@@ -4,12 +4,17 @@ Proxmox VE MCP Server - Enhanced Edition with Batch Operations and Pagination
 Provides comprehensive Proxmox VE management functionality including batch data collection
 
 Author: Jason Cheng (jason@jason.tools)
-Version: 1.5.4
+Version: 1.5.5
 Last Updated: 2026-02-26
 License: MIT
 Repository: https://raw.githubusercontent.com/jasoncheng7115/it-scripts/refs/heads/master/mcp/mcp_pve/mcp_pve.py
 
 Changelog:
+v1.5.5 (2026-02-26) - Fix: Remove include_details from get_ceph_status to prevent token overflow
+         - Removed include_details parameter that dumped raw Ceph data (caused LLM context overflow)
+         - Only summary_only=true/false remains: health-only or structured metrics
+         - Updated tool description for clearer LLM parameter selection
+
 v1.5.4 (2026-02-26) - Fix: SSE/Streamable-HTTP 421 Misdirected Request for external clients
          - Switched to FastMCP wrapper with DNS rebinding protection disabled
          - SSE/Streamable-HTTP now use fastmcp.sse_app() / fastmcp.streamable_http_app()
@@ -117,7 +122,7 @@ from pydantic import AnyUrl
 import mcp.types as types
 
 # Version information
-__version__ = "1.5.4"
+__version__ = "1.5.5"
 __last_updated__ = "2026-02-26"
 __author__ = "Jason Cheng"
 __email__ = "jason@jason.tools"
@@ -1220,19 +1225,14 @@ async def handle_list_tools() -> List[Tool]:
         ),
         Tool(
             name="get_ceph_status",
-            description="Get Ceph cluster health status. Set summary_only=false for full details.",
+            description="Get Ceph cluster health, monitors, OSDs, PGs, storage usage. summary_only=true returns health only, false returns full metrics.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "summary_only": {
                         "type": "boolean",
-                        "description": "Return only essential health summary (default: True, safest)",
+                        "description": "true: health summary only. false: health + monitors + OSDs + PGs + storage metrics",
                         "default": True
-                    },
-                    "include_details": {
-                        "type": "boolean",
-                        "description": "Include full raw Ceph status (may overflow context)",
-                        "default": False
                     }
                 },
                 "additionalProperties": False
@@ -3334,20 +3334,10 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
         
         elif name == "get_ceph_status":
             summary_only = arguments.get("summary_only", True)
-            include_details = arguments.get("include_details", False)
 
             # Get full Ceph status
             full_status = await client.get("/cluster/ceph/status")
             ceph_data = full_status.get("data", {})
-
-            # If full details requested, return raw data (may overflow context)
-            if include_details:
-                logger.warning("Returning full Ceph details - may cause context overflow!")
-                return {
-                    "full_details": ceph_data,
-                    "display_message": "Returning full Ceph details (may cause context overflow)",
-                    "warning": "Full details included - may cause context overflow in large clusters"
-                }
 
             # Extract core health information
             health = ceph_data.get("health", {})
@@ -3381,7 +3371,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                     "health_checks_count": len(health_summary),
                     "health_issues": health_summary if health_status != "HEALTH_OK" else [],
                     "display_message": display_msg,
-                    "recommendation": "Use summary_only=false for more details, include_details=true for full output"
+                    "recommendation": "Use summary_only=false for monitors, OSDs, PGs and storage metrics"
                 }
 
             # Standard mode: return key metrics without detailed data
@@ -3463,7 +3453,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                 "storage": storage_summary,
                 "display_message": display_msg,
                 "summary_mode": "standard",
-                "recommendation": "Use include_details=true for full Ceph status output (may cause context overflow)"
+                "recommendation": "This is the detailed view with all key metrics"
             }
         
         elif name == "get_ceph_osds":
