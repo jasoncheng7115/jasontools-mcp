@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-OPNsense MCP Server - v2.1.1 (FastMCP Rewrite)
+OPNsense MCP Server - v2.2.1 (FastMCP Rewrite)
 ================================================
 Author: Jason Cheng (Jason Tools) - Enhanced by Claude
 License: MIT
 Created: 2025-06-25
-Updated: 2026-03-01
+Updated: 2026-03-02
 
 FastMCP-based OPNsense integration optimized for weak/small LLMs.
-18 tools, compact responses, camelCase tool names.
+20 tools, compact responses, camelCase tool names.
 Supports stdio, streamable-http, and sse transport.
 
 pip install mcp aiohttp requests defusedxml uvicorn
 
 Changelog:
+  v2.2.1 (2026-03-02) - Fix Claude Desktop launch: upgrade mcp 1.9.4 → 1.26.0
+    - Local venv mcp package too old, missing mcp.server.transport_security module
+    - Upgraded /Users/jasoncheng/venvs/mcp-opnsense/ mcp dependency
+  v2.2.0 (2026-03-01) - Add getPlugins and getPackages tools
+    - getPlugins: list/search OPNsense plugins (os-* packages) with status filter
+    - getPackages: list/search system packages (non os-*) with status filter
+    - Updated getFirmwareInfo docstring to reference new tools
+    - 20 tools → 20 tools
   v2.1.1 (2026-03-01) - Fix version retrieval in getConfigSummary/downloadConfigXml
     - Switched from get_firmware_status() to get_firmware_info() for version retrieval
       (firmware/status returns empty when no firmware check has been run;
@@ -73,7 +81,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("mcp-opnsense")
 
-__version__ = "2.0.0"
+__version__ = "2.2.1"
 
 
 # ───────────────────────── Configuration ─────────────────────────
@@ -569,7 +577,7 @@ async def _ensure_client() -> OPNsenseClient:
     return client
 
 
-# ───────────────────────── MCP Tools (18) ─────────────────────────
+# ───────────────────────── MCP Tools (20) ─────────────────────────
 
 # Tool 1: getConfigSummary
 @mcp.tool()
@@ -829,12 +837,15 @@ async def getFirmwareStatus() -> str:
 # Tool 9: getFirmwareInfo
 @mcp.tool()
 async def getFirmwareInfo() -> str:
-    """Get firmware info including package list and security audit.
-    [YES] "套件清單", "installed packages", "firmware audit", "plugin list".
+    """Get firmware info including full package list and security audit.
+    [YES] "firmware audit", "firmware info", "all packages raw".
     [NO] "Firmware update status" -> use getFirmwareStatus().
     [NO] "Specific package" -> use getPackageInfo().
+    [NO] "已安裝 plugin", "plugin list" -> use getPlugins().
+    [NO] "已安裝套件", "installed packages" -> use getPackages().
 
-    Returns packages, plugins, and security audit results."""
+    Returns ALL packages (hundreds), plugins, and security audit.
+    For filtered views, prefer getPlugins() or getPackages()."""
     try:
         c = await _ensure_client()
         result = {}
@@ -1138,11 +1149,113 @@ async def downloadConfigXml() -> str:
         return _R({"error": str(e)})
 
 
+# Tool 19: getPlugins
+@mcp.tool()
+async def getPlugins(status: str = "all", search: Optional[str] = None) -> str:
+    """Get OPNsense plugins (os-* packages) with optional filtering.
+    [YES] "已安裝 plugin", "可安裝插件", "plugin list", "os-haproxy", "available plugins".
+    [NO] "System packages" -> use getPackages().
+    [NO] "Specific package detail" -> use getPackageInfo().
+
+    Args:
+        status: "all" (default), "installed", or "available".
+        search: Filter by name or description (case-insensitive partial match)."""
+    try:
+        c = await _ensure_client()
+        info = await c.get_firmware_info()
+        packages = info.get("package", [])
+
+        plugins = [p for p in packages if p.get("name", "").startswith("os-")]
+
+        installed = [p for p in plugins if p.get("installed") == "1"]
+        available = [p for p in plugins if p.get("installed") != "1"]
+
+        if status == "installed":
+            plugins = installed
+        elif status == "available":
+            plugins = available
+
+        if search:
+            kw = search.lower()
+            plugins = [p for p in plugins
+                       if kw in p.get("name", "").lower()
+                       or kw in p.get("comment", "").lower()]
+
+        slim = [{
+            "name": p.get("name", ""),
+            "version": p.get("version", ""),
+            "comment": p.get("comment", ""),
+            "installed": p.get("installed", "0"),
+            "repository": p.get("repository", ""),
+            "flatsize": p.get("flatsize", ""),
+        } for p in plugins]
+
+        return _R({
+            "plugins": slim,
+            "count": len(slim),
+            "installed_count": len(installed),
+            "available_count": len(available),
+        })
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Tool 20: getPackages
+@mcp.tool()
+async def getPackages(status: str = "installed", search: Optional[str] = None) -> str:
+    """Get system packages (non-plugin, non os-* packages) with optional filtering.
+    [YES] "已安裝套件", "系統套件", "installed packages", "patches", "FreeBSD packages".
+    [NO] "Plugin list" -> use getPlugins().
+    [NO] "Specific package detail" -> use getPackageInfo().
+
+    Args:
+        status: "installed" (default), "all", or "available".
+        search: Filter by name or description (case-insensitive partial match)."""
+    try:
+        c = await _ensure_client()
+        info = await c.get_firmware_info()
+        packages = info.get("package", [])
+
+        sys_pkgs = [p for p in packages if not p.get("name", "").startswith("os-")]
+
+        installed = [p for p in sys_pkgs if p.get("installed") == "1"]
+        available = [p for p in sys_pkgs if p.get("installed") != "1"]
+
+        if status == "installed":
+            sys_pkgs = installed
+        elif status == "available":
+            sys_pkgs = available
+
+        if search:
+            kw = search.lower()
+            sys_pkgs = [p for p in sys_pkgs
+                        if kw in p.get("name", "").lower()
+                        or kw in p.get("comment", "").lower()]
+
+        slim = [{
+            "name": p.get("name", ""),
+            "version": p.get("version", ""),
+            "comment": p.get("comment", ""),
+            "installed": p.get("installed", "0"),
+            "repository": p.get("repository", ""),
+            "flatsize": p.get("flatsize", ""),
+        } for p in sys_pkgs]
+
+        return _R({
+            "packages": slim,
+            "count": len(slim),
+            "installed_count": len(installed),
+            "available_count": len(available),
+        })
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
 # ───────────────────────── Main Entry Point ─────────────────────────
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description=f"OPNsense FastMCP Server v{__version__} (18 tools)",
+        description=f"OPNsense FastMCP Server v{__version__} (20 tools)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1179,7 +1292,7 @@ if __name__ == "__main__":
     cache = SimpleCache(config.CACHE_TTL)
 
     logger.info("=" * 60)
-    logger.info(f"OPNsense FastMCP Server v{__version__} (18 tools)")
+    logger.info(f"OPNsense FastMCP Server v{__version__} (20 tools)")
     logger.info("=" * 60)
     logger.info(f"Transport: {args.transport}")
     if args.transport in ('streamable-http', 'sse'):
