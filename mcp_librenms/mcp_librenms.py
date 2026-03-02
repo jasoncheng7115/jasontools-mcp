@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP server for LibreNMS API – v4.2.0 Slim (Weak-Model Optimized)
+MCP server for LibreNMS API – v4.2.1 Slim (Weak-Model Optimized)
 =================================================================
 Author: Jason Cheng (Jason Tools) - Enhanced by Claude
 License: MIT
@@ -12,6 +12,10 @@ Supports stdio, streamable-http, and sse transport.
 pip install mcp requests uvicorn
 
 Changelog:
+  v4.2.1 - Compatibility fix
+    - Requires mcp>=1.26.0 (TransportSecuritySettings added in newer SDK)
+    - Fixed Claude Desktop startup failure caused by outdated mcp package
+    - pip install: mcp requests uvicorn (uvicorn only needed for SSE/HTTP)
   v4.2.0 - SLA tools + SSE/Streamable-HTTP fix
     - Added get_device_sla: device availability SLA (uptime/outage history)
     - Added get_cisco_sla: Cisco IP SLA probe results (RTT, jitter, status)
@@ -150,7 +154,7 @@ def initialize_session():
     session = requests.Session()
     session.headers.update({
         "X-Auth-Token": config.TOKEN,
-        "User-Agent": "mcp-librenms/4.2.0",
+        "User-Agent": "mcp-librenms/4.2.1",
         "Accept": "application/json",
         "Content-Type": "application/json"
     })
@@ -1736,7 +1740,7 @@ def clear_cache() -> str:
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="LibreNMS FastMCP Server v4.2.0 - Slim (Weak-Model Optimized)",
+        description="LibreNMS FastMCP Server v4.2.1 - Slim (Weak-Model Optimized)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1776,7 +1780,7 @@ if __name__ == "__main__":
     initialize_session()
 
     logger.info("=" * 60)
-    logger.info("LibreNMS FastMCP Server v4.2.0 - Slim (22 tools)")
+    logger.info("LibreNMS FastMCP Server v4.2.1 - Slim (22 tools)")
     logger.info("=" * 60)
     logger.info(f"Transport: {args.transport}")
     if args.transport in ('streamable-http', 'sse'):
