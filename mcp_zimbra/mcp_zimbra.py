@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-MCP server for Zimbra Collaboration Suite - v1.9.1
+MCP server for Zimbra Collaboration Suite - v1.9.2
 ===============================================================================
 Author: Jason Cheng (co-created with Claude Code)
-Created: 2025-01-27
-Updated: 2026-02-13
 License: MIT
+Repository: https://github.com/jasoncheng7115/jasontools-mcp
+Created: 2025-01-27
+Updated: 2026-03-02
 
 Reference:
 This implementation follows design patterns from mcp_wazuh_sample.py
@@ -15,6 +16,13 @@ FastMCP-based Zimbra integration providing comprehensive email system monitoring
 and analysis capabilities through natural language interactions.
 
 Version History:
+- v1.9.2 (2026-03-02): OPTIMIZATION - Weak LLM compatibility
+                       - NEW HELPER: tool_response() — compact JSON output with usage_hint injection
+                       - All json.dumps calls migrated to tool_response() (removes indent=2, saves ~30% tokens)
+                       - USAGE_HINTS dict: per-tool one-line guidance for weaker models (50+ tools)
+                       - getServerStatus: NEW PARAM summary (default: true) — compact output, problem services only
+                       - getConversation: NEW PARAM limit (default: 25) — truncates long threads, keeps newest
+                       - health_check: replaced full services array with stopped_service_names list
 - v1.9.1 (2026-02-26): FIX - SSE/streamable-http transport fixes
                        - Disable DNS rebinding protection (fixes 421 Misdirected Request)
                        - Use uvicorn directly for host/port binding (FastMCP.run() limitation)
@@ -264,6 +272,7 @@ from functools import wraps
 import logging
 import hashlib
 import re
+import inspect
 import urllib3
 from urllib.parse import urlparse, unquote
 import xml.etree.ElementTree as ET
@@ -535,7 +544,7 @@ def setup_http_session():
     http_session = requests.Session()
     http_session.headers.update({
         "Content-Type": "application/soap+xml",
-        "User-Agent": "zimbra-mcp-server/1.8.3"
+        "User-Agent": "zimbra-mcp-server/1.9.2"
     })
     http_session.verify = zimbra_config.use_ssl
 
@@ -908,6 +917,97 @@ def create_pagination_message(returned_count: int, total_count: int, has_more: b
         # Fallback
         return f"Showing {returned_count} {item_name}"
 
+# ======================= Tool Response Helper =======================
+
+USAGE_HINTS = {
+    # Account Management
+    "getAccountInfo": "Use getAccountQuota for storage details, or getAccountAliases for alias list.",
+    "getAccountQuota": "If quota is high, use getQuotaUsage to compare across accounts.",
+    "getAccountAliases": "Use searchGal to find accounts by alias pattern.",
+    "unlockAccount": "After unlocking, verify with getAccountInfo to confirm status is 'active'.",
+    "getAllAccounts": "Use getAccountCount for just the count. Add domain filter to narrow results.",
+    "getAccountCount": "Use countAccountByCOS for per-COS breakdown.",
+    # Distribution Lists
+    "getDLInfo": "Use getDLMembers to list members. Use getDLMembership for reverse lookup.",
+    "getDLMembers": "Increase limit/offset for more members. Use getDLInfo for DL metadata.",
+    "getAllDistributionLists": "Use getDLInfo for details on a specific DL.",
+    "getDLMembership": "Shows all DLs an account belongs to.",
+    # Mail Queue
+    "getQueueStat": "Use getQueueList for message details. Use searchMailQueue to filter.",
+    "getQueueList": "Use searchMailQueue to filter by sender/recipient pattern.",
+    "searchMailQueue": "Refine with sender/recipient/time filters to narrow results.",
+    # Server & System
+    "getServerList": "Use getServerStatus for service health per server.",
+    "getServerStatus": "Use summary=false for full service details. Use health_check for overall status.",
+    "getActiveSessions": "Use list_sessions=true for detailed session list.",
+    "getMailboxStats": "Use getQuotaUsage for per-account storage ranking.",
+    "getQuotaUsage": "Sort by percentUsed to find accounts near quota limit.",
+    # Domain & COS
+    "getDomainList": "Use getDomainInfo for details on a specific domain.",
+    "getDomainInfo": "Use getAccountCount with domain filter for account count.",
+    "getCOSList": "Use getCOSInfo for settings of a specific COS.",
+    "getCOSInfo": "Use attr_filter to narrow attributes (e.g. 'password' for password policy).",
+    "countAccountByCOS": "Use getAccountCount for total across all COS.",
+    # Rights & Permissions
+    "getGrants": "Use checkRight to verify a specific permission.",
+    "checkRight": "Use getGrants for full ACL listing.",
+    "getDelegates": "Use getAllDelegations for bulk delegation audit.",
+    # Bulk Audit
+    "getAllDelegations": "Filter by domain to narrow results.",
+    "getAllForwardings": "Review forwarding rules for security audit.",
+    "getAllOutOfOffice": "Check for stale auto-replies from former employees.",
+    "getInactiveAccounts": "Increase days parameter for longer inactivity threshold.",
+    "searchByAttribute": "Use LDAP filter syntax. Example: (zimbraMailForwardingAddress=*).",
+    # Mail Read
+    "listFolders": "Use folder_id in searchMail to search within a specific folder.",
+    "searchMail": "Use msg id with getMailDetail for full message. Use conversation_id with getConversation for thread.",
+    "getMailDetail": "Use part_id with getMailAttachment to download attachments.",
+    "getConversation": "Use limit param to control number of messages returned.",
+    "getMailAttachment": "Provide msg_id and part_id from getMailDetail results.",
+    # Mail Write & Contacts
+    "saveDraft": "Reply/forward auto-quotes original message. Provide only your reply text.",
+    "searchGal": "Use search_type to filter: account, resource, or all.",
+    "searchContacts": "Searches personal address book. Use searchGal for global directory.",
+    # Mail Trace (jt_zmmsgtrace)
+    "jt_zmmsgtrace_search_by_sender": "Use jt_zmmsgtrace_search for multi-criteria search.",
+    "jt_zmmsgtrace_search_by_recipient": "Use jt_zmmsgtrace_search for multi-criteria search.",
+    "jt_zmmsgtrace_search_by_message_id": "Check delivery_path for bounce details.",
+    "jt_zmmsgtrace_search_by_host": "Specify srchost or desthost to trace mail routing.",
+    "jt_zmmsgtrace_search_by_time": "Combine with jt_zmmsgtrace_search for filtered time search.",
+    "jt_zmmsgtrace_search": "Most flexible search — combine sender, recipient, time, host filters.",
+    # System
+    "health_check": "Use getServerStatus for per-server service details.",
+    "clear_cache": "Cache auto-expires. Use this only when fresh data is critical.",
+    "cache_stats": "Shows hit/miss ratio and entry count.",
+    "getVersionInfo": "Shows Zimbra server version and build info.",
+}
+
+def tool_response(data: Any, tool_name: str = None, cls=None) -> str:
+    """Format tool response as compact JSON with usage_hint injection.
+
+    Args:
+        data: Response dict to serialize.
+        tool_name: Override tool name for hint lookup. Auto-detected from caller if None.
+        cls: Custom JSON encoder class (e.g. DateTimeJSONEncoder).
+    """
+    if tool_name is None:
+        frame = inspect.currentframe()
+        caller = frame.f_back if frame else None
+        tool_name = caller.f_code.co_name if caller else None
+
+    if isinstance(data, dict):
+        # Inject usage_hint for successful responses
+        if tool_name and tool_name in USAGE_HINTS and "usage_hint" not in data:
+            data["usage_hint"] = USAGE_HINTS[tool_name]
+        # Inject generic error hint for error responses
+        if data.get("status") == "error" and "usage_hint" not in data:
+            data["usage_hint"] = "Check the error message. Verify parameter values and try again."
+
+    kwargs = {}
+    if cls is not None:
+        kwargs["cls"] = cls
+    return json.dumps(data, **kwargs)
+
 def query_jt_zmmsgtrace_api(params: Dict[str, Any]) -> Dict[str, Any]:
     """Execute API request to jt_zmmsgtrace service
 
@@ -943,7 +1043,7 @@ def query_jt_zmmsgtrace_api(params: Dict[str, Any]) -> Dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {zimbra_config.jt_zmmsgtrace_api_key}",
         "Accept": "application/json",
-        "User-Agent": "zimbra-mcp-server/1.8.3"
+        "User-Agent": "zimbra-mcp-server/1.9.2"
     }
 
     # Clean up params - remove None values
@@ -997,21 +1097,19 @@ def query_jt_zmmsgtrace_api(params: Dict[str, Any]) -> Dict[str, Any]:
                 logger.error(f"jt_zmmsgtrace API request failed after {zimbra_config.retry_attempts} attempts")
                 raise Exception(f"jt_zmmsgtrace API error: {str(req_error)}")
 
-def format_jt_zmmsgtrace_result(api_response: Dict[str, Any]) -> str:
+def format_jt_zmmsgtrace_result(api_response: Dict[str, Any], tool_name: str = None) -> str:
     """Format jt_zmmsgtrace API response into user-friendly JSON
 
     Args:
         api_response: Raw API response from jt_zmmsgtrace
-
-    Returns:
-        Formatted JSON string with human-readable structure
+        tool_name: Caller tool name for usage_hint injection.
     """
 
     if not api_response.get('success', False):
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": api_response.get('message', 'Unknown error')
-        }, indent=2)
+        }, tool_name=tool_name)
 
     data = api_response.get('data', {})
 
@@ -1069,7 +1167,7 @@ def format_jt_zmmsgtrace_result(api_response: Dict[str, Any]) -> str:
 
         result['messages'].append(formatted_msg)
 
-    return json.dumps(result, indent=2, cls=DateTimeJSONEncoder)
+    return tool_response(result, tool_name=tool_name, cls=DateTimeJSONEncoder)
 
 # ======================= MCP Tool Implementations =======================
 
@@ -1098,10 +1196,10 @@ def getAccountInfo(email: str) -> str:
         account_elem = root.find('.//zimbra:account', ns)
 
         if account_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Account not found: {email}"
-            }, indent=2)
+            })
 
         account_info = {
             "id": account_elem.get('id'),
@@ -1109,17 +1207,17 @@ def getAccountInfo(email: str) -> str:
             "attributes": parse_attributes(account_elem)
         }
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "account": account_info
-        }, indent=2, cls=DateTimeJSONEncoder)
+        }, cls=DateTimeJSONEncoder)
 
     except Exception as e:
         logger.error(f"Failed to get account info: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get account info: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getAccountQuota(email: str) -> str:
@@ -1145,10 +1243,10 @@ def getAccountQuota(email: str) -> str:
         account_elem = acct_root.find('.//zimbra:account', ns)
 
         if account_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Account not found: {email}"
-            }, indent=2)
+            })
 
         account_id = account_elem.get('id')
         attrs = parse_attributes(account_elem)
@@ -1168,10 +1266,10 @@ def getAccountQuota(email: str) -> str:
         mbox_elem = mbox_root.find('.//zimbra:mbox', ns)
 
         if mbox_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Mailbox not found: {email}"
-            }, indent=2)
+            })
 
         used = int(mbox_elem.get('s', 0))
 
@@ -1181,7 +1279,7 @@ def getAccountQuota(email: str) -> str:
             percentage = round((used / limit) * 100, 2)
             available = max(0, limit - used)
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "email": email,
             "quota": {
@@ -1191,14 +1289,14 @@ def getAccountQuota(email: str) -> str:
                 "available_bytes": available,
                 "unlimited": limit == 0
             }
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get account quota: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get account quota: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getAccountAliases(email: str) -> str:
@@ -1226,19 +1324,19 @@ def getAccountAliases(email: str) -> str:
                 else:
                     aliases.append(value)
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "email": email,
             "aliases": aliases,
             "count": len(aliases)
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get account aliases: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get account aliases: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def unlockAccount(email: str) -> str:
@@ -1264,10 +1362,10 @@ def unlockAccount(email: str) -> str:
         account_elem = acct_root.find('.//zimbra:account', ns)
 
         if account_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Account not found: {email}"
-            }, indent=2)
+            })
 
         account_id = account_elem.get('id')
         attrs = parse_attributes(account_elem)
@@ -1278,13 +1376,13 @@ def unlockAccount(email: str) -> str:
         # Check if account is locked or lockout
         if current_status.lower() not in ('locked', 'lockout'):
             logger.warning(f"Account {email} is not locked (status: {current_status}), skipping unlock operation")
-            return json.dumps({
+            return tool_response({
                 "status": "skipped",
                 "email": email,
                 "current_status": current_status,
                 "message": f"Account unlock skipped: account status is '{current_status}', not 'locked' or 'lockout'. Only locked/lockout accounts can be unlocked.",
                 "hint": "If you need to change the account status, use a different operation or manually modify the account."
-            }, indent=2)
+            })
 
         # Account is locked/lockout, proceed with unlock
         logger.info(f"Account {email} is {current_status}, proceeding with unlock operation")
@@ -1309,20 +1407,20 @@ def unlockAccount(email: str) -> str:
 
         logger.info(f"Successfully unlocked account {email}")
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "email": email,
             "previous_status": current_status,
             "current_status": "active",
             "message": f"Account {email} has been unlocked successfully (status changed from '{current_status}' to 'active')"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to unlock account: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to unlock account: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getAllAccounts(domain: Optional[str] = None,
@@ -1417,7 +1515,7 @@ def getAllAccounts(domain: Optional[str] = None,
         # Create display message for user clarity
         display_msg = create_pagination_message(returned_count, total_matches, has_more, "accounts")
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "display_message": display_msg,
             "filters": {
@@ -1433,14 +1531,14 @@ def getAllAccounts(domain: Optional[str] = None,
                 "next_offset": offset + returned_count if has_more else None
             },
             "accounts": accounts
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get all accounts: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get all accounts: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getAccountCount(domain: Optional[str] = None,
@@ -1523,18 +1621,18 @@ def getAccountCount(domain: Optional[str] = None,
         if ldap_query and ldap_query != query:
             filters_applied["combined_ldap"] = ldap_query
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "filters": filters_applied if filters_applied else "none (all accounts)",
             "total_count": total_matches
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get account count: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get account count: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Distribution List -------------------
 
@@ -1568,10 +1666,10 @@ def getDLInfo(dl_email: str) -> str:
             is_dynamic = True
 
         if dl_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Distribution list not found: {dl_email}"
-            }, indent=2)
+            })
 
         # Determine dynamic status from element type, attribute, or memberURL
         attrs = parse_attributes(dl_elem)
@@ -1591,17 +1689,17 @@ def getDLInfo(dl_email: str) -> str:
 
         logger.debug(f"Retrieved {'dynamic group' if is_dynamic else 'DL'} info for {dl_email}")
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "dl": dl_info
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get DL info: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get DL info: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getDLMembers(dl_email: str, limit: int = 100, offset: int = 0) -> str:
@@ -1635,10 +1733,10 @@ def getDLMembers(dl_email: str, limit: int = 100, offset: int = 0) -> str:
             is_dynamic = True
 
         if dl_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Distribution list not found: {dl_email}"
-            }, indent=2)
+            })
 
         members = []
         for member_elem in dl_elem.findall('.//zimbra:dlm', ns):
@@ -1653,7 +1751,7 @@ def getDLMembers(dl_email: str, limit: int = 100, offset: int = 0) -> str:
         # Create display message for user clarity
         display_msg = create_pagination_message(returned_count, total_members, has_more, "members")
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "dl_email": dl_email,
             "display_message": display_msg,
@@ -1666,14 +1764,14 @@ def getDLMembers(dl_email: str, limit: int = 100, offset: int = 0) -> str:
                 "next_offset": offset + returned_count if has_more else None
             },
             "members": members
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get DL members: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get DL members: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getAllDistributionLists(domain: Optional[str] = None, limit: int = 100, offset: int = 0, include_member_count: bool = False) -> str:
@@ -1802,7 +1900,7 @@ def getAllDistributionLists(domain: Optional[str] = None, limit: int = 100, offs
         # Create display message for user clarity
         display_msg = create_pagination_message(returned_count, total_matches, has_more, "distribution lists")
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "display_message": display_msg,
             "filters": {
@@ -1817,14 +1915,14 @@ def getAllDistributionLists(domain: Optional[str] = None, limit: int = 100, offs
                 "next_offset": offset + returned_count if has_more else None
             },
             "distribution_lists": distribution_lists
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get all distribution lists: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get all distribution lists: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- System Status -------------------
 
@@ -1926,27 +2024,28 @@ def getServerList(attrs: str = "minimal") -> str:
 
         display_msg = f"Found {len(servers)} servers ({mode_desc})"
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "servers": servers,
             "count": len(servers),
             "display_message": display_msg,
             "mode": attrs
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get server list: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get server list: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
-def getServerStatus(server_name: Optional[str] = None) -> str:
+def getServerStatus(server_name: Optional[str] = None, summary: bool = True) -> str:
     """Get real-time service health status (running/stopped) for Zimbra servers.
 
     Args:
         server_name: Server hostname. Example: "mail.example.com". Default: all servers.
+        summary: Compact output showing only problem services + counts. Set false for full detail. Default: true.
     """
     logger.info(f"Getting server status for {server_name or 'all servers'}")
 
@@ -2047,6 +2146,27 @@ def getServerStatus(server_name: Optional[str] = None) -> str:
 
         return servers_status
 
+    def summarize_servers(servers_list):
+        """Compact server status: only show problem services + counts."""
+        summarized = []
+        for srv in servers_list:
+            services = srv.get("services", [])
+            service_count = len(services)
+            running_count = sum(1 for s in services if s.get("status") == "running")
+            problem_services = [s for s in services if s.get("status") != "running"]
+            entry = {
+                "server": srv.get("server", "unknown"),
+                "health": "healthy" if not problem_services else "degraded",
+                "service_count": service_count,
+                "running_count": running_count,
+            }
+            if problem_services:
+                entry["problem_services"] = [{"name": s["name"], "status": s["status"]} for s in problem_services]
+            if srv.get("error"):
+                entry["error"] = srv["error"]
+            summarized.append(entry)
+        return summarized
+
     try:
         if not server_name:
             # Query all servers
@@ -2094,11 +2214,12 @@ def getServerStatus(server_name: Optional[str] = None) -> str:
                         "services": []
                     })
 
-            return json.dumps({
+            output_servers = summarize_servers(all_servers_status) if summary else all_servers_status
+            return tool_response({
                 "status": "success",
-                "total_servers": len(all_servers_status),
-                "servers": all_servers_status
-            }, indent=2)
+                "total_servers": len(output_servers),
+                "servers": output_servers
+            })
 
         else:
             # Query specific server - try multiple formats
@@ -2118,10 +2239,11 @@ def getServerStatus(server_name: Optional[str] = None) -> str:
 
                     if servers_status:
                         logger.info(f"Successfully retrieved status for {server_name} using format {i+1}")
-                        return json.dumps({
+                        output_servers = summarize_servers(servers_status) if summary else servers_status
+                        return tool_response({
                             "status": "success",
-                            "servers": servers_status
-                        }, indent=2)
+                            "servers": output_servers
+                        })
                     else:
                         logger.debug(f"Format {i+1} returned no servers")
 
@@ -2132,21 +2254,21 @@ def getServerStatus(server_name: Optional[str] = None) -> str:
 
             # If all formats failed
             logger.error(f"All SOAP formats failed for {server_name}")
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Could not retrieve service status for {server_name}",
                 "last_error": last_error,
                 "hint": "The server exists but service status could not be retrieved. This may be a permissions issue or API compatibility issue."
-            }, indent=2)
+            })
 
     except Exception as e:
         logger.error(f"Failed to get server status: {e}")
         import traceback
         logger.debug(traceback.format_exc())
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get server status: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getActiveSessions(list_sessions: bool = False, group_by_account: bool = False) -> str:
@@ -2240,16 +2362,16 @@ def getActiveSessions(list_sessions: bool = False, group_by_account: bool = Fals
 
             result["display_message"] = display_msg
 
-        return json.dumps(result, indent=2)
+        return tool_response(result)
 
     except Exception as e:
         logger.error(f"Failed to get active sessions: {e}")
         import traceback
         logger.debug(traceback.format_exc())
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get active sessions: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Domain & COS -------------------
 
@@ -2317,7 +2439,7 @@ def getDomainList(limit: int = 50,
         else:
             display_msg = f"Showing {returned_count} domains ({mode}), {total_domains} total"
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "domains": domains,
             "pagination": {
@@ -2329,14 +2451,14 @@ def getDomainList(limit: int = 50,
                 "next_offset": next_offset
             },
             "display_message": display_msg
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get domain list: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get domain list: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getDomainInfo(domain_name: str) -> str:
@@ -2361,10 +2483,10 @@ def getDomainInfo(domain_name: str) -> str:
         domain_elem = root.find('.//zimbra:domain', ns)
 
         if domain_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Domain not found: {domain_name}"
-            }, indent=2)
+            })
 
         domain_info = {
             "id": domain_elem.get('id'),
@@ -2372,17 +2494,17 @@ def getDomainInfo(domain_name: str) -> str:
             "attributes": parse_attributes(domain_elem)
         }
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "domain": domain_info
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get domain info: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get domain info: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getCOSList(limit: int = 20,
@@ -2448,7 +2570,7 @@ def getCOSList(limit: int = 20,
         else:
             display_msg = f"Showing {returned_count} COS ({mode}), {total_cos} total"
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "cos_list": cos_list,
             "pagination": {
@@ -2460,14 +2582,14 @@ def getCOSList(limit: int = 20,
                 "next_offset": next_offset
             },
             "display_message": display_msg
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get COS list: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get COS list: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getCOSInfo(cos_name: str,
@@ -2522,10 +2644,10 @@ def getCOSInfo(cos_name: str,
         cos_elem = root.find('.//zimbra:cos', ns)
 
         if cos_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"COS '{cos_name}' not found"
-            }, indent=2)
+            })
 
         cos_id = cos_elem.get('id')
         cos_name_result = cos_elem.get('name')
@@ -2548,10 +2670,10 @@ def getCOSInfo(cos_name: str,
                 filter_pattern = attr_filter
 
             except re.error as e:
-                return json.dumps({
+                return tool_response({
                     "status": "error",
                     "message": f"Invalid regex pattern '{attr_filter}': {str(e)}"
-                }, indent=2)
+                })
         else:
             # No filter - return only common attributes to prevent overflow
             selected_attrs = {
@@ -2612,14 +2734,14 @@ def getCOSInfo(cos_name: str,
                 "all_attributes": "attr_filter='.*', limit=50 (get first 50 of all attributes)"
             }
 
-        return json.dumps(result, indent=2)
+        return tool_response(result)
 
     except Exception as e:
         logger.error(f"Failed to get COS info: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get COS info: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Mail Queue -------------------
 
@@ -2646,10 +2768,10 @@ def getQueueStat(server_name: str) -> str:
         server_elem = root.find('.//zimbra:server', ns)
 
         if server_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Queue info not found for server: {server_name}"
-            }, indent=2)
+            })
 
         queues = {}
         for queue_elem in server_elem.findall('.//zimbra:queue', ns):
@@ -2657,19 +2779,19 @@ def getQueueStat(server_name: str) -> str:
             queue_count = int(queue_elem.get('n', 0))
             queues[queue_name] = queue_count
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "server": server_name,
             "queues": queues,
             "total": sum(queues.values())
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get queue stats: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get queue stats: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def getQueueList(server_name: str,
@@ -2729,7 +2851,7 @@ def getQueueList(server_name: str,
         returned_count = len(messages)
         has_more = end_idx < total
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "server": server_name,
             "queue_name": queue_name,
@@ -2742,14 +2864,14 @@ def getQueueList(server_name: str,
                 "next_offset": offset + returned_count if has_more else None
             },
             "messages": messages
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get queue list: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get queue list: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def searchMailQueue(server_name: str,
@@ -2834,7 +2956,7 @@ def searchMailQueue(server_name: str,
         # Apply limit
         matches = matches[:limit]
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "server": server_name,
             "search_query": search_query,
@@ -2842,14 +2964,14 @@ def searchMailQueue(server_name: str,
             "queues_searched": queues_to_search,
             "match_count": len(matches),
             "matches": matches
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to search mail queue: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search mail queue: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Mail Statistics -------------------
 
@@ -2889,18 +3011,18 @@ def getMailboxStats(server_name: Optional[str] = None) -> str:
             }
             servers_stats.append(server_stat)
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "servers": servers_stats,
             "total_servers": len(servers_stats)
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get mailbox stats: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get mailbox stats: {str(e)}"
-        }, indent=2)
+        })
 @admin_only_tool()
 def getQuotaUsage(domain: Optional[str] = None,
                   limit: int = 100,
@@ -2967,7 +3089,7 @@ def getQuotaUsage(domain: Optional[str] = None,
         # Create display message for user clarity
         display_msg = create_pagination_message(returned_count, returned_count, has_more, "accounts")
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "display_message": display_msg,
             "domain": domain or "all",
@@ -2977,14 +3099,14 @@ def getQuotaUsage(domain: Optional[str] = None,
             "offset": offset,
             "total_accounts": returned_count,
             "accounts": accounts
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get quota usage: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get quota usage: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Mail Tracing (jt_zmmsgtrace) -------------------
 
@@ -3009,14 +3131,14 @@ def jt_zmmsgtrace_search_by_sender(sender: str,
         }
 
         api_response = query_jt_zmmsgtrace_api(params)
-        return format_jt_zmmsgtrace_result(api_response)
+        return format_jt_zmmsgtrace_result(api_response, tool_name="jt_zmmsgtrace_search_by_sender")
 
     except Exception as e:
         logger.error(f"Failed to search by sender: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search by sender: {str(e)}"
-        }, indent=2)
+        })
 
 @mcp_server.tool()
 def jt_zmmsgtrace_search_by_recipient(recipient: str,
@@ -3039,14 +3161,14 @@ def jt_zmmsgtrace_search_by_recipient(recipient: str,
         }
 
         api_response = query_jt_zmmsgtrace_api(params)
-        return format_jt_zmmsgtrace_result(api_response)
+        return format_jt_zmmsgtrace_result(api_response, tool_name="jt_zmmsgtrace_search_by_recipient")
 
     except Exception as e:
         logger.error(f"Failed to search by recipient: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search by recipient: {str(e)}"
-        }, indent=2)
+        })
 
 @mcp_server.tool()
 def jt_zmmsgtrace_search_by_message_id(message_id: str,
@@ -3069,14 +3191,14 @@ def jt_zmmsgtrace_search_by_message_id(message_id: str,
         }
 
         api_response = query_jt_zmmsgtrace_api(params)
-        return format_jt_zmmsgtrace_result(api_response)
+        return format_jt_zmmsgtrace_result(api_response, tool_name="jt_zmmsgtrace_search_by_message_id")
 
     except Exception as e:
         logger.error(f"Failed to search by message ID: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search by message ID: {str(e)}"
-        }, indent=2)
+        })
 
 @mcp_server.tool()
 def jt_zmmsgtrace_search_by_host(srchost: Optional[str] = None,
@@ -3095,10 +3217,10 @@ def jt_zmmsgtrace_search_by_host(srchost: Optional[str] = None,
 
     try:
         if not srchost and not desthost:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": "At least one of srchost or desthost must be provided"
-            }, indent=2)
+            })
 
         params = {
             "srchost": srchost,
@@ -3108,14 +3230,14 @@ def jt_zmmsgtrace_search_by_host(srchost: Optional[str] = None,
         }
 
         api_response = query_jt_zmmsgtrace_api(params)
-        return format_jt_zmmsgtrace_result(api_response)
+        return format_jt_zmmsgtrace_result(api_response, tool_name="jt_zmmsgtrace_search_by_host")
 
     except Exception as e:
         logger.error(f"Failed to search by host: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search by host: {str(e)}"
-        }, indent=2)
+        })
 
 @mcp_server.tool()
 def jt_zmmsgtrace_search_by_time(time_range: str,
@@ -3144,14 +3266,14 @@ def jt_zmmsgtrace_search_by_time(time_range: str,
         }
 
         api_response = query_jt_zmmsgtrace_api(params)
-        return format_jt_zmmsgtrace_result(api_response)
+        return format_jt_zmmsgtrace_result(api_response, tool_name="jt_zmmsgtrace_search_by_time")
 
     except Exception as e:
         logger.error(f"Failed to search by time: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search by time: {str(e)}"
-        }, indent=2)
+        })
 
 @mcp_server.tool()
 def jt_zmmsgtrace_search(sender: Optional[str] = None,
@@ -3179,10 +3301,10 @@ def jt_zmmsgtrace_search(sender: Optional[str] = None,
     try:
         # Validate at least one search parameter is provided
         if not any([sender, recipient, message_id, srchost, desthost, time_range]):
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": "At least one search parameter is required (sender, recipient, message_id, srchost, desthost, or time_range)"
-            }, indent=2)
+            })
 
         params = {
             "sender": sender,
@@ -3196,14 +3318,14 @@ def jt_zmmsgtrace_search(sender: Optional[str] = None,
         }
 
         api_response = query_jt_zmmsgtrace_api(params)
-        return format_jt_zmmsgtrace_result(api_response)
+        return format_jt_zmmsgtrace_result(api_response, tool_name="jt_zmmsgtrace_search")
 
     except Exception as e:
         logger.error(f"Failed comprehensive search: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed comprehensive search: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Health Check & Utilities -------------------
 
@@ -3219,7 +3341,7 @@ def _health_check_user_mode() -> str:
         latency = time.time() - start_time
         cache_metrics = memory_cache.get_statistics()
 
-        return json.dumps({
+        return tool_response({
             "overall_status": "healthy",
             "auth_mode": "user",
             "user_email": zimbra_config.user_email,
@@ -3231,11 +3353,11 @@ def _health_check_user_mode() -> str:
             },
             "cache": cache_metrics,
             "note": "User mode: server-level health data unavailable"
-        }, indent=2, cls=DateTimeJSONEncoder)
+        }, cls=DateTimeJSONEncoder)
 
     except Exception as error:
         logger.error(f"User mode health check failed: {error}")
-        return json.dumps({
+        return tool_response({
             "overall_status": "unhealthy",
             "auth_mode": "user",
             "timestamp": datetime.now().isoformat(),
@@ -3244,7 +3366,7 @@ def _health_check_user_mode() -> str:
                 "status": "unreachable",
                 "endpoint": zimbra_config.mail_url
             }
-        }, indent=2, cls=DateTimeJSONEncoder)
+        }, cls=DateTimeJSONEncoder)
 
 @mcp_server.tool()
 def health_check() -> str:
@@ -3288,7 +3410,7 @@ def health_check() -> str:
         overall_status = "healthy"
 
         try:
-            server_status_result = getServerStatus()
+            server_status_result = getServerStatus(summary=False)
             server_status_data = json.loads(server_status_result)
 
             logger.debug(f"Server status result: {server_status_data.get('status')}")
@@ -3330,21 +3452,21 @@ def health_check() -> str:
                 else:
                     servers_health["degraded_servers"] += 1
 
+                stopped_names = [s["name"] for s in services if s.get("status") != "running"]
                 servers_health["servers"].append({
                     "server": server.get('server', 'unknown'),
                     "health": server_health,
                     "total_services": len(services),
                     "running": running,
                     "stopped": stopped,
-                    "services": services
+                    "stopped_service_names": stopped_names
                 })
 
             if servers_health["stopped_services"] > 0:
                 critical_services_down = any(
-                    service.get('name') in ['mailboxd', 'mta', 'ldap']
-                    and service.get('status') != 'running'
+                    name in ['mailboxd', 'mta', 'ldap']
                     for server in servers_health["servers"]
-                    for service in server.get('services', [])
+                    for name in server.get('stopped_service_names', [])
                 )
 
                 if critical_services_down:
@@ -3370,11 +3492,11 @@ def health_check() -> str:
             }
         }
 
-        return json.dumps(health_report, indent=2, cls=DateTimeJSONEncoder)
+        return tool_response(health_report, cls=DateTimeJSONEncoder)
 
     except Exception as error:
         logger.error(f"Health check failed: {error}")
-        return json.dumps({
+        return tool_response({
             "overall_status": "unhealthy",
             "timestamp": datetime.now().isoformat(),
             "error": str(error),
@@ -3382,27 +3504,27 @@ def health_check() -> str:
                 "status": "unreachable",
                 "endpoint": zimbra_config.admin_url
             }
-        }, indent=2, cls=DateTimeJSONEncoder)
+        }, cls=DateTimeJSONEncoder)
 
 @mcp_server.tool()
 def clear_cache() -> str:
     """Clear all cached API responses to force fresh data retrieval."""
     logger.info("Clearing cache")
     memory_cache.invalidate_all()
-    return json.dumps({
+    return tool_response({
         "status": "success",
         "message": "Cache cleared successfully"
-    }, indent=2)
+    })
 
 @mcp_server.tool()
 def cache_stats() -> str:
     """Get cache performance statistics including entry counts and TTL configuration."""
     logger.info("Retrieving cache statistics")
     cache_metrics = memory_cache.get_statistics()
-    return json.dumps({
+    return tool_response({
         "status": "success",
         "cache_statistics": cache_metrics
-    }, indent=2)
+    })
 
 # ------------------- Rights & Permissions -------------------
 
@@ -3545,14 +3667,14 @@ def getGrants(target_type: str = "account",
                 "suggestion": "Please contact administrator to verify Zimbra version and API format"
             }
 
-        return json.dumps(result, indent=2)
+        return tool_response(result)
 
     except Exception as e:
         logger.error(f"Failed to get grants: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get grants: {str(e)}"
-        }, indent=2)
+        })
 
 @admin_only_tool()
 def checkRight(target_type: str,
@@ -3586,7 +3708,7 @@ def checkRight(target_type: str,
 
         has_right = response_elem.get('allow', '0') == '1' if response_elem is not None else False
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "has_right": has_right,
             "target": {
@@ -3596,14 +3718,14 @@ def checkRight(target_type: str,
             "grantee": grantee_name,
             "right": right,
             "display_message": f"{'Has permission' if has_right else 'No permission'}: {grantee_name} {'has' if has_right else 'does not have'} {right} permission on {target_name}"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to check right: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to check right: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Delegation -------------------
 
@@ -3631,10 +3753,10 @@ def getDelegates(account: str) -> str:
         account_elem = root.find('.//zimbra:account', ns)
 
         if account_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Account '{account}' not found"
-            }, indent=2)
+            })
 
         # Parse zimbraPrefAllowAddressForDelegatedSender attribute
         delegates = []
@@ -3643,20 +3765,20 @@ def getDelegates(account: str) -> str:
             if delegate_email:
                 delegates.append(delegate_email)
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "account": account,
             "delegates": delegates,
             "count": len(delegates),
             "display_message": f"Account {account} has {len(delegates)} delegates"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get delegates: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get delegates: {str(e)}"
-        }, indent=2)
+        })
 
 
 @admin_only_tool()
@@ -3778,7 +3900,7 @@ def getAllDelegations(domain: Optional[str] = None,
                 total_matches = int(search_response.get('searchTotal'))
             has_more = search_response.get('more') == '1'
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "accounts": accounts_data,
             "count": len(accounts_data),
@@ -3789,14 +3911,14 @@ def getAllDelegations(domain: Optional[str] = None,
             "display_message": f"Found {len(accounts_data)} accounts with delegation settings"
                               + (f" (domain: {domain})" if domain else "")
                               + (f" - more results available, use offset={offset + limit}" if has_more else "")
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get all delegations: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get all delegations: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Bulk Audit -------------------
 
@@ -3872,7 +3994,7 @@ def getAllForwardings(domain: Optional[str] = None,
                 total_matches = int(search_response.get('searchTotal'))
             has_more = search_response.get('more') == '1'
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "accounts": accounts_data,
             "count": len(accounts_data),
@@ -3883,14 +4005,14 @@ def getAllForwardings(domain: Optional[str] = None,
             "display_message": f"Found {len(accounts_data)} accounts with forwarding rules"
                               + (f" (domain: {domain})" if domain else "")
                               + (f" - more results available, use offset={offset + limit}" if has_more else "")
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get all forwardings: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get all forwardings: {str(e)}"
-        }, indent=2)
+        })
 
 
 @admin_only_tool()
@@ -3950,7 +4072,7 @@ def getAllOutOfOffice(domain: Optional[str] = None,
                 total_matches = int(search_response.get('searchTotal'))
             has_more = search_response.get('more') == '1'
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "accounts": accounts_data,
             "count": len(accounts_data),
@@ -3961,14 +4083,14 @@ def getAllOutOfOffice(domain: Optional[str] = None,
             "display_message": f"Found {len(accounts_data)} accounts with out-of-office enabled"
                               + (f" (domain: {domain})" if domain else "")
                               + (f" - more results available, use offset={offset + limit}" if has_more else "")
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get out-of-office accounts: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get out-of-office accounts: {str(e)}"
-        }, indent=2)
+        })
 
 
 @admin_only_tool()
@@ -4050,7 +4172,7 @@ def getInactiveAccounts(days: int = 90,
                 total_matches = int(search_response.get('searchTotal'))
             has_more = search_response.get('more') == '1'
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "accounts": accounts_data,
             "count": len(accounts_data),
@@ -4063,14 +4185,14 @@ def getInactiveAccounts(days: int = 90,
             "display_message": f"Found {len(accounts_data)} accounts inactive for {days}+ days"
                               + (f" (domain: {domain})" if domain else "")
                               + (f" - more results available, use offset={offset + limit}" if has_more else "")
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get inactive accounts: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get inactive accounts: {str(e)}"
-        }, indent=2)
+        })
 
 
 @admin_only_tool()
@@ -4184,7 +4306,7 @@ def searchByAttribute(query: str,
                 total_matches = int(search_response.get('searchTotal'))
             has_more = search_response.get('more') == '1'
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "results": results,
             "count": len(results),
@@ -4196,14 +4318,14 @@ def searchByAttribute(query: str,
             "display_message": f"Found {len(results)} results for LDAP filter: {query}"
                               + (f" (domain: {domain})" if domain else "")
                               + (f" - more results available, use offset={offset + limit}" if has_more else "")
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to search by attribute: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search by attribute: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Mail Search -------------------
 
@@ -4273,7 +4395,7 @@ def listFolders(account: str,
         else:
             matched = folders
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "account": account,
             "folders": matched,
@@ -4282,14 +4404,14 @@ def listFolders(account: str,
             "display_message": f"{len(matched)} folders"
                               + (f" matching '{keyword}'" if keyword else "")
                               + f" in {account}"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to list folders: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to list folders: {str(e)}"
-        }, indent=2)
+        })
 
 
 @mail_read_tool()
@@ -4462,7 +4584,7 @@ def searchMail(account: str,
                 total_matches = int(search_response.get('total'))
             has_more = search_response.get('more') == '1'
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "account": account,
             "query_used": search_query,
@@ -4476,14 +4598,14 @@ def searchMail(account: str,
                               + (f", showing {len(messages)}" if len(messages) < total_matches else "")
                               + (f" - more results available, use offset={offset + limit}" if has_more else ""),
             "usage_hint": "To read a message, call getMailDetail with the 'id' value from a message above. To get conversation thread, use the 'conversation_id' value."
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to search mail: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search mail for {account}: {str(e)}"
-        }, indent=2)
+        })
 
 
 @mail_read_tool()
@@ -4498,10 +4620,10 @@ def getMailDetail(account: str,
     logger.info(f"Getting mail detail for account={account}, msg_id={msg_id}")
 
     if not msg_id or not str(msg_id).strip():
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": "msg_id is required and cannot be empty. Use the 'id' field from searchMail results. Example: call searchMail first, then pass the 'id' value from a message in the results."
-        }, indent=2)
+        })
 
     try:
         soap_body = f"""
@@ -4517,10 +4639,10 @@ def getMailDetail(account: str,
         msg_elem = root.find(f'.//{{{ns_mail}}}m')
 
         if msg_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Message {msg_id} not found in {account}"
-            }, indent=2)
+            })
 
         msg_id_val = msg_elem.get('id', '')
         size = msg_elem.get('s', '0')
@@ -4616,7 +4738,7 @@ def getMailDetail(account: str,
             if hdr_name and hdr.text:
                 headers[hdr_name] = hdr.text
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "account": account,
             "message": {
@@ -4639,32 +4761,34 @@ def getMailDetail(account: str,
                 "headers": headers if headers else None,
                 "fragment": fragment
             }
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get mail detail: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get mail detail: {str(e)}"
-        }, indent=2)
+        })
 
 
 @mail_read_tool()
 def getConversation(account: str,
-                    conversation_id: str) -> str:
+                    conversation_id: str,
+                    limit: int = 25) -> str:
     """Get all messages in an email conversation thread. Use conversation_id from searchMail results.
 
     Args:
         account: Account email. Example: "user@example.com".
         conversation_id: Conversation ID from searchMail "conversation_id" field. Must be non-empty. Example: "-12345".
+        limit: Max messages to return (keeps newest). Default: 25.
     """
     logger.info(f"Getting conversation: account={account}, conv_id={conversation_id}")
 
     if not conversation_id or not str(conversation_id).strip():
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": "conversation_id is required and cannot be empty. Use the 'conversation_id' field from searchMail results."
-        }, indent=2)
+        })
 
     try:
         soap_body = f"""
@@ -4680,10 +4804,10 @@ def getConversation(account: str,
 
         conv_elem = root.find(f'.//{{{ns_mail}}}c')
         if conv_elem is None:
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Conversation {conversation_id} not found in {account}"
-            }, indent=2)
+            })
 
         conv_subject = ''
         su_elem = conv_elem.find(f'{{{ns_mail}}}su')
@@ -4759,22 +4883,33 @@ def getConversation(account: str,
         # Sort by date ascending (oldest first = conversation order)
         messages.sort(key=lambda x: x["date"])
 
-        return json.dumps({
+        total_in_thread = len(messages)
+        truncated = False
+        if limit and total_in_thread > limit:
+            messages = messages[-limit:]  # keep newest
+            truncated = True
+
+        result = {
             "status": "success",
             "account": account,
             "conversation_id": conversation_id,
             "subject": conv_subject,
-            "message_count": int(num_messages) if num_messages else len(messages),
+            "message_count": int(num_messages) if num_messages else total_in_thread,
             "messages": messages,
             "display_message": f"Conversation '{conv_subject}' - {len(messages)} messages"
-        }, indent=2)
+        }
+        if truncated:
+            result["truncated"] = True
+            result["total_in_thread"] = total_in_thread
+
+        return tool_response(result)
 
     except Exception as e:
         logger.error(f"Failed to get conversation: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get conversation: {str(e)}"
-        }, indent=2)
+        })
 
 
 @mail_read_tool()
@@ -4793,15 +4928,15 @@ def getMailAttachment(account: str,
     logger.info(f"Downloading attachment: account={account}, msg_id={msg_id}, part={part_id}")
 
     if not msg_id or not str(msg_id).strip():
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": "msg_id is required and cannot be empty. Use the 'id' field from searchMail results."
-        }, indent=2)
+        })
     if not part_id or not str(part_id).strip():
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": "part_id is required and cannot be empty. Use getMailDetail first to find attachment part_id values."
-        }, indent=2)
+        })
 
     try:
         if zimbra_config.auth_mode == "user":
@@ -4895,7 +5030,7 @@ def getMailAttachment(account: str,
 
         logger.info(f"Saved attachment: {filepath} ({total_size} bytes)")
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "account": account,
             "msg_id": msg_id,
@@ -4905,14 +5040,14 @@ def getMailAttachment(account: str,
             "size_bytes": total_size,
             "content_type": content_type,
             "display_message": f"Saved '{filename}' ({total_size:,} bytes) to {filepath}"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to download attachment: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to download attachment: {str(e)}"
-        }, indent=2)
+        })
 
 
 @mcp_server.tool()
@@ -5051,14 +5186,14 @@ def saveDraft(account: str,
         if reply_to_msg_id:
             result["note"] = "Original message was auto-quoted in the draft body. No need to include it separately."
 
-        return json.dumps(result, indent=2)
+        return tool_response(result)
 
     except Exception as e:
         logger.error(f"Failed to save draft: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to save draft: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- Directory Search -------------------
 
@@ -5115,7 +5250,7 @@ def _searchGal_user_mode(query: str, search_type: str, limit: int) -> str:
     else:
         display_msg = f"GAL search '{query}' found {returned_count} results (all displayed)"
 
-    return json.dumps({
+    return tool_response({
         "status": "success",
         "results": results,
         "count": returned_count,
@@ -5124,7 +5259,7 @@ def _searchGal_user_mode(query: str, search_type: str, limit: int) -> str:
         "has_more": has_more,
         "auth_mode": "user",
         "display_message": display_msg
-    }, indent=2)
+    })
 
 @mcp_server.tool()
 def searchGal(query: str,
@@ -5240,7 +5375,7 @@ def searchGal(query: str,
         else:
             display_msg = f"GAL search '{query}' found {returned_count} results (all displayed)"
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "results": results,
             "count": returned_count,
@@ -5248,14 +5383,14 @@ def searchGal(query: str,
             "limit": limit,
             "has_more": has_more,
             "display_message": display_msg
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to search GAL: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search GAL: {str(e)}"
-        }, indent=2)
+        })
 
 @mcp_server.tool()
 def searchContacts(account: str,
@@ -5330,7 +5465,7 @@ def searchContacts(account: str,
         if has_more:
             display_msg += f" — more results available, use offset={offset + limit}"
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "account": account,
             "contacts": contacts,
@@ -5340,14 +5475,14 @@ def searchContacts(account: str,
             "offset": offset,
             "limit": limit,
             "display_message": display_msg
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to search contacts: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to search contacts: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- COS Statistics -------------------
 
@@ -5427,19 +5562,19 @@ def countAccountByCOS(cos_name: Optional[str] = None) -> str:
 
         cos_statistics.sort(key=lambda x: x['account_count'], reverse=True)
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "cos_statistics": cos_statistics,
             "total_accounts": total_accounts,
             "display_message": f"{len(cos_statistics)} COS total, {total_accounts} accounts total"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to count accounts by COS: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to count accounts by COS: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- DL Nested Relations -------------------
 
@@ -5475,20 +5610,20 @@ def getDLMembership(email: str) -> str:
             }
             member_of.append(dl_info)
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "email": email,
             "member_of": member_of,
             "count": len(member_of),
             "display_message": f"{email} belongs to {len(member_of)} distribution lists"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get DL membership: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get DL membership: {str(e)}"
-        }, indent=2)
+        })
 
 # ------------------- System Information -------------------
 
@@ -5511,19 +5646,19 @@ def getVersionInfo() -> str:
             if info_elem is not None:
                 version_info["version"] = info_elem.get('version')
 
-            return json.dumps({
+            return tool_response({
                 "status": "success",
                 "auth_mode": "user",
                 "version_info": version_info,
                 "display_message": f"Zimbra {version_info.get('version', 'Unknown')} (user mode)"
-            }, indent=2)
+            })
 
         except Exception as e:
             logger.error(f"Failed to get version info (user mode): {e}")
-            return json.dumps({
+            return tool_response({
                 "status": "error",
                 "message": f"Failed to get version info: {str(e)}"
-            }, indent=2)
+            })
 
     # === ADMIN MODE: original code below ===
     try:
@@ -5550,18 +5685,18 @@ def getVersionInfo() -> str:
                 "micro_version": info_elem.get('microversion')
             }
 
-        return json.dumps({
+        return tool_response({
             "status": "success",
             "version_info": version_info,
             "display_message": f"Zimbra {version_info.get('version', 'Unknown')} ({version_info.get('release', 'Unknown')})"
-        }, indent=2)
+        })
 
     except Exception as e:
         logger.error(f"Failed to get version info: {e}")
-        return json.dumps({
+        return tool_response({
             "status": "error",
             "message": f"Failed to get version info: {str(e)}"
-        }, indent=2)
+        })
 
 # ======================= CLI Argument Parser =======================
 
@@ -5651,7 +5786,7 @@ if __name__ == "__main__":
     setup_http_session()
 
     logger.info("=" * 80)
-    logger.info("Zimbra Collaboration MCP Server v1.9.1")
+    logger.info("Zimbra Collaboration MCP Server v1.9.2")
     logger.info("=" * 80)
 
     # Calculate tool count based on feature toggles
