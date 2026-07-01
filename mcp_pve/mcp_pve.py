@@ -4,12 +4,21 @@ Proxmox VE MCP Server - Enhanced Edition with Batch Operations and Pagination
 Provides comprehensive Proxmox VE management functionality including batch data collection
 
 Author: Jason Cheng (jason@jason.tools)
-Version: 1.5.5
-Last Updated: 2026-02-26
+Version: 1.5.6
+Last Updated: 2026-07-01
 License: MIT
-Repository: https://raw.githubusercontent.com/jasoncheng7115/it-scripts/refs/heads/master/mcp/mcp_pve/mcp_pve.py
+Repository: https://github.com/jasoncheng7115/jasontools-mcp
 
 Changelog:
+v1.5.6 (2026-07-01) - Fix: Inaccurate VM memory usage (memory_used_mb could exceed total)
+         - Root cause: /nodes/{node}/qemu `mem` is host-side KVM process RSS (includes
+           QEMU emulation overhead), so it can exceed configured maxmem for VMs without
+           virtio-balloon guest reporting -> nonsensical ">100%" usage
+         - list_vms: For running VMs, fetch status/current and derive true in-guest usage
+           from ballooninfo.total_mem - free_mem when the guest reports balloon stats
+         - list_vms: Merged IP + memory lookups into a single concurrent gather wave
+         - list_vms/list_containers: Clamp memory_used_mb to never exceed memory_mb
+
 v1.5.5 (2026-02-26) - Fix: Remove include_details from get_ceph_status to prevent token overflow
          - Removed include_details parameter that dumped raw Ceph data (caused LLM context overflow)
          - Only summary_only=true/false remains: health-only or structured metrics
@@ -122,8 +131,8 @@ from pydantic import AnyUrl
 import mcp.types as types
 
 # Version information
-__version__ = "1.5.5"
-__last_updated__ = "2026-02-26"
+__version__ = "1.5.6"
+__last_updated__ = "2026-07-01"
 __author__ = "Jason Cheng"
 __email__ = "jason@jason.tools"
 __license__ = "MIT"
@@ -3028,16 +3037,42 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                     pass
                 return ""
 
-            ip_tasks = {}
-            for vm in paginated_vms:
-                if vm.get("status") == "running":
-                    ip_tasks[vm.get("vmid")] = get_vm_ip(vm.get("node"), vm.get("vmid"))
+            # Fetch accurate guest memory usage for running VMs (v1.5.6).
+            # The `mem` field from /nodes/{node}/qemu is the host-side RSS of the
+            # KVM process (includes QEMU emulation overhead), so it can exceed the
+            # configured maxmem and produce nonsensical ">100%" values. When the
+            # guest reports virtio-balloon stats, status/current exposes
+            # ballooninfo.total_mem/free_mem, from which the true in-guest usage
+            # (total - free) can be derived. Returns bytes, or None if unavailable.
+            async def get_vm_mem_used(vm_node, vmid):
+                try:
+                    result = await client.get(f"/nodes/{vm_node}/qemu/{vmid}/status/current")
+                    data = result.get("data", {}) or {}
+                    balloon = data.get("ballooninfo") or {}
+                    total_mem = balloon.get("total_mem")
+                    free_mem = balloon.get("free_mem")
+                    if total_mem and free_mem is not None:
+                        used = int(total_mem) - int(free_mem)
+                        return used if used >= 0 else None
+                except Exception:
+                    pass
+                return None
+
+            running_vms = [vm for vm in paginated_vms if vm.get("status") == "running"]
+            ip_coros = {vm.get("vmid"): get_vm_ip(vm.get("node"), vm.get("vmid")) for vm in running_vms}
+            mem_coros = {vm.get("vmid"): get_vm_mem_used(vm.get("node"), vm.get("vmid")) for vm in running_vms}
 
             ip_results = {}
-            if ip_tasks:
-                results = await asyncio.gather(*ip_tasks.values(), return_exceptions=True)
-                for vmid, result in zip(ip_tasks.keys(), results):
-                    ip_results[vmid] = result if isinstance(result, str) else ""
+            mem_results = {}
+            if running_vms:
+                # Single concurrent wave for both IP and memory lookups
+                combined = list(ip_coros.values()) + list(mem_coros.values())
+                results = await asyncio.gather(*combined, return_exceptions=True)
+                n = len(ip_coros)
+                for vmid, r in zip(ip_coros.keys(), results[:n]):
+                    ip_results[vmid] = r if isinstance(r, str) else ""
+                for vmid, r in zip(mem_coros.keys(), results[n:]):
+                    mem_results[vmid] = r if isinstance(r, int) else None
 
             # Inject IP into each VM dict
             for vm in paginated_vms:
@@ -3049,7 +3084,12 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                 for vm in paginated_vms:
                     maxmem = vm.get("maxmem", 0)
                     maxdisk = vm.get("maxdisk", 0)
-                    mem_used = vm.get("mem", 0)
+                    # Prefer balloon-derived guest usage; fall back to host RSS.
+                    accurate_mem = mem_results.get(vm.get("vmid"))
+                    mem_used = accurate_mem if accurate_mem is not None else vm.get("mem", 0)
+                    # Clamp to configured RAM so host-side overhead never reports >100%
+                    if maxmem and mem_used > maxmem:
+                        mem_used = maxmem
                     cpu_usage = vm.get("cpu", 0)
                     summary_vms.append({
                         "vmid": vm.get("vmid"),
@@ -3216,6 +3256,10 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                     maxdisk = container.get("maxdisk", 0)
                     maxswap = container.get("maxswap", 0)
                     mem_used = container.get("mem", 0)
+                    # Defensive clamp: cgroup mem may include page cache and slightly
+                    # exceed the configured limit; never report used > total (v1.5.6)
+                    if maxmem and mem_used > maxmem:
+                        mem_used = maxmem
                     cpu_usage = container.get("cpu", 0)
                     swap_used = container.get("swap", 0)
                     disk_used = container.get("disk", 0)
