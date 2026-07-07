@@ -26,9 +26,17 @@ Technical Capabilities:
 - Time snapshot for batch queries to prevent time drift
 
 Author: Jason Cheng (Jason Tools)
-Version: 1.9.41
+Version: 1.9.42
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
+
+Changes in 1.9.42:
+- Added 5 read-only infrastructure tools (parity with official Graylog MCP):
+  - get_current_time: server UTC/Taipei time to anchor correct absolute ranges
+  - list_inputs: configured inputs with type/port/state
+  - list_index_sets: rotation/retention policy per index set
+  - list_indices: cluster health + per-index size/doc-count/time-range
+  - list_fields: field-name schema for query building (prefix filter + limit)
 
 Changes in 1.9.41:
 - Fixed timezone offset in absolute time input being silently dropped
@@ -146,7 +154,7 @@ from mcp.types import Resource, Tool, TextContent, ImageContent, EmbeddedResourc
 import mcp.types as types
 
 # Version information
-__version__ = "1.9.41"
+__version__ = "1.9.42"
 __author__ = "Jason Cheng (Jason Tools) - AI Collaboration"
 __license__ = "MIT"
 
@@ -2177,6 +2185,38 @@ async def handle_list_tools() -> List[Tool]:
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
         ),
         Tool(
+            name="get_current_time",
+            description="Get the current server time in UTC (and Asia/Taipei). Call this FIRST when building absolute time ranges so UTC boundaries are correct. IMPORTANT: Graylog absolute ranges are UTC; do NOT pass +08:00 offsets, use '...Z' or 'now-Nh'.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+        ),
+        Tool(
+            name="list_inputs",
+            description="List configured Graylog inputs (syslog/GELF/raw etc.) with title, type, bind/port, global flag and running state. Use to check what is ingesting logs.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+        ),
+        Tool(
+            name="list_index_sets",
+            description="List Graylog index sets with rotation and retention policy (strategy, max size/age, retained indices), shards/replicas, writable and default flags.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+        ),
+        Tool(
+            name="list_indices",
+            description="List Elasticsearch/OpenSearch indices Graylog manages: cluster health, total event count, active write target, and per-index size/doc-count/time-range. Compact overview for storage and health checks.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+        ),
+        Tool(
+            name="list_fields",
+            description="List available message field names for building queries. Optional 'prefix' substring filter (case-insensitive) and 'limit'. Returns names only; use analyze_field_distribution for value stats.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "prefix": {"type": "string", "description": "Case-insensitive substring to filter field names. Ex: 'src', 'win', 'source'"},
+                    "limit": {"type": "integer", "description": "Max field names to return (default 200)", "default": 200}
+                },
+                "additionalProperties": False
+            }
+        ),
+        Tool(
             name="list_content_packs",
             description="List all installed Graylog content packs.",
             inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
@@ -3075,7 +3115,129 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                             return {"version": version_info}
             except Exception as e:
                 raise GraylogError(f"Failed to get system info: {e}")
-        
+
+        elif name == "get_current_time":
+            now_utc = datetime.now(timezone.utc)
+            taipei = now_utc.astimezone(timezone(timedelta(hours=8)))
+            return {
+                "utc": now_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                "asia_taipei": taipei.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+                "note": "Graylog absolute ranges are UTC. Build boundaries as '...Z' (UTC) or use relative 'now-Nh'. Do NOT pass +08:00 offsets."
+            }
+
+        elif name == "list_inputs":
+            try:
+                result = await client.get("/system/inputs")
+                # Merge running state if available (best effort)
+                states = {}
+                try:
+                    st = await client.get("/system/inputstates")
+                    for s in (st.get("states", []) if isinstance(st, dict) else []):
+                        iid = s.get("id") or (s.get("message_input", {}) or {}).get("id")
+                        if iid:
+                            states[iid] = s.get("state", "")
+                except Exception:
+                    pass
+                inputs = []
+                for inp in (result.get("inputs", []) if isinstance(result, dict) else []):
+                    attrs = inp.get("attributes", {}) or {}
+                    iid = inp.get("id", "")
+                    inputs.append({
+                        "id": iid,
+                        "title": inp.get("title", ""),
+                        "type": inp.get("name", inp.get("type", "")),
+                        "global": inp.get("global", False),
+                        "node": inp.get("node"),
+                        "bind_address": attrs.get("bind_address"),
+                        "port": attrs.get("port"),
+                        "state": states.get(iid, "")
+                    })
+                inputs.sort(key=lambda x: str(x["title"]).lower())
+                return {"inputs": inputs, "total": len(inputs)}
+            except Exception as e:
+                raise GraylogError(f"Failed to list inputs: {e}")
+
+        elif name == "list_index_sets":
+            try:
+                result = await client.get("/system/indices/index_sets")
+                sets = []
+                for s in (result.get("index_sets", []) if isinstance(result, dict) else []):
+                    rot = s.get("rotation_strategy", {}) or {}
+                    ret = s.get("retention_strategy", {}) or {}
+                    sets.append({
+                        "id": s.get("id", ""),
+                        "title": s.get("title", ""),
+                        "description": s.get("description", ""),
+                        "index_prefix": s.get("index_prefix"),
+                        "shards": s.get("shards"),
+                        "replicas": s.get("replicas"),
+                        "writable": s.get("writable"),
+                        "default": s.get("default"),
+                        "rotation_strategy": (s.get("rotation_strategy_class", "") or "").split(".")[-1],
+                        "rotation": {k: v for k, v in rot.items() if k != "type"},
+                        "retention_strategy": (s.get("retention_strategy_class", "") or "").split(".")[-1],
+                        "retention": {k: v for k, v in ret.items() if k != "type"}
+                    })
+                return {"index_sets": sets, "total": result.get("total", len(sets)) if isinstance(result, dict) else len(sets)}
+            except Exception as e:
+                raise GraylogError(f"Failed to list index sets: {e}")
+
+        elif name == "list_indices":
+            try:
+                overview = await client.get("/system/indexer/overview")
+                deflector = overview.get("deflector", {}) if isinstance(overview, dict) else {}
+                cluster = overview.get("indexer_cluster", {}) if isinstance(overview, dict) else {}
+                health = (cluster.get("health", {}) or {})
+                indices = []
+                for idx in (overview.get("indices", []) if isinstance(overview, dict) else []):
+                    size = idx.get("size", {}) or {}
+                    rng = idx.get("range", {}) or {}
+                    indices.append({
+                        "index_name": idx.get("index_name", ""),
+                        "events": size.get("events"),
+                        "deleted": size.get("deleted"),
+                        "size_bytes": size.get("bytes"),
+                        "range_begin": rng.get("begin"),
+                        "range_end": rng.get("end")
+                    })
+                return {
+                    "cluster_health": health.get("status"),
+                    "shards": health.get("shards"),
+                    "total_events": (overview.get("counts", {}) or {}).get("events") if isinstance(overview, dict) else None,
+                    "write_target": deflector.get("current_target"),
+                    "deflector_up": deflector.get("is_up"),
+                    "indices": indices,
+                    "total_indices": len(indices)
+                }
+            except Exception as e:
+                raise GraylogError(f"Failed to list indices: {e}")
+
+        elif name == "list_fields":
+            prefix = str(arguments.get("prefix", "") or "").lower()
+            try:
+                limit = int(arguments.get("limit", 200) or 200)
+            except (TypeError, ValueError):
+                limit = 200
+            if limit < 1:
+                limit = 200
+            try:
+                result = await client.get("/system/fields")
+                fields = result.get("fields", []) if isinstance(result, dict) else []
+                if prefix:
+                    fields = [f for f in fields if prefix in str(f).lower()]
+                fields = sorted(fields)
+                total = len(fields)
+                truncated = total > limit
+                return {
+                    "fields": fields[:limit],
+                    "returned": min(total, limit),
+                    "total_matched": total,
+                    "truncated": truncated,
+                    "prefix": arguments.get("prefix", "") or None
+                }
+            except Exception as e:
+                raise GraylogError(f"Failed to list fields: {e}")
+
         # ================ Content Packs Tools ================
         elif name == "list_content_packs":
             try:
