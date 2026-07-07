@@ -25,7 +25,19 @@ Technical Capabilities:
 - Comprehensive error handling and retry mechanisms with file logging (~/.mcp_graylog.log)
 - Time snapshot for batch queries to prevent time drift
 
-Version: 1.9.40
+Author: Jason Cheng (Jason Tools)
+Version: 1.9.41
+License: MIT
+Repository: https://github.com/jasoncheng7115/jasontools-mcp
+
+Changes in 1.9.41:
+- Fixed timezone offset in absolute time input being silently dropped
+- Time strings with an offset (e.g. 2026-07-05T00:00:00+08:00) were parsed
+  then .replace(tzinfo=None)'d WITHOUT converting to UTC, so the local
+  wall-clock value was treated as UTC -> up to 8h window shift and inflated
+  counts (root cause of the 2026-07-06 "Mail Server 5.1x" false-alarm RCA)
+- Offset-aware inputs are now converted to UTC before the tzinfo is dropped;
+  naive (offset-less) and Z-suffixed inputs keep their existing behaviour
 
 Changes in 1.9.40:
 - Fixed TransportSecurityMiddleware crash on SSE/streamable-http startup
@@ -119,7 +131,7 @@ import os
 import sys
 import time
 from typing import Any, Dict, List, Optional, Union
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import csv
 import io
 from collections import Counter, defaultdict
@@ -134,7 +146,7 @@ from mcp.types import Resource, Tool, TextContent, ImageContent, EmbeddedResourc
 import mcp.types as types
 
 # Version information
-__version__ = "1.9.40"
+__version__ = "1.9.41"
 __author__ = "Jason Cheng (Jason Tools) - AI Collaboration"
 __license__ = "MIT"
 
@@ -643,10 +655,19 @@ class GraylogClient:
             # Handle ISO format with Z
             if time_str.endswith('z'):
                 time_str = time_str[:-1] + '+00:00'
-            
-            dt = datetime.fromisoformat(time_str).replace(tzinfo=None)
+
+            dt = datetime.fromisoformat(time_str)
+            # Timezone handling: Graylog absolute timerange expects UTC.
+            # If the input carries a timezone offset (e.g. +08:00), convert to
+            # UTC BEFORE dropping tzinfo. Previously we called .replace(tzinfo=None)
+            # directly, which discarded the offset and treated the local wall-clock
+            # value as UTC -> up to 8h window shift and inflated counts
+            # (see RCA 2026-07-06 "Mail Server 5.1x" false alarm). Naive input
+            # (no offset) is assumed to already be UTC, preserving prior behaviour.
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
             iso_format = dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-            
+
             return {
                 "type": "absolute",
                 "graylog_format": iso_format,
