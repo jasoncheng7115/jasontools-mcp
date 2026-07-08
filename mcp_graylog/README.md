@@ -1,10 +1,10 @@
 # Graylog MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **18 tools** (16 analysis/management + 2 debug), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **23 tools** (21 analysis/management + 2 debug), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.9.40
+- **Version:** 1.9.43
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -139,7 +139,7 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 ---
 
-## Tools (18)
+## Tools (23)
 
 ### Log statistics & analysis
 
@@ -166,6 +166,11 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 |---|---|
 | `get_streams` | List all streams with ID, title, description, status |
 | `get_system_info` | Server version, cluster status, node info |
+| `get_current_time` | Server time in UTC and Asia/Taipei — anchor correct absolute (UTC) time ranges |
+| `list_inputs` | Configured inputs (syslog/GELF/raw…) with type, bind/port and running state |
+| `list_index_sets` | Index sets with rotation/retention policy, shards/replicas, writable/default flags |
+| `list_indices` | Cluster health, total event count, active write target, per-index size/doc-count/time-range |
+| `list_fields` | Available message field names for query building (optional `prefix` filter + `limit`) |
 
 ### Content packs & dashboards
 
@@ -190,7 +195,9 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 - **API-limit breakthrough.** Graylog's search API caps result sizes; for accurate counts/distributions this server combines the Export API, time slicing and smart pagination, then de-duplicates. A single time snapshot is taken per batch query to avoid time drift between sub-requests.
 - **Query escaping.** Query strings are normalized to Graylog's escaping rules — e.g. `source:router\-004` vs `source:"router-004"` are treated equivalently; unescaped special characters are validated/auto-fixed.
-- **Errors are explicit.** When all Graylog API attempts fail, tools return an explicit error rather than an empty result (so the LLM doesn't assume "no data"). API errors are logged at WARNING and captured in `~/.mcp_graylog.log`.
+- **Numeric/IP terms are auto-quoted.** Bare numeric or IPv4 tokens (e.g. `4624`, `192.168.1.100`) are wrapped in quotes before hitting Graylog (`AUTO_QUOTE_NUMERIC_TERMS`). This sidesteps OpenSearch `search_phase_execution`/`number_format` exceptions that fire when a field is mapped with conflicting types across a stream's indices, and is the semantically-correct match for an IP. Field-scoped (`port:443`), already-quoted, wildcard and range tokens are left untouched.
+- **Time ranges are UTC.** Absolute ranges are interpreted as UTC. Offset-bearing input (e.g. `+08:00`) is now correctly converted to UTC before querying; prefer `...Z` or relative `now-Nh`. Call `get_current_time` to anchor boundaries.
+- **Errors are explicit.** When all Graylog API attempts fail, tools return an explicit error (not an empty result) that **surfaces the underlying OpenSearch search/count error** plus a hint when it looks like a numeric field-mapping conflict. API errors are logged at WARNING and captured in `~/.mcp_graylog.log`.
 - All tools return compact JSON with trimmed metadata to reduce LLM token usage.
 - DNS-rebinding middleware is not attached to the HTTP transports, avoiding `421 Misdirected Request` behind reverse proxies.
 
@@ -198,6 +205,9 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 ## Changelog (recent)
 
+- **v1.9.43** — Fixed bare numeric/IPv4 query terms failing with a generic error on streams with index field-mapping conflicts: auto-quote numeric/IP tokens, and surface the underlying OpenSearch error instead of swallowing it.
+- **v1.9.42** — Added 5 read-only infrastructure tools (`get_current_time`, `list_inputs`, `list_index_sets`, `list_indices`, `list_fields`) for parity with the official Graylog MCP.
+- **v1.9.41** — Fixed timezone offset (`+08:00`) in absolute time input being dropped instead of converted to UTC (caused up to an 8h window shift and inflated counts).
 - **v1.9.40** — Fixed `TransportSecurityMiddleware` crash on SSE/streamable-http startup.
 - **v1.9.39** — Added API-key auth middleware (`--api-key` / `MCP_API_KEY`); shared SSE/HTTP middleware setup.
 - **v1.9.38** — Added SSE transport; fixed false-positive API-error detection on legitimately empty results.
