@@ -362,7 +362,7 @@ Endpoint: `http://<host>:<port>/mcp`
 | `getInactiveAccounts` | List accounts inactive for N+ days |
 | `searchByAttribute` | Generic LDAP filter search for any attribute |
 
-### Mail Search (4 tools)
+### Mail Search (7 tools)
 
 | Tool | Description |
 |------|-------------|

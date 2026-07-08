@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-OPNsense MCP Server - v2.2.1 (FastMCP Rewrite)
+OPNsense MCP Server - v2.3.0 (FastMCP Rewrite)
 ================================================
 Author: Jason Cheng (Jason Tools) - Enhanced by Claude
 License: MIT
@@ -14,6 +14,11 @@ Supports stdio, streamable-http, and sse transport.
 pip install mcp aiohttp requests defusedxml uvicorn
 
 Changelog:
+  v2.3.0 - Native-API firewall rules + aliases
+    - getFirewallRules/getConfigSummary/downloadConfigXml use search_rule?show_all=1
+    - Alias content via alias/search_item; matching via alias_meta_*
+    - Fixes firewall_rules=0 in getConfigSummary/downloadConfigXml on 24.7+
+    - Version label reconciled: these features shipped but were still tagged v2.2.1
   v2.2.1 (2026-03-02) - Fix Claude Desktop launch: upgrade mcp 1.9.4 → 1.26.0
     - Local venv mcp package too old, missing mcp.server.transport_security module
     - Upgraded /Users/jasoncheng/venvs/mcp-opnsense/ mcp dependency
@@ -81,7 +86,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("mcp-opnsense")
 
-__version__ = "2.2.1"
+__version__ = "2.3.0"
 
 
 # ───────────────────────── Configuration ─────────────────────────
