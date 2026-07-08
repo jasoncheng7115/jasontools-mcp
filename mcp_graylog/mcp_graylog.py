@@ -26,9 +26,22 @@ Technical Capabilities:
 - Time snapshot for batch queries to prevent time drift
 
 Author: Jason Cheng (Jason Tools)
-Version: 1.9.42
+Version: 1.9.43
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
+
+Changes in 1.9.43:
+- Fixed: queries with bare numeric/IPv4 tokens (IP, account, digits) failing with
+  a generic "All Graylog API attempts failed" on streams whose indices have a
+  field-mapping conflict (OpenSearch throws on the numeric term). SSL-VPN-style
+  clean-mapping streams were unaffected.
+  - Root cause is per-environment index mapping, but the wrapper made it (a)
+    undiagnosable by swallowing the real error, and (b) unmitigated.
+  - Now auto-quotes bare numeric / IPv4 query tokens (AUTO_QUOTE_NUMERIC_TERMS)
+    so OpenSearch does a text-term match instead of numeric parsing. Field-scoped,
+    quoted, wildcard and range tokens are left untouched.
+  - API-failure responses now surface the underlying OpenSearch error (search/
+    count) plus a hint when it looks like a numeric field-mapping conflict.
 
 Changes in 1.9.42:
 - Added 5 read-only infrastructure tools (parity with official Graylog MCP):
@@ -154,7 +167,7 @@ from mcp.types import Resource, Tool, TextContent, ImageContent, EmbeddedResourc
 import mcp.types as types
 
 # Version information
-__version__ = "1.9.42"
+__version__ = "1.9.43"
 __author__ = "Jason Cheng (Jason Tools) - AI Collaboration"
 __license__ = "MIT"
 
@@ -798,6 +811,7 @@ class GraylogClient:
         max_count = 0
         successful_strategies = []
         all_failed_with_error = True
+        last_count_error = None
 
         for strategy_name, strategy_func in count_strategies:
             try:
@@ -814,9 +828,14 @@ class GraylogClient:
 
             except Exception as e:
                 logger.warning(f"{strategy_name} failed: {e}")
+                last_count_error = e
                 continue
 
         self._last_count_api_failed = all_failed_with_error
+        # Preserve the underlying error so callers can surface it instead of a
+        # generic "all attempts failed" message (e.g. OpenSearch field-mapping
+        # conflicts on numeric terms). Only meaningful when every strategy threw.
+        self._last_count_error = str(last_count_error) if (all_failed_with_error and last_count_error) else None
         logger.info(f"Accurate count result: {max_count}")
         logger.info(f"Successful strategies: {successful_strategies}")
         
@@ -1568,6 +1587,7 @@ class GraylogClient:
                 continue
         
         self._last_search_api_failed = last_error is not None
+        self._last_search_error = str(last_error) if last_error else None
         if last_error:
             logger.warning(f"All high limit attempts failed, last error: {last_error}")
         else:
@@ -2315,6 +2335,92 @@ async def handle_call_tool(name: str, arguments: dict) -> List[Union[types.TextC
         logger.error(error_msg)
         return [types.TextContent(type="text", text=error_msg)]
 
+# When True, bare numeric / IPv4 query tokens are wrapped in double quotes
+# before hitting Graylog. This sidesteps OpenSearch search_phase_execution /
+# number_format exceptions that fire when a field name is mapped with
+# conflicting types across the indices backing a stream (observed: numeric IP /
+# account tokens failing on Firewall/Windows-AD/VMware streams while text-only
+# queries succeed). Quoting is also the semantically-correct match for an IP.
+AUTO_QUOTE_NUMERIC_TERMS = True
+
+
+def quote_bare_numeric_terms(query: str) -> str:
+    r"""Wrap bare numeric / IPv4 tokens in double quotes.
+
+    Only unquoted, non-field-scoped tokens that are purely numeric (e.g. 4624)
+    or an IPv4 literal (e.g. 192.168.1.100) are quoted. Field-scoped values
+    (field:value), already-quoted spans, wildcards, ranges and boolean
+    operators are left untouched.
+
+    Examples:
+    - 4624                    -> "4624"
+    - source:win AND 4624     -> source:win AND "4624"
+    - 192.168.1.100           -> "192.168.1.100"
+    - port:443                -> port:443            (field-scoped, untouched)
+    - "4624"                  -> "4624"              (already quoted, untouched)
+    """
+    if not query:
+        return query
+
+    num_re = re.compile(r'^\d+$')
+    ipv4_re = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
+
+    out = []
+    i, n = 0, len(query)
+    while i < n:
+        c = query[i]
+        if c == '"':
+            # Copy a quoted span verbatim (respect backslash escaping).
+            j = i + 1
+            while j < n and query[j] != '"':
+                if query[j] == '\\':
+                    j += 1
+                j += 1
+            out.append(query[i:min(j + 1, n)])
+            i = j + 1
+        elif c.isspace() or c in '()':
+            out.append(c)
+            i += 1
+        else:
+            # Read a whitespace/paren/quote-delimited token.
+            j = i
+            while j < n and (not query[j].isspace()) and query[j] not in '()"':
+                j += 1
+            token = query[i:j]
+            if all(ch not in token for ch in (':', '\\', '*', '?', '[', ']', '{', '}')):
+                if num_re.match(token) or ipv4_re.match(token):
+                    token = f'"{token}"'
+            out.append(token)
+            i = j
+    return ''.join(out)
+
+
+def _api_failure_message(client) -> str:
+    """Build the API-failure error string, surfacing the underlying exception
+    instead of only the generic message (the wrapper used to swallow the real
+    OpenSearch error, making field-mapping conflicts undiagnosable)."""
+    base = ("All Graylog API attempts failed. Check server connectivity, "
+            "credentials, and ~/.mcp_graylog.log for details.")
+    details = []
+    se = getattr(client, '_last_search_error', None)
+    ce = getattr(client, '_last_count_error', None)
+    if se:
+        details.append(f"search: {se[:300]}")
+    if ce:
+        details.append(f"count: {ce[:300]}")
+    if not details:
+        return base
+    base += " Underlying error(s) -> " + " | ".join(details)
+    joined = " ".join(details).lower()
+    if any(k in joined for k in ("number_format", "search_phase_execution",
+                                 "failed to parse", "illegal_argument",
+                                 "mapper_parsing", "for input string")):
+        base += (". Hint: likely an OpenSearch field-mapping conflict on a "
+                 "numeric term. Quote the numeric/IP value (e.g. "
+                 '"192.168.1.100") or scope it to a text field (message:VALUE).')
+    return base
+
+
 def normalize_query_string(query: str, auto_fix_escaping: bool = False) -> str:
     r"""
     Normalize query string to handle Graylog escaping rules correctly.
@@ -2380,7 +2486,14 @@ def normalize_query_string(query: str, auto_fix_escaping: bool = False) -> str:
         if '\\-' not in value and '"' not in value:
             logger.debug(f"Note: Unescaped hyphen in query: {field}:{value}")
             logger.debug(f"This might need: {field}:{value.replace('-', '\\-')} or {field}:\"{value}\"")
-    
+
+    # Quote bare numeric / IPv4 terms to avoid OpenSearch field-mapping throws.
+    if AUTO_QUOTE_NUMERIC_TERMS:
+        quoted = quote_bare_numeric_terms(normalized)
+        if quoted != normalized:
+            logger.info(f"Query numeric terms quoted: '{normalized}' -> '{quoted}'")
+            normalized = quoted
+
     return normalized
 
 async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
@@ -2445,7 +2558,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
 
                 if not messages and accurate_total_count == 0 and (getattr(client, '_last_search_api_failed', False) or getattr(client, '_last_count_api_failed', False)):
                     return {
-                        "error": "All Graylog API attempts failed. Check server connectivity, credentials, and ~/.mcp_graylog.log for details.",
+                        "error": _api_failure_message(client),
                         "total_count": 0,
                         "sample_size": 0,
                         "query": query,
@@ -2546,7 +2659,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
 
                 if not messages and accurate_total_count == 0 and (getattr(client, '_last_search_api_failed', False) or getattr(client, '_last_count_api_failed', False)):
                     return {
-                        "error": "All Graylog API attempts failed. Check server connectivity, credentials, and ~/.mcp_graylog.log for details.",
+                        "error": _api_failure_message(client),
                         "source_distribution": {},
                         "total_count": 0,
                         "sample_size": 0,
@@ -2623,7 +2736,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                 
                 if not messages and accurate_total_count == 0 and (getattr(client, '_last_search_api_failed', False) or getattr(client, '_last_count_api_failed', False)):
                     return {
-                        "error": "All Graylog API attempts failed. Check server connectivity, credentials, and ~/.mcp_graylog.log for details.",
+                        "error": _api_failure_message(client),
                         "error_patterns": {},
                         "total_count": 0,
                         "sample_size": 0,
@@ -2729,7 +2842,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
 
                 if not messages and accurate_total_count == 0 and (getattr(client, '_last_search_api_failed', False) or getattr(client, '_last_count_api_failed', False)):
                     return {
-                        "error": "All Graylog API attempts failed. Check server connectivity, credentials, and ~/.mcp_graylog.log for details.",
+                        "error": _api_failure_message(client),
                         "field_analysis": {},
                         "total_count": 0,
                         "sample_size": 0,
@@ -2818,7 +2931,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
 
                 if not sample_messages and accurate_total_count == 0 and (getattr(client, '_last_search_api_failed', False) or getattr(client, '_last_count_api_failed', False)):
                     return {
-                        "error": "All Graylog API attempts failed. Check server connectivity, credentials, and ~/.mcp_graylog.log for details.",
+                        "error": _api_failure_message(client),
                         "messages": [],
                         "total_count": 0,
                         "returned": 0,
@@ -2942,7 +3055,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                 
                 if not paginated_messages and accurate_total_count == 0 and (getattr(client, '_last_search_api_failed', False) or getattr(client, '_last_count_api_failed', False)):
                     return {
-                        "error": "All Graylog API attempts failed. Check server connectivity, credentials, and ~/.mcp_graylog.log for details.",
+                        "error": _api_failure_message(client),
                         "messages": [],
                         "total_count": 0,
                         "returned": 0,
@@ -2992,7 +3105,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                 
                 if not messages and accurate_total_count == 0 and (getattr(client, '_last_search_api_failed', False) or getattr(client, '_last_count_api_failed', False)):
                     return {
-                        "error": "All Graylog API attempts failed. Check server connectivity, credentials, and ~/.mcp_graylog.log for details.",
+                        "error": _api_failure_message(client),
                         "total_count": 0,
                         "sample_size": 0,
                         "sample_data": [],
