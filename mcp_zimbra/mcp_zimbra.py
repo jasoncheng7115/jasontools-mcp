@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MCP server for Zimbra Collaboration Suite - v1.9.2
+MCP server for Zimbra Collaboration Suite - v1.10.0
 ===============================================================================
 Author: Jason Cheng (co-created with Claude Code)
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Created: 2025-01-27
-Updated: 2026-03-02
+Updated: 2026-09-04
 
 Reference:
 This implementation follows design patterns from mcp_wazuh_sample.py
@@ -16,6 +16,25 @@ FastMCP-based Zimbra integration providing comprehensive email system monitoring
 and analysis capabilities through natural language interactions.
 
 Version History:
+- v1.10.0 (2026-09-04): FEATURE - Calendar and Tasks read access
+  - NEW TOOL searchCalendar: appointments in a date range, across all calendars or
+    one folder; expands recurring events via calExpandInstStart/End; optional
+    include_attendees (capped at 20 results, one extra fetch each)
+  - NEW TOOL getAppointment: full detail for one appointment — description body,
+    every attendee with reply status (<replies> overrides <at ptst>), recurrence
+    rule, attachments
+  - NEW TOOL searchTasks: Zimbra Tasks with folder / status / due-date filters;
+    status and due filtering happen client-side because Zimbra task search has no
+    reliable server-side operator for them
+  - Unlike searchMail, date_from/date_to are SOAP attributes rather than query
+    terms, so a caller-supplied `query` and the date range now apply together
+    instead of the query silently winning
+  - Param naming follows getMailDetail's msg_id style: appt_id
+- v1.9.3 (2026-08-31): FIX - searchMail date_from/date_to silently returned 0 results
+  - Only YYYY/MM/DD parsed; any other form (e.g. ISO 2026-01-01) was passed to
+    Zimbra verbatim, producing a query that matched nothing with no error raised
+  - Now accepts YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY, YYYYMMDD via _parse_search_date()
+  - An unparseable date now returns an explicit error instead of an empty result set
 - v1.9.2 (2026-03-02): OPTIMIZATION - Weak LLM compatibility
                        - NEW HELPER: tool_response() — compact JSON output with usage_hint injection
                        - All json.dumps calls migrated to tool_response() (removes indent=2, saves ~30% tokens)
@@ -4414,6 +4433,21 @@ def listFolders(account: str,
         })
 
 
+def _parse_search_date(value: str):
+    """Parse a user-supplied search date into a datetime, or None if unparseable.
+
+    Callers previously only accepted YYYY/MM/DD and passed anything else through
+    to Zimbra verbatim, which produced a query Zimbra silently matched nothing
+    against - an ISO date like 2026-01-01 returned 0 results with no error.
+    """
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%Y%m%d"):
+        try:
+            return datetime.strptime(str(value).strip(), fmt)
+        except ValueError:
+            continue
+    return None
+
+
 @mail_read_tool()
 def searchMail(account: str,
                query: Optional[str] = None,
@@ -4439,8 +4473,8 @@ def searchMail(account: str,
         cc: Search by CC recipient email. Example: "manager@example.com".
         content: Search in message body text. Example: "quarterly report".
         folder: Limit to folder. Supports fuzzy match — e.g. "華電" matches "中華電信" and "華電聯網". Example: "inbox", "sent", "華電". Default: all folders.
-        date_from: Start date inclusive. Format: "YYYY/MM/DD". Example: "2025/01/01".
-        date_to: End date inclusive. Format: "YYYY/MM/DD". Example: "2025/12/31".
+        date_from: Start date inclusive. Accepts YYYY-MM-DD, YYYY/MM/DD, or MM/DD/YYYY. Example: "2025-01-01".
+        date_to: End date inclusive. Accepts YYYY-MM-DD, YYYY/MM/DD, or MM/DD/YYYY. Example: "2025-12-31".
         has_attachment: Only messages with attachments. Default: false.
         limit: Max results. Default: 50. Range: 1-500.
         offset: Starting position for pagination. Default: 0.
@@ -4486,18 +4520,24 @@ def searchMail(account: str,
                         parts.append(f'in:"{folder}"')
             if date_from:
                 # Zimbra after: is exclusive, subtract 1 day to make inclusive
-                try:
-                    df = datetime.strptime(date_from, "%Y/%m/%d") - timedelta(days=1)
-                    parts.append(f'after:{df.strftime("%Y/%m/%d")}')
-                except ValueError:
-                    parts.append(f'after:{date_from}')
+                df = _parse_search_date(date_from)
+                if df is None:
+                    return tool_response({
+                        "status": "error",
+                        "message": f"Invalid date_from '{date_from}'. "
+                                   f"Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
+                    })
+                parts.append(f'after:{(df - timedelta(days=1)).strftime("%Y/%m/%d")}')
             if date_to:
                 # Zimbra before: is exclusive, add 1 day to make inclusive
-                try:
-                    dt = datetime.strptime(date_to, "%Y/%m/%d") + timedelta(days=1)
-                    parts.append(f'before:{dt.strftime("%Y/%m/%d")}')
-                except ValueError:
-                    parts.append(f'before:{date_to}')
+                dt = _parse_search_date(date_to)
+                if dt is None:
+                    return tool_response({
+                        "status": "error",
+                        "message": f"Invalid date_to '{date_to}'. "
+                                   f"Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
+                    })
+                parts.append(f'before:{(dt + timedelta(days=1)).strftime("%Y/%m/%d")}')
             if has_attachment:
                 parts.append('has:attachment')
             search_query = ' '.join(parts) if parts else 'in:inbox'
@@ -5048,6 +5088,572 @@ def getMailAttachment(account: str,
             "status": "error",
             "message": f"Failed to download attachment: {str(e)}"
         })
+
+
+
+# ======================= Calendar & Tasks =======================
+#
+# Zimbra represents appointments and tasks as calendar items, not messages, so
+# searchMail (types="message") can never see them.  These tools use
+# types="appointment" / types="task" against the same admin-delegated mail API.
+#
+# Note on date filtering: unlike searchMail, date_from/date_to here are NOT part
+# of the search query string - they become calExpandInstStart/calExpandInstEnd
+# SOAP attributes.  That means a caller-supplied `query` and the date range are
+# applied together; neither silently overrides the other.
+
+_PTST_MAP = {
+    "AC": "accepted", "DE": "declined", "TE": "tentative", "NE": "needs-action",
+    "DG": "delegated", "CO": "completed", "IN": "in-process", "WE": "waiting",
+    "DF": "deferred",
+}
+
+_ITEM_STATUS_MAP = {
+    "CONF": "confirmed", "CANC": "cancelled", "TENT": "tentative",
+    "NEED": "needs-action", "COMP": "completed", "INPR": "in-progress",
+    "WAITING": "waiting", "DEFERRED": "deferred",
+}
+
+_TASK_STATUS_ALIASES = {
+    "needs-action": "NEED", "needsaction": "NEED", "todo": "NEED",
+    "in-progress": "INPR", "inprogress": "INPR",
+    "completed": "COMP", "done": "COMP",
+    "deferred": "DEFERRED", "waiting": "WAITING",
+}
+
+_PRIORITY_MAP = {"1": "high", "2": "high", "3": "high",
+                 "4": "normal", "5": "normal", "6": "normal",
+                 "7": "low", "8": "low", "9": "low"}
+
+
+def _ms_to_iso(ms) -> Optional[str]:
+    """Convert Zimbra epoch-milliseconds to a local-time ISO 8601 string with offset."""
+    if ms in (None, "", "0"):
+        return None
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000).astimezone().isoformat()
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _day_bounds_ms(date_from: Optional[str], date_to: Optional[str],
+                   default_days: int = 30):
+    """Resolve a date range into (start_ms, end_ms, error).
+
+    Defaults to today 00:00 through +default_days, which suits the common
+    "what's on this week" question without forcing callers to pass dates.
+    """
+    if date_from:
+        start = _parse_search_date(date_from)
+        if start is None:
+            return None, None, f"Invalid date_from '{date_from}'. Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
+    else:
+        now = datetime.now()
+        start = datetime(now.year, now.month, now.day)
+
+    if date_to:
+        end = _parse_search_date(date_to)
+        if end is None:
+            return None, None, f"Invalid date_to '{date_to}'. Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
+    else:
+        end = start + timedelta(days=default_days)
+
+    # date_to is inclusive: extend to the end of that day
+    end = end + timedelta(days=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000), None
+
+
+def _folder_num(folder_ref: str) -> str:
+    """Zimbra returns folder ids as '<mailbox-uuid>:<n>' for delegated access."""
+    return str(folder_ref or "").split(":")[-1]
+
+
+def _calendar_folders(account: str, view: str) -> list:
+    """All folders of a given view ('appointment' or 'task') for an account."""
+    return [f for f in _get_account_folders(account) if f.get("view") == view]
+
+
+def _resolve_folder_clause(account: str, folder: str, view: str):
+    """Build an 'inid:' query clause from a folder name (fuzzy) or path.
+
+    Returns (clause, matched_paths).  Falls back to an in:"name" clause when
+    nothing matches so Zimbra can still try.
+    """
+    candidates = _calendar_folders(account, view)
+    wanted = folder.strip().lower()
+
+    matched = [f for f in candidates if f["path"].lower() == wanted or f["name"].lower() == wanted]
+    if not matched:
+        matched = [f for f in candidates if wanted in f["path"].lower() or wanted in f["name"].lower()]
+
+    if not matched:
+        return f'in:"{folder}"', []
+
+    ids = [_folder_num(f["id"]) for f in matched]
+    clause = f'inid:{ids[0]}' if len(ids) == 1 else "(" + " OR ".join(f"inid:{i}" for i in ids) + ")"
+    return clause, [f["path"] for f in matched]
+
+
+def _all_folders_clause(account: str, view: str) -> str:
+    """OR of every folder id of a view.
+
+    Zimbra's SearchRequest returns nothing for types="appointment"/"task" when
+    the query is empty - it does not mean "everything". So "all calendars" has
+    to be spelled out as an explicit inid: list.
+    """
+    ids = [_folder_num(f["id"]) for f in _calendar_folders(account, view)]
+    if not ids:
+        return ""
+    if len(ids) == 1:
+        return f"inid:{ids[0]}"
+    return "(" + " OR ".join(f"inid:{i}" for i in ids) + ")"
+
+
+def _parse_attendees(comp_elem, ns_mail: str, appt_elem=None) -> list:
+    """Attendees plus their reply status.
+
+    The <at ptst=...> value is the status recorded on the invite; when the
+    appointment carries a <replies> block that reply is authoritative, so it
+    overrides <at>.  Pass appt_elem so both searchCalendar and getAppointment
+    report the same status for the same meeting.
+    """
+    attendees = []
+    for at in comp_elem.findall(f'{{{ns_mail}}}at'):
+        addr = at.get('a', '')
+        attendees.append({
+            "email": addr,
+            "name": at.get('d', ''),
+            "role": at.get('role', ''),
+            "rsvp": at.get('rsvp') == '1',
+            "status": _PTST_MAP.get(at.get('ptst', ''), at.get('ptst', '')),
+        })
+
+    if appt_elem is not None:
+        replies = {}
+        for reply in appt_elem.iter(f'{{{ns_mail}}}reply'):
+            addr = reply.get('at', '')
+            if addr:
+                replies[addr.lower()] = (
+                    _PTST_MAP.get(reply.get('ptst', ''), reply.get('ptst', '')),
+                    _ms_to_iso(reply.get('d')),
+                )
+        for attendee in attendees:
+            match = replies.get(attendee["email"].lower())
+            if match:
+                attendee["status"], attendee["replied_at"] = match
+
+    return attendees
+
+
+def _parse_recurrence(comp_elem, ns_mail: str) -> Optional[dict]:
+    """Flatten a <recur> block into something readable. Returns None if not recurring."""
+    recur = comp_elem.find(f'{{{ns_mail}}}recur')
+    if recur is None:
+        return None
+
+    rules = []
+    for rule in recur.iter(f'{{{ns_mail}}}rule'):
+        entry = {"freq": rule.get('freq', '')}
+        for child in rule:
+            tag = child.tag.split('}')[-1]
+            if tag == 'interval':
+                entry["interval"] = child.get('ival')
+            elif tag == 'until':
+                entry["until"] = child.get('d')
+            elif tag == 'count':
+                entry["count"] = child.get('num')
+            elif tag == 'byday':
+                entry["by_day"] = [w.get('day') for w in child]
+            elif tag == 'bymonthday':
+                entry["by_month_day"] = child.get('modaylist')
+            elif tag == 'bymonth':
+                entry["by_month"] = child.get('molist')
+        rules.append(entry)
+
+    return {"rules": rules} if rules else {"rules": [], "note": "recurring, rule not expressible"}
+
+
+@mail_read_tool()
+def searchCalendar(account: str,
+                   date_from: Optional[str] = None,
+                   date_to: Optional[str] = None,
+                   folder: Optional[str] = None,
+                   query: Optional[str] = None,
+                   include_attendees: bool = False,
+                   limit: int = 50,
+                   offset: int = 0) -> str:
+    """Search an account's calendar appointments in a date range. Use for "what meetings do I have", availability checks, and finding when a customer meeting is scheduled.
+
+    Unlike searchMail, the date range and `query` work together - dates are applied as SOAP attributes, not merged into the query string.
+
+    Args:
+        account: Target account email. Example: "user@example.com".
+        date_from: Range start, inclusive. Accepts YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY. Default: today.
+        date_to: Range end, inclusive. Same formats. Default: date_from + 30 days.
+        folder: Limit to one calendar. Fuzzy match on name or path. Example: "Calendar", "Sylvia". Default: all calendars.
+        query: Extra Zimbra search terms matched against subject, location and attendees. Example: "上銀". Default: no term filter.
+        include_attendees: Fetch the full attendee list and reply status for each result. Costs one extra request per appointment, so it is capped at 20 results. Default: false.
+        limit: Max results. Default: 50. Range: 1-500.
+        offset: Starting position for pagination. Default: 0.
+    """
+    logger.info(f"Searching calendar for account={account}, {date_from}..{date_to}, folder={folder}, query={query}")
+
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+
+        start_ms, end_ms, err = _day_bounds_ms(date_from, date_to)
+        if err:
+            return tool_response({"status": "error", "message": err})
+
+        parts = []
+        matched_folders = []
+        if folder:
+            clause, matched_folders = _resolve_folder_clause(account, folder, "appointment")
+            parts.append(clause)
+        else:
+            all_clause = _all_folders_clause(account, "appointment")
+            if all_clause:
+                parts.append(all_clause)
+        if query:
+            parts.append(query)
+        search_query = " ".join(parts)
+
+        query_xml = f"<query><![CDATA[{search_query}]]></query>" if search_query else ""
+        soap_body = f"""
+        <SearchRequest xmlns="urn:zimbraMail"
+                       types="appointment"
+                       sortBy="none"
+                       limit="{limit}"
+                       offset="{offset}"
+                       calExpandInstStart="{start_ms}"
+                       calExpandInstEnd="{end_ms}">
+            {query_xml}
+        </SearchRequest>
+        """
+
+        root = query_zimbra_mail_api(soap_body, account)
+        parse_zimbra_response(root, namespace="urn:zimbraMail")
+        ns_mail = 'urn:zimbraMail'
+
+        folder_paths = {_folder_num(f["id"]): f["path"] for f in _calendar_folders(account, "appointment")}
+
+        appointments = []
+        for appt in root.findall(f'.//{{{ns_mail}}}appt'):
+            duration_ms = int(appt.get('dur') or 0)
+
+            instances = []
+            for inst in appt.findall(f'{{{ns_mail}}}inst'):
+                inst_start = inst.get('s')
+                if not inst_start:
+                    continue
+                instances.append({
+                    "start": _ms_to_iso(inst_start),
+                    "end": _ms_to_iso(int(inst_start) + duration_ms) if duration_ms else None,
+                    "recurrence_id": inst.get('ridZ', ''),
+                })
+
+            organizer_elem = appt.find(f'{{{ns_mail}}}or')
+            fragment_elem = appt.find(f'{{{ns_mail}}}fr')
+
+            record = {
+                "id": appt.get('id', ''),
+                "invId": appt.get('invId', ''),
+                "subject": appt.get('name', ''),
+                "location": appt.get('loc', ''),
+                "all_day": appt.get('allDay') == '1',
+                "duration_minutes": duration_ms // 60000 if duration_ms else 0,
+                "start": instances[0]["start"] if instances else None,
+                "end": instances[0]["end"] if instances else None,
+                "occurrences_in_range": len(instances),
+                "instances": instances,
+                "status": _ITEM_STATUS_MAP.get(appt.get('status', ''), appt.get('status', '')),
+                "my_response": _PTST_MAP.get(appt.get('ptst', ''), appt.get('ptst', '')),
+                "is_organizer": appt.get('isOrg') == '1',
+                "has_other_attendees": appt.get('otherAtt') == '1',
+                "organizer": {
+                    "email": organizer_elem.get('a', '') if organizer_elem is not None else '',
+                    "name": organizer_elem.get('d', '') if organizer_elem is not None else '',
+                },
+                "folder": folder_paths.get(_folder_num(appt.get('l', '')), ''),
+                "fragment": fragment_elem.text if fragment_elem is not None and fragment_elem.text else '',
+            }
+            appointments.append(record)
+
+        # Zimbra's sortBy has no stable ordering once instances are expanded, so
+        # order by the occurrence that actually falls in the requested window.
+        appointments.sort(key=lambda a: a["start"] or "")
+
+        attendee_note = None
+        if include_attendees:
+            if len(appointments) > 20:
+                attendee_note = (f"include_attendees skipped: {len(appointments)} results exceed the 20-item cap. "
+                                 f"Narrow the date range or use getAppointment for specific items.")
+            else:
+                for record in appointments:
+                    try:
+                        detail_root = query_zimbra_mail_api(
+                            f'<GetAppointmentRequest xmlns="urn:zimbraMail" id="{record["id"]}"/>', account)
+                        detail_appt = detail_root.find(f'.//{{{ns_mail}}}appt')
+                        comp = detail_root.find(f'.//{{{ns_mail}}}comp')
+                        if comp is not None:
+                            record["attendees"] = _parse_attendees(comp, ns_mail, detail_appt)
+                    except Exception as detail_error:
+                        record["attendees_error"] = str(detail_error)
+
+        result = {
+            "status": "success",
+            "account": account,
+            "range": {"from": _ms_to_iso(start_ms), "to": _ms_to_iso(end_ms)},
+            "folder_filter": matched_folders or (folder or "all calendars"),
+            "query": search_query or None,
+            "appointments": appointments,
+            "count": len(appointments),
+            "display_message": f"{len(appointments)} appointments for {account}"
+        }
+        if attendee_note:
+            result["note"] = attendee_note
+        return tool_response(result)
+
+    except Exception as e:
+        logger.error(f"Failed to search calendar: {e}")
+        return tool_response({"status": "error", "message": f"Failed to search calendar: {str(e)}"})
+
+
+@mail_read_tool()
+def getAppointment(account: str, appt_id: str) -> str:
+    """Get one appointment in full: description body, every attendee with their reply status, recurrence rule, and attachments. Use after searchCalendar when you need the detail behind a single meeting.
+
+    Args:
+        account: Target account email. Example: "user@example.com".
+        appt_id: Appointment id from searchCalendar's `id` field. Example: "4ef3bd6d-...:819502".
+    """
+    logger.info(f"Getting appointment {appt_id} for account={account}")
+
+    try:
+        soap_body = f'<GetAppointmentRequest xmlns="urn:zimbraMail" id="{appt_id}" includeContent="1"/>'
+        root = query_zimbra_mail_api(soap_body, account)
+        parse_zimbra_response(root, namespace="urn:zimbraMail")
+        ns_mail = 'urn:zimbraMail'
+
+        appt = root.find(f'.//{{{ns_mail}}}appt')
+        if appt is None:
+            return tool_response({
+                "status": "error",
+                "message": f"Appointment '{appt_id}' not found in {account}."
+            })
+
+        comp = appt.find(f'.//{{{ns_mail}}}comp')
+        if comp is None:
+            return tool_response({
+                "status": "error",
+                "message": f"Appointment '{appt_id}' has no component data."
+            })
+
+        start_elem = comp.find(f'{{{ns_mail}}}s')
+        end_elem = comp.find(f'{{{ns_mail}}}e')
+        desc_elem = comp.find(f'{{{ns_mail}}}desc')
+        frag_elem = comp.find(f'{{{ns_mail}}}fr')
+        org_elem = comp.find(f'{{{ns_mail}}}or')
+
+        attendees = _parse_attendees(comp, ns_mail, appt)
+
+        attachments = []
+        for part in comp.iter(f'{{{ns_mail}}}mp'):
+            filename = part.get('filename')
+            if filename:
+                attachments.append({
+                    "filename": filename,
+                    "content_type": part.get('ct', ''),
+                    "size_bytes": int(part.get('s') or 0),
+                    "part_id": part.get('part', ''),
+                })
+
+        folder_paths = {_folder_num(f["id"]): f["path"] for f in _calendar_folders(account, "appointment")}
+
+        return tool_response({
+            "status": "success",
+            "account": account,
+            "appointment": {
+                "id": appt.get('id', ''),
+                "uid": appt.get('uid', ''),
+                "subject": comp.get('name', ''),
+                "location": comp.get('loc', ''),
+                "all_day": comp.get('allDay') == '1',
+                "start": _ms_to_iso(start_elem.get('u')) if start_elem is not None else None,
+                "end": _ms_to_iso(end_elem.get('u')) if end_elem is not None else None,
+                "timezone": (start_elem.get('tz') if start_elem is not None else None),
+                "status": _ITEM_STATUS_MAP.get(comp.get('status', ''), comp.get('status', '')),
+                "free_busy": comp.get('fba', ''),
+                "visibility": comp.get('class', ''),
+                "organizer": {
+                    "email": org_elem.get('a', '') if org_elem is not None else '',
+                    "name": org_elem.get('d', '') if org_elem is not None else '',
+                },
+                "attendees": attendees,
+                "attendee_count": len(attendees),
+                "recurrence": _parse_recurrence(comp, ns_mail),
+                "description": desc_elem.text if desc_elem is not None and desc_elem.text else '',
+                "fragment": frag_elem.text if frag_elem is not None and frag_elem.text else '',
+                "attachments": attachments,
+                "folder": folder_paths.get(_folder_num(appt.get('l', '')), ''),
+            },
+            "display_message": f"Appointment '{comp.get('name', '')}' with {len(attendees)} attendees"
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to get appointment: {e}")
+        message = str(e)
+        if "500" in message or "no such" in message.lower():
+            message = (f"Appointment '{appt_id}' could not be read from {account}. "
+                       f"Check the id came from searchCalendar's `id` field "
+                       f"(format '<mailbox-uuid>:<item-id>'), and that the account owns it.")
+        return tool_response({"status": "error", "message": f"Failed to get appointment: {message}"})
+
+
+@mail_read_tool()
+def searchTasks(account: str,
+                folder: Optional[str] = None,
+                status: Optional[str] = None,
+                due_before: Optional[str] = None,
+                due_after: Optional[str] = None,
+                query: Optional[str] = None,
+                limit: int = 50,
+                offset: int = 0) -> str:
+    """Search an account's Zimbra Tasks. Use to review outstanding to-dos, or to cross-check a mail-derived task list against what is already recorded.
+
+    Status and due-date filters are applied after fetching, because Zimbra's task search has no reliable server-side operator for them. Task folders are small so this stays cheap.
+
+    Args:
+        account: Target account email. Example: "user@example.com".
+        folder: Limit to one task folder. Fuzzy match on name or path. Example: "Tasks/待辦", "維護期間專案". Default: all task folders.
+        status: Filter by state. Values: "needs-action", "in-progress", "completed", "deferred", "waiting". Default: all.
+        due_before: Only tasks due on or before this date. Accepts YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY. Tasks with no due date are excluded when set.
+        due_after: Only tasks due on or after this date. Same formats and exclusion rule.
+        query: Extra Zimbra search terms matched against subject and notes. Default: no term filter.
+        limit: Max results after filtering. Default: 50. Range: 1-500.
+        offset: Starting position for pagination. Default: 0.
+    """
+    logger.info(f"Searching tasks for account={account}, folder={folder}, status={status}")
+
+    try:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+
+        wanted_status = None
+        if status:
+            key = status.strip().lower()
+            wanted_status = _TASK_STATUS_ALIASES.get(key)
+            if wanted_status is None:
+                return tool_response({
+                    "status": "error",
+                    "message": f"Invalid status '{status}'. "
+                               f"Accepted: {', '.join(sorted(set(_TASK_STATUS_ALIASES)))}."
+                })
+
+        due_before_dt = None
+        if due_before:
+            due_before_dt = _parse_search_date(due_before)
+            if due_before_dt is None:
+                return tool_response({"status": "error", "message": f"Invalid due_before '{due_before}'."})
+            due_before_dt += timedelta(days=1)
+
+        due_after_dt = None
+        if due_after:
+            due_after_dt = _parse_search_date(due_after)
+            if due_after_dt is None:
+                return tool_response({"status": "error", "message": f"Invalid due_after '{due_after}'."})
+
+        parts = []
+        matched_folders = []
+        if folder:
+            clause, matched_folders = _resolve_folder_clause(account, folder, "task")
+            parts.append(clause)
+        else:
+            all_clause = _all_folders_clause(account, "task")
+            if all_clause:
+                parts.append(all_clause)
+        if query:
+            parts.append(query)
+        search_query = " ".join(parts)
+
+        query_xml = f"<query><![CDATA[{search_query}]]></query>" if search_query else ""
+        # Post-filtering means the server cap must exceed the caller's limit.
+        fetch_limit = min(500, max(limit + offset, 100))
+        soap_body = f"""
+        <SearchRequest xmlns="urn:zimbraMail"
+                       types="task"
+                       sortBy="taskDueAsc"
+                       limit="{fetch_limit}"
+                       offset="0">
+            {query_xml}
+        </SearchRequest>
+        """
+
+        root = query_zimbra_mail_api(soap_body, account)
+        parse_zimbra_response(root, namespace="urn:zimbraMail")
+        ns_mail = 'urn:zimbraMail'
+
+        folder_paths = {_folder_num(f["id"]): f["path"] for f in _calendar_folders(account, "task")}
+
+        tasks = []
+        for task in root.findall(f'.//{{{ns_mail}}}task'):
+            raw_status = task.get('status', '')
+            if wanted_status and raw_status != wanted_status:
+                continue
+
+            # A due date only exists when the user set one; Zimbra exposes it as
+            # an <inst s=...> on the task, and leaves <inst/> empty otherwise.
+            due_ms = None
+            inst = task.find(f'{{{ns_mail}}}inst')
+            if inst is not None and inst.get('s'):
+                due_ms = int(inst.get('s'))
+            elif task.get('dueDate'):
+                due_ms = int(task.get('dueDate'))
+
+            if due_before_dt or due_after_dt:
+                if due_ms is None:
+                    continue
+                due_dt = datetime.fromtimestamp(due_ms / 1000)
+                if due_before_dt and due_dt >= due_before_dt:
+                    continue
+                if due_after_dt and due_dt < due_after_dt:
+                    continue
+
+            frag_elem = task.find(f'{{{ns_mail}}}fr')
+            priority = task.get('priority', '')
+
+            tasks.append({
+                "id": task.get('id', ''),
+                "invId": task.get('invId', ''),
+                "subject": task.get('name', ''),
+                "status": _ITEM_STATUS_MAP.get(raw_status, raw_status),
+                "percent_complete": int(task.get('percentComplete') or 0),
+                "priority": _PRIORITY_MAP.get(priority, priority),
+                "priority_value": priority,
+                "due": _ms_to_iso(due_ms),
+                "created": _ms_to_iso(task.get('d')),
+                "folder": folder_paths.get(_folder_num(task.get('l', '')), ''),
+                "notes": frag_elem.text if frag_elem is not None and frag_elem.text else '',
+            })
+
+        total_matched = len(tasks)
+        page = tasks[offset:offset + limit]
+
+        return tool_response({
+            "status": "success",
+            "account": account,
+            "folder_filter": matched_folders or (folder or "all task folders"),
+            "status_filter": status or "all",
+            "tasks": page,
+            "count": len(page),
+            "total_matched": total_matched,
+            "display_message": f"{len(page)} of {total_matched} tasks for {account}"
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to search tasks: {e}")
+        return tool_response({"status": "error", "message": f"Failed to search tasks: {str(e)}"})
 
 
 @mcp_server.tool()
@@ -5876,3 +6482,4 @@ if __name__ == "__main__":
             app.add_middleware(APIKeyAuthMiddleware)
 
         uvicorn.run(app, host=http_host, port=http_port)
+

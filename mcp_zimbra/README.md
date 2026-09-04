@@ -1,6 +1,6 @@
 # Zimbra MCP Server
 
-**Version:** 1.9.2
+**Version:** 1.10.0
 **Author:** Jason Cheng (co-created with Claude Code)
 **License:** MIT
 **Last Updated:** 2026-03-02
@@ -53,7 +53,7 @@ FastMCP-based integration for Zimbra Collaboration Suite, providing comprehensiv
 
 mcp_zimbra supports two authentication modes:
 
-### Admin Mode (44 base + 5 mail_read)
+### Admin Mode (44 base + 8 mail_read)
 
 Full access to all Zimbra administration tools. Mail read tools require `ZIMBRA_ENABLE_MAIL_READ=true`.
 
@@ -64,7 +64,7 @@ export ZIMBRA_ADMIN_PASS="admin_password"
 export ZIMBRA_ENABLE_MAIL_READ="true"   # Optional: enable mail read tools
 ```
 
-### User Mode (13 base + 5 mail_read)
+### User Mode (13 base + 8 mail_read)
 
 Personal mailbox access only. Authenticates as a regular user via the web client API.
 
@@ -374,6 +374,22 @@ Endpoint: `http://<host>:<port>/mcp`
 | `saveDraft` | Save new email or reply/forward as draft for review |
 | `searchContacts` | Search user's personal address book / contacts |
 
+### Calendar & Tasks (3 tools)
+
+| Tool | Description |
+|------|-------------|
+| `searchCalendar` | **⚡ NEW** - Appointments in a date range, all calendars or one folder; expands recurring events |
+| `getAppointment` | **⚡ NEW** - One appointment in full: description, attendees with reply status, recurrence, attachments |
+| `searchTasks` | **⚡ NEW** - Zimbra Tasks filtered by folder, status and due date |
+
+Appointments and tasks are calendar items, not messages, so `searchMail` can never
+return them. These three tools use `types="appointment"` / `types="task"` against the
+same admin-delegated mail API and are gated by the same `ZIMBRA_ENABLE_MAIL_READ` flag.
+
+Unlike `searchMail`, `date_from` / `date_to` on `searchCalendar` are sent as SOAP
+attributes rather than merged into the query string, so a caller-supplied `query` and
+the date range apply together instead of the query silently overriding the dates.
+
 ### Directory & Search (1 tool)
 
 | Tool | Description |
@@ -394,8 +410,8 @@ Endpoint: `http://<host>:<port>/mcp`
 | `clear_cache` | Clear all cached API responses |
 | `cache_stats` | Get cache usage statistics |
 
-**Total: 49 tools in admin mode** (44 base + 5 mail_read) — 6 Account + 3 Distribution Lists + 3 Mail Queue + 2 Statistics + 9 System + 3 Rights + 5 Bulk Audit + 5 Mail Read† + 2 Mail Write + 1 Directory + 1 Advanced DL + 3 Utilities + 6 jt_zmmsgtrace
-**Total: 18 tools in user mode** (13 base + 5 mail_read) — 5 Mail Read† + 2 Mail Write + 1 Directory + 3 Utilities + 1 Version + 6 jt_zmmsgtrace
+**Total: 52 tools in admin mode** (44 base + 8 mail_read) — 6 Account + 3 Distribution Lists + 3 Mail Queue + 2 Statistics + 9 System + 3 Rights + 5 Bulk Audit + 5 Mail Read† + 3 Calendar & Tasks† + 2 Mail Write + 1 Directory + 1 Advanced DL + 3 Utilities + 6 jt_zmmsgtrace
+**Total: 21 tools in user mode** (13 base + 8 mail_read) — 5 Mail Read† + 3 Calendar & Tasks† + 2 Mail Write + 1 Directory + 3 Utilities + 1 Version + 6 jt_zmmsgtrace
 
 †Mail Read tools require `ZIMBRA_ENABLE_MAIL_READ=true`
 
@@ -502,7 +518,50 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 
 ## 📜 Version History
 
-### v1.9.2 (2026-03-02) - Current
+### v1.10.0 (2026-09-04) - Current
+
+**FEATURE — Calendar and Tasks read access**
+
+Appointments and tasks live outside the message store, so `searchMail` could never
+reach them even though `listFolders` showed the folders. Three new tools close that gap:
+
+- **`searchCalendar`** — appointments in a date range, across all calendars or one
+  folder. Recurring events are expanded via `calExpandInstStart` / `calExpandInstEnd`,
+  so each result reports the occurrences that actually fall inside the window.
+  Optional `include_attendees` fetches the full attendee list, capped at 20 results
+  because it costs one extra request per appointment.
+- **`getAppointment`** — one appointment in full: description body, every attendee with
+  their reply status, recurrence rule, attachments.
+- **`searchTasks`** — Zimbra Tasks with folder, status and due-date filters.
+
+Notes:
+
+- `date_from` / `date_to` are sent as SOAP attributes, not merged into the query
+  string, so they coexist with a caller-supplied `query`. This is deliberately
+  different from `searchMail`, where passing `query` causes the date parameters to
+  be ignored.
+- Zimbra returns nothing for an appointment or task search with an empty query — it
+  does not mean "all items". "All calendars" is therefore expanded into an explicit
+  `inid:` list built from the account's folders.
+- Task status and due-date filtering happen client-side; Zimbra's task search has no
+  reliable server-side operator for either, and task folders are small enough that
+  fetching then filtering stays cheap.
+- Attendee reply status comes from `<replies>` when present, falling back to
+  `<at ptst>`. Both tools share that logic so the same meeting never reports two
+  different answers.
+- Parameter naming follows `getMailDetail`'s `msg_id` style: `appt_id`.
+
+### v1.9.3 (2026-08-31)
+**FIX**: `searchMail` date filters silently returned zero results
+- `date_from` / `date_to` only parsed `YYYY/MM/DD`; any other form (notably ISO
+  `2026-01-01`) fell through to Zimbra verbatim, producing a query that matched
+  nothing — with **no error raised**, so it looked like "no such mail exists"
+- New `_parse_search_date()` accepts `YYYY-MM-DD`, `YYYY/MM/DD`, `MM/DD/YYYY`, `YYYYMMDD`
+- An unparseable date now returns an explicit error instead of an empty result set
+- Note: `sender` / `from:` match the **email address only**, not a display name —
+  搜尋中文人名或公司名請用 `query` 做全文搜尋
+
+### v1.9.2 (2026-03-02)
 **OPTIMIZATION**: Weak LLM compatibility
 - **NEW HELPER**: `tool_response()` — compact JSON output with `usage_hint` injection
 - All `json.dumps` calls migrated to `tool_response()` (removes `indent=2`, saves ~30% tokens)
@@ -548,7 +607,7 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 **FEATURE**: Mail read tools gated by `ZIMBRA_ENABLE_MAIL_READ` toggle
 - `searchMail`, `getMailDetail`, `getConversation`, `listFolders`, `getMailAttachment` only registered when `ZIMBRA_ENABLE_MAIL_READ=true` (default: `false`)
 - Allows deployment without mail reading capability for security-sensitive environments
-- Tool counts: admin 44+5 / user 13+5 (base + mail_read)
+- Tool counts: admin 44+8 / user 13+8 (base + mail_read)
 
 ### v1.8.4 (2026-02-13)
 **ROBUSTNESS**: Input validation guards for weaker LLM compatibility
