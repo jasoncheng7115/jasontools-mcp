@@ -3,8 +3,9 @@
 **Version:** 1.10.0
 **Author:** Jason Cheng (co-created with Claude Code)
 **License:** MIT
-**Last Updated:** 2026-03-02
+**Last Updated:** 2026-09-04
 **Repository:** [github.com/jasoncheng7115/jasontools-mcp](https://github.com/jasoncheng7115/jasontools-mcp)
+**Language:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
 FastMCP-based integration for Zimbra Collaboration Suite, providing comprehensive email system monitoring and administration capabilities through natural language interactions.
 
@@ -258,6 +259,20 @@ Once configured, you can interact with Zimbra through natural language:
 請列出所有郵件佇列中的訊息
 ```
 
+With `ZIMBRA_ENABLE_MAIL_READ=true`, mail, calendar and tasks become available:
+
+```
+請找 user@example.com 信箱裡主旨含「報價」、2026-01-01 之後的信，列 20 筆
+user@example.com 這週有哪些會議？
+user@example.com 下週三下午有空嗎？
+「Ceph 建置」那場會議有誰參加？他們回覆了嗎？
+user@example.com 的待辦事項裡，還沒完成、且今年到期的有哪些？
+```
+
+Every mail, calendar and task tool takes an explicit `account` parameter — in
+admin mode the server reaches the mailbox by admin delegation, so it has no
+notion of "my" mailbox and will not guess.
+
 ### Direct Command Line (for testing)
 
 ```bash
@@ -401,6 +416,20 @@ the date range apply together instead of the query silently overriding the dates
 | Tool | Description |
 |------|-------------|
 | `getDLMembership` | **⚡ NEW** - Query which DLs an account/DL belongs to (nested relations) |
+
+### Mail Tracing (6 tools)
+
+Registered only when `JT_ZMMSGTRACE_API_KEY` is configured. These query the
+separate jt_zmmsgtrace service rather than Zimbra's SOAP API.
+
+| Tool | Description |
+|------|-------------|
+| `jt_zmmsgtrace_search` | Free-form search across the message trace log |
+| `jt_zmmsgtrace_search_by_sender` | Trace messages from a sender |
+| `jt_zmmsgtrace_search_by_recipient` | Trace messages to a recipient |
+| `jt_zmmsgtrace_search_by_message_id` | Trace one message by Message-ID |
+| `jt_zmmsgtrace_search_by_host` | Trace messages handled by a given host |
+| `jt_zmmsgtrace_search_by_time` | Trace messages within a time window |
 
 ### Utilities (3 tools)
 
