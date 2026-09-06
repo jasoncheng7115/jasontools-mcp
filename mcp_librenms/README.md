@@ -1,4 +1,4 @@
-# LibreNMS MCP Server v4.5.0
+# LibreNMS MCP Server v4.5.1
 
 FastMCP-based LibreNMS API integration, optimized for weak/small LLMs (gpt-oss:120b etc.).
 
@@ -298,6 +298,25 @@ per-device API calls (which will likely return empty due to the API limitation).
 Priority: CLI args > environment variables > defaults.
 
 ## Changelog
+
+### v4.5.1 (2026-09-06) - Fix: troubleshoot_ip was broken for every IP
+
+`troubleshoot_ip` called `json.loads()` on the return value of `search_fdb_by_mac`.
+That tool had at some point switched to pipe-delimited text output to save tokens,
+so the parse raised `Expecting value: line 1 column 1` on every lookup — the tool
+had not resolved a single IP since that change, and failed with an error that gave
+no hint about the real cause.
+
+- Extracted `_fdb_entries_for_mac()` so callers inside the module consume structured
+  data instead of a tool's presentation format.
+- Added `_tool_rows()`, which accepts either JSON or the pipe-delimited table, for
+  any remaining place that has to read another tool's output.
+- `switch_location` is flattened: `/devices` returns location as a nested object on
+  this LibreNMS, which buried the answer under a coordinate blob.
+
+The underlying mistake is worth stating plainly: tools in this module deliberately
+return two different formats, so nothing inside the module may assume which one it
+is getting.
 
 ### v4.5.0 (2026-09-06) - Whole-network Performance / Syslog
 

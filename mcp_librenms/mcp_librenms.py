@@ -914,6 +914,123 @@ def search_mac_to_ip(mac_address: str) -> str:
         return _R({"error": str(e)})
 
 
+def _tool_rows(payload: str) -> List[Dict]:
+    """Normalise a tool's return value into a list of dicts.
+
+    Tools in this module emit either JSON (via _R) or a pipe-delimited table with
+    a header line, chosen per tool to save tokens. Anything calling a tool from
+    inside this module must not assume which - that assumption is what broke
+    troubleshoot_ip().
+    """
+    if not payload:
+        return []
+    text = payload.strip()
+    if text.startswith("{") or text.startswith("["):
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return []
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict)]
+        if isinstance(data, dict):
+            for key in ("data", "results", "entries", "rows"):
+                if isinstance(data.get(key), list):
+                    return [d for d in data[key] if isinstance(d, dict)]
+            return [] if "error" in data else [data]
+        return []
+
+    lines = [l for l in text.split("\n") if l.strip()]
+    header_idx = next((i for i, l in enumerate(lines) if "|" in l), None)
+    if header_idx is None:
+        return []
+    cols = lines[header_idx].split("|")
+    rows = []
+    for line in lines[header_idx + 1:]:
+        if "|" not in line:
+            continue
+        vals = line.split("|")
+        rows.append({c: (vals[i] if i < len(vals) else "") for i, c in enumerate(cols)})
+    return rows
+
+
+def _fdb_entries_for_mac(mac_address: str) -> List[Dict]:
+    """FDB rows for a MAC, enriched with device and port names.
+
+    Kept separate from search_fdb_by_mac() so that callers inside this module
+    consume structured data. troubleshoot_ip() used to json.loads() the tool's
+    return value, which broke silently the moment that tool switched to
+    pipe-delimited text output.
+    """
+    vcache = _build_vlan_cache()
+    try:
+        normalized = _normalize_mac(mac_address)
+    except Exception:
+        normalized = mac_address
+
+    fdb = []
+    try:
+        result = _api_request("GET", f"resources/fdb/{normalized}")
+        fdb.extend(_extract_data(result, ['ports_fdb']))
+    except Exception:
+        pass
+
+    if not fdb:
+        try:
+            all_fdb = _paginate("resources/fdb", max_items=5000)
+            for e in all_fdb:
+                emac = e.get("mac_address", "")
+                if normalized in emac.lower() or mac_address.lower() in emac.lower():
+                    fdb.append(e)
+        except Exception:
+            pass
+
+    seen = set()
+    unique = []
+    for e in fdb:
+        eid = e.get("ports_fdb_id") or str(e)
+        if eid not in seen:
+            seen.add(eid)
+            unique.append(e)
+
+    device_cache = {}
+    port_cache = {}
+    enriched = []
+
+    for e in unique:
+        entry = {
+            "mac_address": _format_mac(e.get("mac_address", "")),
+            "device_id": e.get("device_id"),
+            "port_id": e.get("port_id"),
+        }
+        _enrich_vlan(e, vcache)
+        entry["vlan_tag"] = e.get("vlan_tag")
+        entry["vlan_name"] = e.get("vlan_name")
+
+        did = e.get("device_id")
+        if did:
+            if did not in device_cache:
+                device_cache[did] = _get_device_info_dict(did)
+            dev = device_cache[did]
+            if dev:
+                entry["device_hostname"] = dev.get("hostname")
+                entry["device_sysName"] = dev.get("sysName")
+                entry["device_ip"] = dev.get("ip")
+                entry["device_location"] = dev.get("location")
+
+        pid = e.get("port_id")
+        if pid:
+            if pid not in port_cache:
+                port_cache[pid] = _get_port_info_dict(pid)
+            port = port_cache[pid]
+            if port:
+                entry["port_name"] = port.get("ifName")
+                entry["port_descr"] = port.get("ifDescr")
+
+        enriched.append(entry)
+
+    return enriched
+
+
 @mcp.tool()
 def search_fdb_by_mac(mac_address: str) -> str:
     """Find which switch port a MAC address is on via FDB table.
@@ -923,77 +1040,7 @@ def search_fdb_by_mac(mac_address: str) -> str:
     Args:
         mac_address: MAC address (any format)."""
     try:
-        vcache = _build_vlan_cache()
-        try:
-            normalized = _normalize_mac(mac_address)
-        except Exception:
-            normalized = mac_address
-
-        fdb = []
-        try:
-            result = _api_request("GET", f"resources/fdb/{normalized}")
-            fdb.extend(_extract_data(result, ['ports_fdb']))
-        except Exception:
-            pass
-
-        if not fdb:
-            try:
-                all_fdb = _paginate("resources/fdb", max_items=5000)
-                for e in all_fdb:
-                    emac = e.get("mac_address", "")
-                    if normalized in emac.lower() or mac_address.lower() in emac.lower():
-                        fdb.append(e)
-            except Exception:
-                pass
-
-        # Deduplicate
-        seen = set()
-        unique = []
-        for e in fdb:
-            eid = e.get("ports_fdb_id") or str(e)
-            if eid not in seen:
-                seen.add(eid)
-                unique.append(e)
-
-        device_cache = {}
-        port_cache = {}
-        enriched = []
-
-        for e in unique:
-            entry = {
-                "mac_address": _format_mac(e.get("mac_address", "")),
-                "device_id": e.get("device_id"),
-                "port_id": e.get("port_id"),
-            }
-            _enrich_vlan(e, vcache)
-            entry["vlan_tag"] = e.get("vlan_tag")
-            entry["vlan_name"] = e.get("vlan_name")
-
-            # Device info with cache
-            did = e.get("device_id")
-            if did:
-                if did not in device_cache:
-                    device_cache[did] = _get_device_info_dict(did)
-                dev = device_cache[did]
-                if dev:
-                    entry["device_hostname"] = dev.get("hostname")
-                    entry["device_sysName"] = dev.get("sysName")
-                    entry["device_ip"] = dev.get("ip")
-                    entry["device_location"] = dev.get("location")
-
-            # Port info with cache
-            pid = e.get("port_id")
-            if pid:
-                if pid not in port_cache:
-                    port_cache[pid] = _get_port_info_dict(pid)
-                port = port_cache[pid]
-                if port:
-                    entry["port_name"] = port.get("ifName")
-                    entry["port_descr"] = port.get("ifDescr")
-
-            enriched.append(entry)
-
-        # Compact text output
+        enriched = _fdb_entries_for_mac(mac_address)
         rows = [f"FDB search results: {len(enriched)}",
                 "mac_address|device_id|device_hostname|device_sysName|port_id|port_name|vlan_tag|vlan_name"]
         for e in enriched:
@@ -1024,8 +1071,10 @@ def troubleshoot_ip(ip_address: str) -> str:
         result = {"ip_address": ip_address, "status": "investigating"}
 
         # Step 1: ARP -> MAC
-        arp_result = json.loads(search_ip_to_mac(ip_address))
-        arp_entries = arp_result.get("data", [])
+        # search_ip_to_mac() currently returns JSON, but consume it defensively:
+        # search_fdb_by_mac() used to return JSON too, and when it switched to
+        # pipe-delimited text this function broke for every IP with no warning.
+        arp_entries = _tool_rows(search_ip_to_mac(ip_address))
 
         if not arp_entries:
             result["status"] = "not_found"
@@ -1045,9 +1094,8 @@ def troubleshoot_ip(ip_address: str) -> str:
             result["message"] = "Found ARP entry but no MAC address."
             return _R(result)
 
-        # Step 2: FDB -> switch port
-        fdb_result = json.loads(search_fdb_by_mac(mac))
-        fdb_entries = fdb_result.get("data", [])
+        # Step 2: FDB -> switch port (structured helper, not the tool's text output)
+        fdb_entries = _fdb_entries_for_mac(mac)
 
         if not fdb_entries:
             result["status"] = "partial"
@@ -1069,7 +1117,10 @@ def troubleshoot_ip(ip_address: str) -> str:
             dev = _get_device_info_dict(did)
             if dev:
                 result["switch_os"] = dev.get("os")
-                result["switch_location"] = dev.get("location")
+                # /devices returns location as a nested object on this LibreNMS;
+                # emitting it raw buried the answer under a coordinate blob.
+                loc = dev.get("location")
+                result["switch_location"] = loc.get("location") if isinstance(loc, dict) else loc
                 result["switch_status"] = dev.get("status")
 
         result["status"] = "success"
@@ -3023,7 +3074,7 @@ if __name__ == "__main__":
     initialize_session()
 
     logger.info("=" * 60)
-    logger.info("LibreNMS FastMCP Server v4.5.0 - Slim (29 tools)")
+    logger.info("LibreNMS FastMCP Server v4.5.1 - Slim (29 tools)")
     logger.info("=" * 60)
     logger.info(f"Transport: {args.transport}")
     if args.transport in ('streamable-http', 'sse'):
