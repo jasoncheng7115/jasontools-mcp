@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
-MCP server for Odoo API – v1.8.3 API Key Authentication Support
+MCP server for Odoo API – v1.9.0 Invoice Reading
 ===============================================================================
 Author: Jason Cheng (Jason Tools)
 Created: 2025-07-14
 Updated: 2026-02-26
-Version: 1.8.3
+Version: 1.9.0
 License: MIT
+Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Tested: Odoo 13 Community Edition
 
 FastMCP-based Odoo integration with comprehensive business management capabilities.
+
+NEW in v1.9.0:
+- Invoice reading (account.move): search_invoices, get_invoice_details, get_invoice_stats
+- Covers customer invoices, vendor bills and both kinds of credit note via invoice_type
+- unpaid_only excludes drafts by default: a draft invoice has not been issued, so
+  counting it as receivable overstates what is actually owed (22 -> 16 on the
+  reference database, 648,730 -> 41,576 outstanding)
+- Draft invoices report name "/" in Odoo until posted; shown as "（草稿．尚未編號）"
 
 NEW in v1.8.3:
 - Added API key authentication for HTTP transports (SSE/streamable-http)
@@ -346,7 +355,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Version information
-__version__ = "1.8.3"
+__version__ = "1.9.0"
 __author__ = "Jason Cheng (Jason Tools)"
 
 # Configure logging
@@ -4508,6 +4517,362 @@ def get_current_user_language() -> str:
         }, indent=2, ensure_ascii=False)
 
 # ───────────────────────── Partner Management ─────────────────────────
+
+# ======================= Invoices (account.move) =======================
+#
+# Odoo keeps customer invoices, vendor bills and credit notes in one model
+# (account.move) separated by move_type. These tools default to customer
+# invoices because that is what "發票" means in day-to-day use here; the
+# move_type argument opens up the rest without a second set of tools.
+
+_INVOICE_TYPES = {
+    "customer": "out_invoice",
+    "customer_credit": "out_refund",
+    "vendor": "in_invoice",
+    "vendor_credit": "in_refund",
+}
+
+_PAYMENT_STATE_ZH = {
+    "not_paid": "未付款", "in_payment": "付款處理中", "paid": "已付款",
+    "partial": "部分付款", "reversed": "已沖銷", "invoicing_legacy": "舊制",
+}
+
+_MOVE_STATE_ZH = {"draft": "草稿", "posted": "已過帳", "cancel": "已取消"}
+
+
+def _generate_invoice_url(invoice_id: int) -> str:
+    """Generate URL to access an invoice in Odoo web interface"""
+    return _generate_record_url(invoice_id, 'account.move')
+
+
+def _resolve_move_type(invoice_type: Optional[str]) -> Optional[str]:
+    """Map the friendly invoice_type argument onto Odoo's move_type.
+
+    Returns None for "all" so the caller can omit the domain clause.
+    """
+    if not invoice_type or invoice_type == "customer":
+        return "out_invoice"
+    if invoice_type == "all":
+        return None
+    if invoice_type in _INVOICE_TYPES:
+        return _INVOICE_TYPES[invoice_type]
+    if invoice_type in _INVOICE_TYPES.values():
+        return invoice_type
+    raise ValueError(
+        f"Invalid invoice_type '{invoice_type}'. "
+        f"Use one of: {', '.join(sorted(_INVOICE_TYPES))}, all."
+    )
+
+
+def _slim_invoice(inv: Dict, is_english: bool = False) -> Dict:
+    """Shape one account.move record for output."""
+    partner = inv.get("partner_id") or [None, ""]
+    currency = inv.get("currency_id") or [None, ""]
+    state = inv.get("state", "")
+    pay = inv.get("payment_state") or ""
+    # Odoo leaves name as "/" until an invoice is posted and numbered.
+    number = inv.get("name")
+    if not number or number == "/":
+        number = "（草稿．尚未編號）" if not is_english else "(draft, unnumbered)"
+    return {
+        "id": inv.get("id"),
+        "number": number,
+        "is_draft": inv.get("state") == "draft",
+        "customer": partner[1] if isinstance(partner, list) and len(partner) > 1 else "",
+        "partner_id": partner[0] if isinstance(partner, list) else None,
+        "invoice_date": inv.get("invoice_date") or None,
+        "due_date": inv.get("invoice_date_due") or None,
+        "state": state,
+        "state_label": state if is_english else _MOVE_STATE_ZH.get(state, state),
+        "payment_state": pay,
+        "payment_label": pay if is_english else _PAYMENT_STATE_ZH.get(pay, pay),
+        "amount_untaxed": inv.get("amount_untaxed"),
+        "amount_tax": inv.get("amount_tax"),
+        "amount_total": inv.get("amount_total"),
+        "amount_residual": inv.get("amount_residual"),
+        "currency": _get_currency_code(currency),
+        "origin": inv.get("invoice_origin") or None,
+        "reference": inv.get("ref") or None,
+        "url": _generate_invoice_url(inv.get("id")),
+    }
+
+
+@mcp.tool()
+def search_invoices(partner_name: Optional[str] = None,
+                    invoice_number: Optional[str] = None,
+                    invoice_type: str = "customer",
+                    state: Optional[str] = None,
+                    payment_state: Optional[str] = None,
+                    date_from: Optional[str] = None,
+                    date_to: Optional[str] = None,
+                    due_before: Optional[str] = None,
+                    unpaid_only: bool = False,
+                    min_amount: Optional[float] = None,
+                    max_amount: Optional[float] = None,
+                    origin: Optional[str] = None,
+                    limit: int = 20, offset: int = 0,
+                    count_only: bool = False) -> str:
+    """Search Odoo invoices (customer invoices, vendor bills, credit notes).
+
+    WHEN TO USE:
+    - "哪些發票還沒收款" -> unpaid_only=True
+    - "某客戶開過哪些發票" -> partner_name
+    - "這張報價單有沒有開發票" -> origin="S01234"
+    - "逾期未收的款項" -> unpaid_only=True, due_before=today
+
+    Args:
+        partner_name: Customer/vendor name, partial match.
+        invoice_number: Invoice number, partial match (e.g. 'INV/2026/0009').
+        invoice_type: "customer" (default), "vendor", "customer_credit", "vendor_credit", or "all".
+        state: draft / posted / cancel. Default: all states.
+        payment_state: not_paid / in_payment / partial / paid / reversed.
+        date_from: Invoice date on or after (YYYY-MM-DD).
+        date_to: Invoice date on or before (YYYY-MM-DD).
+        due_before: Due date before this date - use with unpaid_only to find overdue.
+        unpaid_only: Only posted invoices still owing money. Drafts are excluded because
+                     they have not been issued yet; pass state="draft" to see those.
+        min_amount: Minimum total amount.
+        max_amount: Maximum total amount.
+        origin: Source document, e.g. the quotation number the invoice came from.
+        limit: Max results (default 20).
+        offset: Skip first N for pagination.
+        count_only: Return just the count - cheapest way to answer "how many".
+    """
+    try:
+        domain = []
+        move_type = _resolve_move_type(invoice_type)
+        if move_type:
+            domain.append(("move_type", "=", move_type))
+        else:
+            domain.append(("move_type", "in", list(_INVOICE_TYPES.values())))
+
+        if partner_name:
+            domain.append(("partner_id.name", "ilike", partner_name))
+        if invoice_number:
+            domain.append(("name", "ilike", invoice_number))
+        if state:
+            domain.append(("state", "=", state))
+        if payment_state:
+            domain.append(("payment_state", "=", payment_state))
+        if date_from:
+            domain.append(("invoice_date", ">=", date_from))
+        if date_to:
+            domain.append(("invoice_date", "<=", date_to))
+        if due_before:
+            domain.append(("invoice_date_due", "<", due_before))
+        if unpaid_only:
+            # payment_state can be False on drafts, so filter on the residual
+            # amount instead - that is what "still owes money" actually means.
+            domain.append(("amount_residual", ">", 0))
+            # A draft invoice has not been issued to the customer, so counting it
+            # as receivable overstates what is actually owed. Callers who really
+            # want drafts can pass state="draft" explicitly.
+            if not state:
+                domain.append(("state", "=", "posted"))
+        if min_amount is not None:
+            domain.append(("amount_total", ">=", min_amount))
+        if max_amount is not None:
+            domain.append(("amount_total", "<=", max_amount))
+        if origin:
+            domain.append(("invoice_origin", "ilike", origin))
+
+        total = _cached_odoo_call("account.move", "search_count", [domain])
+        if count_only:
+            return json.dumps({"count": total, "filters_applied": len(domain)},
+                              indent=2, ensure_ascii=False)
+
+        records = _cached_odoo_call("account.move", "search_read", [domain], {
+            "fields": ["name", "partner_id", "invoice_date", "invoice_date_due", "state",
+                       "payment_state", "amount_untaxed", "amount_tax", "amount_total",
+                       "amount_residual", "currency_id", "invoice_origin", "ref"],
+            "limit": limit, "offset": offset, "order": "invoice_date desc, id desc",
+        })
+
+        invoices = [_slim_invoice(r) for r in records]
+        outstanding = sum(r.get("amount_residual") or 0 for r in records)
+
+        result = {
+            "count": len(invoices),
+            "total_matching": total,
+            "invoice_type": invoice_type,
+            "outstanding_in_page": round(outstanding, 2),
+            "invoices": invoices,
+        }
+        if total > offset + len(invoices):
+            result["note"] = (f"Showing {offset + 1}-{offset + len(invoices)} of {total}. "
+                              f"Use offset to page through the rest.")
+        return json.dumps(result, indent=2, ensure_ascii=False, cls=DateTimeEncoder)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_invoice_details(invoice_id: Optional[int] = None,
+                        invoice_number: Optional[str] = None,
+                        include_lines: bool = True) -> str:
+    """Get one invoice in full: header, line items, taxes and payment status.
+
+    Give either invoice_id or invoice_number. Use search_invoices first if you
+    only have a customer name or date.
+
+    Args:
+        invoice_id: Odoo record id, as returned by search_invoices.
+        invoice_number: Invoice number, e.g. 'INV/2026/0009'.
+        include_lines: Include line items (default True).
+    """
+    try:
+        if not invoice_id and not invoice_number:
+            return json.dumps({"error": "Provide invoice_id or invoice_number."},
+                              indent=2, ensure_ascii=False)
+
+        if invoice_id:
+            domain = [("id", "=", invoice_id)]
+        else:
+            domain = [("name", "=", invoice_number)]
+
+        fields = ["name", "partner_id", "invoice_date", "invoice_date_due", "state",
+                  "payment_state", "move_type", "amount_untaxed", "amount_tax",
+                  "amount_total", "amount_residual", "currency_id", "invoice_origin",
+                  "ref", "narration", "invoice_payment_term_id", "user_id",
+                  "company_id", "invoice_line_ids"]
+        records = _cached_odoo_call("account.move", "search_read", [domain],
+                                    {"fields": fields, "limit": 1})
+        if not records:
+            target = invoice_number or invoice_id
+            return json.dumps({"error": f"Invoice '{target}' not found."},
+                              indent=2, ensure_ascii=False)
+
+        inv = records[0]
+        partner_id = (inv.get("partner_id") or [None])[0]
+        is_english = False
+        if partner_id:
+            try:
+                is_english = _is_english_customer(_get_partner_details(partner_id).get("lang", ""))
+            except Exception:
+                pass
+
+        detail = _slim_invoice(inv, is_english)
+        detail["move_type"] = inv.get("move_type")
+        detail["payment_term"] = (inv.get("invoice_payment_term_id") or [None, None])[1]
+        detail["salesperson"] = (inv.get("user_id") or [None, None])[1]
+        detail["company"] = (inv.get("company_id") or [None, None])[1]
+
+        narration = inv.get("narration")
+        if narration:
+            detail["terms"] = re.sub(r"<[^>]+>", " ", narration).strip()
+
+        if include_lines and inv.get("invoice_line_ids"):
+            raw_lines = _cached_odoo_call("account.move.line", "read",
+                                          [inv["invoice_line_ids"]],
+                                          {"fields": ["name", "quantity", "price_unit",
+                                                      "price_subtotal", "product_id",
+                                                      "discount", "display_type"]})
+            lines = []
+            for l in raw_lines:
+                # Section and note rows carry no amounts; keep them for context
+                # but do not present them as billable lines.
+                if l.get("display_type") in ("line_section", "line_note"):
+                    lines.append({"type": l.get("display_type"), "text": l.get("name", "")})
+                    continue
+                product = l.get("product_id") or [None, None]
+                lines.append({
+                    "description": l.get("name", ""),
+                    "product": product[1] if len(product) > 1 else None,
+                    "quantity": l.get("quantity"),
+                    "unit_price": l.get("price_unit"),
+                    "discount_pct": l.get("discount") or 0,
+                    "subtotal": l.get("price_subtotal"),
+                })
+            detail["lines"] = lines
+            detail["line_count"] = sum(1 for l in lines if "subtotal" in l)
+
+        return json.dumps({"invoice": detail}, indent=2, ensure_ascii=False,
+                          cls=DateTimeEncoder)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2, ensure_ascii=False)
+
+
+@mcp.tool()
+def get_invoice_stats(invoice_type: str = "customer",
+                      date_from: Optional[str] = None,
+                      date_to: Optional[str] = None,
+                      group_by: str = "payment_state",
+                      top_n: int = 10) -> str:
+    """Aggregate invoices: totals, outstanding balance, and a breakdown.
+
+    Answers "這個月開了多少發票"、"還有多少錢沒收"、"哪個客戶欠最多".
+
+    Args:
+        invoice_type: "customer" (default), "vendor", "customer_credit", "vendor_credit", "all".
+        date_from: Invoice date on or after (YYYY-MM-DD).
+        date_to: Invoice date on or before (YYYY-MM-DD).
+        group_by: "payment_state" (default), "state", "customer", or "month".
+        top_n: How many groups to return when grouping by customer (default 10).
+    """
+    try:
+        domain = []
+        move_type = _resolve_move_type(invoice_type)
+        if move_type:
+            domain.append(("move_type", "=", move_type))
+        else:
+            domain.append(("move_type", "in", list(_INVOICE_TYPES.values())))
+        if date_from:
+            domain.append(("invoice_date", ">=", date_from))
+        if date_to:
+            domain.append(("invoice_date", "<=", date_to))
+
+        records = _cached_odoo_call("account.move", "search_read", [domain], {
+            "fields": ["name", "partner_id", "invoice_date", "state", "payment_state",
+                       "amount_total", "amount_residual", "currency_id"],
+            "limit": 5000, "order": "invoice_date desc",
+        })
+
+        if not records:
+            return json.dumps({"count": 0, "message": "No invoices matched."},
+                              indent=2, ensure_ascii=False)
+
+        buckets = {}
+        for r in records:
+            if group_by == "customer":
+                partner = r.get("partner_id") or [None, "（未指定）"]
+                key = partner[1] if len(partner) > 1 else "（未指定）"
+            elif group_by == "state":
+                key = _MOVE_STATE_ZH.get(r.get("state", ""), r.get("state", ""))
+            elif group_by == "month":
+                key = (r.get("invoice_date") or "")[:7] or "（無日期）"
+            else:
+                key = _PAYMENT_STATE_ZH.get(r.get("payment_state") or "", r.get("payment_state") or "（未設定）")
+            b = buckets.setdefault(key, {"group": key, "count": 0, "total": 0.0, "outstanding": 0.0})
+            b["count"] += 1
+            b["total"] += r.get("amount_total") or 0
+            b["outstanding"] += r.get("amount_residual") or 0
+
+        groups = sorted(buckets.values(), key=lambda b: b["total"], reverse=True)
+        for b in groups:
+            b["total"] = round(b["total"], 2)
+            b["outstanding"] = round(b["outstanding"], 2)
+        if group_by == "month":
+            groups.sort(key=lambda b: b["group"], reverse=True)
+        elif group_by == "customer":
+            groups = groups[:max(1, top_n)]
+
+        return json.dumps({
+            "invoice_type": invoice_type,
+            "period": {"from": date_from, "to": date_to},
+            "invoice_count": len(records),
+            "total_amount": round(sum(r.get("amount_total") or 0 for r in records), 2),
+            "total_outstanding": round(sum(r.get("amount_residual") or 0 for r in records), 2),
+            "currency": _get_currency_code((records[0].get("currency_id") or [])),
+            "group_by": group_by,
+            "groups": groups,
+            "note": "Amounts assume a single currency; mixed-currency data is summed as-is.",
+        }, indent=2, ensure_ascii=False, cls=DateTimeEncoder)
+
+    except Exception as e:
+        return json.dumps({"error": str(e)}, indent=2, ensure_ascii=False)
+
 
 @mcp.tool()
 def create_or_get_partner(partner_name: str, is_company: bool = True,

@@ -144,7 +144,7 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 ---
 
-## Tools (13)
+## Tools (16)
 
 ### System
 
@@ -177,6 +177,28 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 | `get_product_details` | Full product detail by ID |
 | `get_product_stock` | On-hand stock/quantity by warehouse / location |
 
+### Invoices
+
+| Tool | Description |
+|---|---|
+| `search_invoices` | Search invoices by customer, number, state, payment state, date, due date, amount, or source document. `unpaid_only=True` for outstanding receivables |
+| `get_invoice_details` | Full invoice detail by id or number, including line items and payment status |
+| `get_invoice_stats` | Totals and outstanding balance, grouped by payment state, state, customer or month |
+
+Odoo stores customer invoices, vendor bills and credit notes in one model
+(`account.move`). These tools default to customer invoices; pass
+`invoice_type="vendor"`, `"customer_credit"`, `"vendor_credit"` or `"all"`
+for the rest.
+
+Two behaviours worth knowing:
+
+- **`unpaid_only` excludes drafts.** A draft invoice has not been issued to the
+  customer, so counting it as receivable overstates what is owed. On the
+  reference database that is the difference between 22 invoices / 648,730
+  outstanding and 16 / 41,576. Pass `state="draft"` to see drafts explicitly.
+- **Draft invoices have no number.** Odoo reports `name` as `/` until an invoice
+  is posted; these are shown as `（草稿．尚未編號）` with an `is_draft` flag.
+
 ### Partners
 
 | Tool | Description |
@@ -197,6 +219,17 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 ---
 
 ## Changelog (recent)
+
+### v1.9.0 — Invoice reading
+
+Adds `search_invoices`, `get_invoice_details` and `get_invoice_stats` over
+`account.move`. Customer invoices by default; vendor bills and credit notes via
+`invoice_type`.
+
+`unpaid_only` filters on `amount_residual > 0` rather than `payment_state`,
+because `payment_state` can be unset on drafts — and it also restricts to posted
+invoices, since a draft has not been issued yet.
+
 
 - **v1.8.3** — API-key auth for HTTP transports (`--api-key` / `MCP_API_KEY`).
 - **v1.8.2** — Disabled DNS-rebinding protection (fixes `421` for external clients).
