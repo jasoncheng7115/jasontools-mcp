@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **G
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.9.43
+- **Version:** 1.9.44
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -81,6 +81,11 @@ python3 mcp_graylog.py --transport sse --http-host 0.0.0.0 --http-port 8020 \
   --host "https://graylog.example.com:9000" --api-token YOUR_GRAYLOG_TOKEN \
   --api-key YOUR_BEARER_TOKEN
 ```
+
+SSE mode also serves **Streamable HTTP at `/mcp` on the same port** (since v1.9.44). Prefer `/mcp` for any
+client that supports it (e.g. Claude Code `"type": "http"`): SSE clients that auto-reconnect after a dropped
+connection (laptop sleep, network blip) get a fresh session without re-sending `initialize`, and every call then
+fails with `-32602 Invalid request parameters`. `/mcp` is stateless, so there is no session to lose.
 
 ### Streamable HTTP
 
@@ -205,6 +210,7 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 ## Changelog (recent)
 
+- **v1.9.44** — SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 - **v1.9.43** — Fixed bare numeric/IPv4 query terms failing with a generic error on streams with index field-mapping conflicts: auto-quote numeric/IP tokens, and surface the underlying OpenSearch error instead of swallowing it.
 - **v1.9.42** — Added 5 read-only infrastructure tools (`get_current_time`, `list_inputs`, `list_index_sets`, `list_indices`, `list_fields`) for parity with the official Graylog MCP.
 - **v1.9.41** — Fixed timezone offset (`+08:00`) in absolute time input being dropped instead of converted to UTC (caused up to an 8h window shift and inflated counts).

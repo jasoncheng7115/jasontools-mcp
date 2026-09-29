@@ -26,9 +26,20 @@ Technical Capabilities:
 - Time snapshot for batch queries to prevent time drift
 
 Author: Jason Cheng (Jason Tools)
-Version: 1.9.43
+Version: 1.9.44
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
+
+Changes in 1.9.44:
+- SSE mode now also serves Streamable HTTP at /mcp on the same port.
+  SSE clients that auto-reconnect after a dropped connection (laptop sleep) get a
+  fresh session without re-sending `initialize`; every call then fails with -32602
+  "Invalid request parameters" (server log: "Received request before initialization
+  was complete").
+- Streamable HTTP runs stateless: no server-side session to lose, so sleep/wake
+  and server restarts no longer break clients. Clients should move to /mcp.
+- API key check is now plain ASGI middleware with a constant-time compare;
+  BaseHTTPMiddleware logged an AssertionError on every SSE disconnect.
 
 Changes in 1.9.43:
 - Fixed: queries with bare numeric/IPv4 tokens (IP, account, digits) failing with
@@ -167,7 +178,7 @@ from mcp.types import Resource, Tool, TextContent, ImageContent, EmbeddedResourc
 import mcp.types as types
 
 # Version information
-__version__ = "1.9.43"
+__version__ = "1.9.44"
 __author__ = "Jason Cheng (Jason Tools) - AI Collaboration"
 __license__ = "MIT"
 
@@ -4030,37 +4041,43 @@ async def main():
                 )
 
         elif transport in ("streamable-http", "sse"):
+            import hmac
             from contextlib import asynccontextmanager
             from starlette.applications import Starlette
             from starlette.routing import Route, Mount
             from starlette.responses import Response, JSONResponse
-            from starlette.middleware.base import BaseHTTPMiddleware
+            from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
             import uvicorn
 
             http_host = config['http_host']
             http_port = config['http_port']
             api_key = config['api_key']
 
-            if transport == "streamable-http":
-                from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+            # Streamable HTTP (/mcp) is served in both modes. It runs stateless: there is
+            # no server-side session, so a client that lost its connection (laptop sleep,
+            # network drop) never ends up on an uninitialized session.
+            session_manager = StreamableHTTPSessionManager(
+                app=server, json_response=True, stateless=True,
+            )
 
-                session_manager = StreamableHTTPSessionManager(
-                    app=server, json_response=True,
-                )
+            @asynccontextmanager
+            async def lifespan(app):
+                async with session_manager.run():
+                    yield
 
-                @asynccontextmanager
-                async def lifespan(app):
-                    async with session_manager.run():
-                        yield
+            class _MCPEndpoint:
+                # An ASGI app object, so Route passes the raw scope through. Route (not
+                # Mount) matches /mcp exactly instead of 307-redirecting POSTs to /mcp/.
+                async def __call__(self, scope, receive, send):
+                    await session_manager.handle_request(scope, receive, send)
 
-                starlette_app = Starlette(
-                    debug=False,
-                    routes=[Mount("/mcp", app=session_manager.handle_request)],
-                    lifespan=lifespan,
-                )
-                endpoint_path = "/mcp"
+            routes = [Route("/mcp", endpoint=_MCPEndpoint())]
+            endpoint_path = "/mcp"
 
-            else:  # sse
+            if transport == "sse":
+                # Legacy SSE on the same port for clients that only speak SSE. SSE clients
+                # that auto-reconnect get a fresh session without re-sending `initialize`,
+                # and every call then fails with -32602; they should move to /mcp.
                 from mcp.server.sse import SseServerTransport
 
                 sse = SseServerTransport("/messages/")
@@ -4083,32 +4100,32 @@ async def main():
                         )
                     return Response()
 
-                starlette_app = Starlette(
-                    debug=False,
-                    routes=[
-                        Route("/sse", endpoint=handle_sse, methods=["GET"]),
-                        Mount("/messages/", app=sse.handle_post_message),
-                    ],
-                )
-                endpoint_path = "/sse"
+                routes += [
+                    Route("/sse", endpoint=handle_sse, methods=["GET"]),
+                    Mount("/messages/", app=sse.handle_post_message),
+                ]
+                endpoint_path = "/sse and /mcp"
 
-            # API Key authentication middleware
+            starlette_app = Starlette(debug=False, routes=routes, lifespan=lifespan)
+
+            # API key check as plain ASGI middleware: BaseHTTPMiddleware breaks on
+            # streaming responses and logged an AssertionError on every SSE disconnect.
             if api_key:
-                class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                    async def dispatch(self, request, call_next):
-                        auth_header = request.headers.get('Authorization', '')
-                        if auth_header.startswith('Bearer '):
-                            token = auth_header[7:]
-                        else:
-                            token = auth_header
-                        if token != api_key:
-                            return JSONResponse(
+                inner_app = starlette_app
+
+                async def starlette_app(scope, receive, send):
+                    if scope["type"] == "http":
+                        auth_header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+                        token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
+                        if not hmac.compare_digest(token.encode(), api_key.encode()):
+                            response = JSONResponse(
                                 {"error": "Unauthorized", "message": "Invalid or missing API key"},
                                 status_code=401
                             )
-                        return await call_next(request)
+                            await response(scope, receive, send)
+                            return
+                    await inner_app(scope, receive, send)
 
-                starlette_app.add_middleware(APIKeyAuthMiddleware)
                 print(f"API key authentication enabled", file=sys.stderr)
 
             # Note: DNS rebinding protection not needed here - manual Starlette setup
