@@ -59,6 +59,11 @@ Chatbox connection settings:
 | URL | `http://SERVER_IP:8080/sse` |
 | HTTP Header | `Authorization=Bearer YOUR_MCP_API_KEY` |
 
+SSE mode also serves **Streamable HTTP at `/mcp` on the same port** (since v4.5.2). Prefer `/mcp` for any
+client that supports it (e.g. Claude Code `"type": "http"`): SSE clients that auto-reconnect after a dropped
+connection (laptop sleep, network blip) get a fresh session without re-sending `initialize`, and every call then
+fails with `-32602 Invalid request parameters`. `/mcp` is stateless, so there is no session to lose.
+
 ### mcpo (OpenAPI proxy) deployment
 
 ```bash
@@ -298,6 +303,10 @@ per-device API calls (which will likely return empty due to the API limitation).
 Priority: CLI args > environment variables > defaults.
 
 ## Changelog
+
+### v4.5.2 (2026-09-29) - Fix: SSE clients stuck on an uninitialized session
+
+SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 
 ### v4.5.1 (2026-09-06) - Fix: troubleshoot_ip was broken for every IP
 

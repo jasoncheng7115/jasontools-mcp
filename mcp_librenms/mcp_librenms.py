@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MCP server for LibreNMS API – v4.4.0 Slim (Weak-Model Optimized)
+MCP server for LibreNMS API – v4.5.2 Slim (Weak-Model Optimized)
 =================================================================
 Author: Jason Cheng (Jason Tools) - Enhanced by Claude
 License: MIT
@@ -13,6 +13,16 @@ Supports stdio, streamable-http, and sse transport.
 pip install mcp requests uvicorn
 
 Changelog:
+  v4.5.2 - SSE clients stuck on an uninitialized session
+    - SSE mode now also serves Streamable HTTP at /mcp on the same port.
+      SSE clients that auto-reconnect after a dropped connection (laptop sleep) get a
+      fresh session without re-sending `initialize`; every call then fails with -32602
+      "Invalid request parameters" (server log: "Received request before initialization
+      was complete").
+    - Streamable HTTP runs stateless: no server-side session to lose, so sleep/wake
+      and server restarts no longer break clients. Clients should move to /mcp.
+    - API key check is now plain ASGI middleware with a constant-time compare;
+      BaseHTTPMiddleware logged an AssertionError on every SSE disconnect.
   v4.4.0 - Sensor / port / event / monitoring coverage
     - Added get_sensor_health: temperature, voltage, fan, power sensors.
       369 of 377 sensors on the reference server had no tool before this.
@@ -183,8 +193,52 @@ cache = None
 session = None
 mcp = FastMCP(
     "LibreNMS",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # Streamable HTTP without server-side sessions: a client that lost its connection
+    # (laptop sleep, network drop) never ends up on an uninitialized session.
+    stateless_http=True,
 )
+
+
+def _sse_and_http_app(server):
+    """Legacy SSE (/sse + /messages/) plus Streamable HTTP (/mcp) on one port.
+
+    SSE clients that auto-reconnect after a dropped connection (laptop sleep, network
+    blip) get a fresh session without re-sending `initialize`, and every call then fails
+    with -32602 "Invalid request parameters". /mcp runs stateless, so there is no
+    session to lose; clients that support Streamable HTTP should use it.
+    """
+    from starlette.applications import Starlette
+    sse = server.sse_app()
+    http = server.streamable_http_app()
+    return Starlette(routes=list(sse.routes) + list(http.routes),
+                     lifespan=http.router.lifespan_context)
+
+
+class _APIKeyAuth:
+    """API key check as plain ASGI middleware.
+
+    Starlette's BaseHTTPMiddleware breaks on streaming responses and logged an
+    AssertionError every time an SSE connection closed.
+    """
+    def __init__(self, app, api_key):
+        self.app = app
+        self.api_key = api_key.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            import hmac
+            from starlette.responses import JSONResponse
+            auth = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            token = auth[7:] if auth.startswith("Bearer ") else auth
+            if not hmac.compare_digest(token.encode(), self.api_key):
+                response = JSONResponse(
+                    {"error": "Unauthorized", "message": "Invalid or missing API key"},
+                    status_code=401
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 def initialize_session():
@@ -3074,7 +3128,7 @@ if __name__ == "__main__":
     initialize_session()
 
     logger.info("=" * 60)
-    logger.info("LibreNMS FastMCP Server v4.5.1 - Slim (29 tools)")
+    logger.info("LibreNMS FastMCP Server v4.5.2 - Slim (29 tools)")
     logger.info("=" * 60)
     logger.info(f"Transport: {args.transport}")
     if args.transport in ('streamable-http', 'sse'):
@@ -3086,32 +3140,17 @@ if __name__ == "__main__":
 
     if args.transport in ('sse', 'streamable-http'):
         import uvicorn
-        from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
 
         if args.transport == 'sse':
-            app = mcp.sse_app()
+            app = _sse_and_http_app(mcp)
         else:
             app = mcp.streamable_http_app()
 
         if args.api_key:
             _api_key = args.api_key
-            class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                async def dispatch(self, request, call_next):
-                    auth_header = request.headers.get('Authorization', '')
-                    if auth_header.startswith('Bearer '):
-                        token = auth_header[7:]
-                    else:
-                        token = auth_header
-                    if token != _api_key:
-                        return JSONResponse(
-                            {"error": "Unauthorized", "message": "Invalid or missing API key"},
-                            status_code=401
-                        )
-                    return await call_next(request)
-            app.add_middleware(APIKeyAuthMiddleware)
+            app = _APIKeyAuth(app, _api_key)
 
         uvicorn.run(app, host=args.listen, port=args.port)
     else:
         mcp.run(transport='stdio')
-
