@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **P
 
 - **Author:** Jason Cheng (jason@jason.tools)
 - **License:** MIT
-- **Version:** 1.5.6
+- **Version:** 1.5.7
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -50,7 +50,7 @@ Settings are resolved in this order: **CLI args > environment variables > defaul
 
 | Env var | CLI arg | Default | Description |
 |---|---|---|---|
-| `PVE_HOST` | `--host` | — (required) | Base URL, e.g. `https://192.168.1.111:8006` |
+| `PVE_HOST` | `--host` | — (required) | Base URL, e.g. `https://pve.example.com:8006` |
 | `PVE_USERNAME` | `--username` | — | e.g. `root@pam` (password auth) |
 | `PVE_PASSWORD` | `--password` | — | Password (password auth) |
 | `PVE_API_TOKEN_ID` | `--api-token-id` | — | e.g. `root@pam!mytoken` (token auth, preferred) |
@@ -72,7 +72,7 @@ Use **API token** auth where possible; the server falls back to ticket + CSRF wh
 
 ```bash
 python3 mcp_pve.py \
-  --host "https://192.168.1.111:8006" \
+  --host "https://pve.example.com:8006" \
   --api-token-id 'root@pam!mytoken' --api-token-secret SECRET
 ```
 
@@ -80,16 +80,21 @@ python3 mcp_pve.py \
 
 ```bash
 python3 mcp_pve.py --transport sse --http-host 0.0.0.0 --http-port 8015 \
-  --host "https://192.168.1.111:8006" \
+  --host "https://pve.example.com:8006" \
   --api-token-id 'root@pam!mytoken' --api-token-secret SECRET \
   --api-key YOUR_BEARER_TOKEN
 ```
+
+SSE mode also serves **Streamable HTTP at `/mcp` on the same port** (since v1.5.7). Prefer `/mcp` for any
+client that supports it (e.g. Claude Code `"type": "http"`): SSE clients that auto-reconnect after a dropped
+connection (laptop sleep, network blip) get a fresh session without re-sending `initialize`, and every call then
+fails with `-32602 Invalid request parameters`. `/mcp` is stateless, so there is no session to lose.
 
 ### Streamable HTTP
 
 ```bash
 python3 mcp_pve.py --transport streamable-http --http-port 8004 \
-  --host "https://192.168.1.111:8006" \
+  --host "https://pve.example.com:8006" \
   --api-token-id 'root@pam!mytoken' --api-token-secret SECRET
 ```
 
@@ -127,7 +132,7 @@ Expose the stdio server as an OpenAPI endpoint with [`mcpo`](https://github.com/
 
 ```bash
 uvx mcpo --port 8004 --api-key "YOUR_MCPO_KEY" -- \
-  env PVE_HOST=https://192.168.1.111:8006 \
+  env PVE_HOST=https://pve.example.com:8006 \
       PVE_API_TOKEN_ID='root@pam!mytoken' \
       PVE_API_TOKEN_SECRET=SECRET \
       PVE_VERIFY_SSL=false \
@@ -273,6 +278,7 @@ Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in prod
 
 ## Changelog (recent)
 
+- **v1.5.7** — SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 - **v1.5.6** — Fix inaccurate VM memory usage (`memory_used_mb` could exceed total); balloon-derived in-guest usage + clamp; merged IP/memory lookups into one concurrent wave.
 - **v1.5.5** — Removed `include_details` from `get_ceph_status` to prevent token overflow.
 - **v1.5.4** — FastMCP wrapper for SSE/streamable-HTTP (fixes `421`); optional `--api-key` Bearer auth.

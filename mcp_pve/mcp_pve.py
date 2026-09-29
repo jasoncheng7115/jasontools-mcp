@@ -4,12 +4,22 @@ Proxmox VE MCP Server - Enhanced Edition with Batch Operations and Pagination
 Provides comprehensive Proxmox VE management functionality including batch data collection
 
 Author: Jason Cheng (jason@jason.tools)
-Version: 1.5.6
-Last Updated: 2026-07-01
+Version: 1.5.7
+Last Updated: 2026-09-29
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 
 Changelog:
+v1.5.7 (2026-09-29) - Fix: SSE clients stuck on an uninitialized session
+         - SSE mode now also serves Streamable HTTP at /mcp on the same port.
+           SSE clients that auto-reconnect after a dropped connection (laptop sleep) get a
+           fresh session without re-sending `initialize`; every call then fails with -32602
+           "Invalid request parameters" (server log: "Received request before initialization
+           was complete").
+         - Streamable HTTP runs stateless: no server-side session to lose, so sleep/wake
+           and server restarts no longer break clients. Clients should move to /mcp.
+         - API key check is now plain ASGI middleware with a constant-time compare;
+           BaseHTTPMiddleware logged an AssertionError on every SSE disconnect.
 v1.5.6 (2026-07-01) - Fix: Inaccurate VM memory usage (memory_used_mb could exceed total)
          - Root cause: /nodes/{node}/qemu `mem` is host-side KVM process RSS (includes
            QEMU emulation overhead), so it can exceed configured maxmem for VMs without
@@ -131,7 +141,7 @@ from pydantic import AnyUrl
 import mcp.types as types
 
 # Version information
-__version__ = "1.5.6"
+__version__ = "1.5.7"
 __last_updated__ = "2026-07-01"
 __author__ = "Jason Cheng"
 __email__ = "jason@jason.tools"
@@ -533,8 +543,52 @@ def get_pve_client():
 # Create MCP server (via FastMCP for SSE/HTTP transport support with DNS rebinding protection disabled)
 fastmcp = FastMCP(
     "Proxmox_VE",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # Streamable HTTP without server-side sessions: a client that lost its connection
+    # (laptop sleep, network drop) never ends up on an uninitialized session.
+    stateless_http=True,
 )
+
+
+def _sse_and_http_app(server):
+    """Legacy SSE (/sse + /messages/) plus Streamable HTTP (/mcp) on one port.
+
+    SSE clients that auto-reconnect after a dropped connection (laptop sleep, network
+    blip) get a fresh session without re-sending `initialize`, and every call then fails
+    with -32602 "Invalid request parameters". /mcp runs stateless, so there is no
+    session to lose; clients that support Streamable HTTP should use it.
+    """
+    from starlette.applications import Starlette
+    sse = server.sse_app()
+    http = server.streamable_http_app()
+    return Starlette(routes=list(sse.routes) + list(http.routes),
+                     lifespan=http.router.lifespan_context)
+
+
+class _APIKeyAuth:
+    """API key check as plain ASGI middleware.
+
+    Starlette's BaseHTTPMiddleware breaks on streaming responses and logged an
+    AssertionError every time an SSE connection closed.
+    """
+    def __init__(self, app, api_key):
+        self.app = app
+        self.api_key = api_key.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            import hmac
+            from starlette.responses import JSONResponse
+            auth = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            token = auth[7:] if auth.startswith("Bearer ") else auth
+            if not hmac.compare_digest(token.encode(), self.api_key):
+                response = JSONResponse(
+                    {"error": "Unauthorized", "message": "Invalid or missing API key"},
+                    status_code=401
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 server = fastmcp._mcp_server
 
 @server.list_tools()
@@ -4784,27 +4838,13 @@ async def main():
 
         elif transport == "sse":
             import uvicorn
-            from starlette.middleware.base import BaseHTTPMiddleware
             from starlette.responses import JSONResponse
 
-            app = fastmcp.sse_app()
+            app = _sse_and_http_app(fastmcp)
 
             api_key = config.get('api_key', '')
             if api_key:
-                class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                    async def dispatch(self, request, call_next):
-                        auth_header = request.headers.get('Authorization', '')
-                        if auth_header.startswith('Bearer '):
-                            token = auth_header[7:]
-                        else:
-                            token = auth_header
-                        if token != api_key:
-                            return JSONResponse(
-                                {"error": "Unauthorized", "message": "Invalid or missing API key"},
-                                status_code=401
-                            )
-                        return await call_next(request)
-                app.add_middleware(APIKeyAuthMiddleware)
+                app = _APIKeyAuth(app, api_key)
 
             http_host = config['http_host']
             http_port = config['http_port']
@@ -4821,27 +4861,13 @@ async def main():
 
         elif transport == "streamable-http":
             import uvicorn
-            from starlette.middleware.base import BaseHTTPMiddleware
             from starlette.responses import JSONResponse
 
             app = fastmcp.streamable_http_app()
 
             api_key = config.get('api_key', '')
             if api_key:
-                class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                    async def dispatch(self, request, call_next):
-                        auth_header = request.headers.get('Authorization', '')
-                        if auth_header.startswith('Bearer '):
-                            token = auth_header[7:]
-                        else:
-                            token = auth_header
-                        if token != api_key:
-                            return JSONResponse(
-                                {"error": "Unauthorized", "message": "Invalid or missing API key"},
-                                status_code=401
-                            )
-                        return await call_next(request)
-                app.add_middleware(APIKeyAuthMiddleware)
+                app = _APIKeyAuth(app, api_key)
 
             http_host = config['http_host']
             http_port = config['http_port']
