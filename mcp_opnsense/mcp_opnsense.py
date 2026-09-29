@@ -1,24 +1,73 @@
 #!/usr/bin/env python3
 """
-OPNsense MCP Server - v2.3.0 (FastMCP Rewrite)
+OPNsense MCP Server - v2.4.1 (FastMCP Rewrite)
 ================================================
 Author: Jason Cheng (Jason Tools) - Enhanced by Claude
 License: MIT
 Created: 2025-06-25
-Updated: 2026-03-02
+Updated: 2026-09-29
 
 FastMCP-based OPNsense integration optimized for weak/small LLMs.
-20 tools, compact responses, camelCase tool names.
+21 tools, compact responses, camelCase tool names.
 Supports stdio, streamable-http, and sse transport.
 
 pip install mcp aiohttp requests defusedxml uvicorn
 
+API vs config.xml
+-----------------
+Rules/aliases/NAT/gateways are read from the native MVC API first and fall back to
+config.xml only when the API is unavailable (older OPNsense, missing plugin, error).
+Every affected tool reports which source it used via a "source" field.
+
+Minimum OPNsense version per data source (see README for the full matrix):
+  - firewall/filter/search_rule   : 24.1+  (see the 26.1 cutover note below)
+  - firewall/{source_nat,npt}/search_rule : 24.1+
+  - firewall/one_to_one/search_rule       : 24.7+ (safe floor)
+  - firewall/d_nat/search_rule    : 26.1+  (port forward; config.xml-only before that)
+  - firewall/alias/search_item, alias_util/list : 23.7+
+  - routing/settings/search_gateway : 24.1+
+  - routes/gateway/status           : 23.7+
+  - core/backup/download/this       : 23.7.8+ or os-api-backup plugin (fallback path)
+
+IMPORTANT (the 26.1 cutover): filter/search_rule exists from 24.1, but on 24.1-25.7 it
+only exposed Firewall > Automation rules — the real GUI rules lived in config.xml
+<filter><rule>. In 26.1 the rules were promoted into the MVC model, and config.xml
+<filter><rule> is now EMPTY. So neither source alone is correct across versions:
+reading config.xml returns 0 rules on 26.1, reading the API returns only automation
+rules on 25.x. We read the API first (with show_all=1, which on 25.x is what merges
+the legacy config.xml rules into the response) and fall back to config.xml.
+
 Changelog:
-  v2.3.0 - Native-API firewall rules + aliases
-    - getFirewallRules/getConfigSummary/downloadConfigXml use search_rule?show_all=1
-    - Alias content via alias/search_item; matching via alias_meta_*
-    - Fixes firewall_rules=0 in getConfigSummary/downloadConfigXml on 24.7+
-    - Version label reconciled: these features shipped but were still tagged v2.2.1
+  v2.4.1 (2026-09-29) - SSE clients stuck on an uninitialized session
+    - SSE mode now also serves Streamable HTTP at /mcp on the same port.
+      SSE clients that auto-reconnect after a dropped connection (laptop sleep) get a
+      fresh session without re-sending `initialize`; every call then fails with -32602
+      "Invalid request parameters" (server log: "Received request before initialization
+      was complete").
+    - Streamable HTTP runs stateless: no server-side session to lose, so sleep/wake
+      and server restarts no longer break clients. Clients should move to /mcp.
+    - API key check is now plain ASGI middleware with a constant-time compare;
+      BaseHTTPMiddleware logged an AssertionError on every SSE disconnect.
+  v2.4.0 (2026-07-12) - API-first reads, gateways, real config.xml export
+    - FIX: getFirewallRules/getConfigSummary returned 0 rules on OPNsense 26.1.
+      They read config.xml <filter><rule>, which 26.1 leaves empty (rules moved to
+      the MVC model). Now read firewall/filter/search_rule, config.xml as fallback.
+    - NEW getGateways: gateway config + live status (monitor IP, monitor_disable,
+      priority, weight, loss/delay) via routing/settings/search_gateway, which also
+      surfaces dynamic (DHCP/PPPoE) gateways that have no config entry.
+    - getNatRules: single entry point for all NAT types. nat_type now accepts
+      port_forward | outbound | source_nat | one_to_one | npt. Port forward uses the
+      26.1 firewall/d_nat API (note: the endpoint is "d_nat", not "forward"/"dnat"),
+      falling back to config.xml <nat><rule> on older releases.
+    - downloadConfigXml: new `section` arg returns the raw XML of a config.xml
+      section (e.g. "gateways", "system", "nat"). No arg = previous summary output.
+    - Synthetic rows (anti-lockout in d_nat, automatic outbound in source_nat) are
+      tagged is_automatic and excluded by default; pass include_automatic=True.
+    - Backward compatible: all v2.3.0 tool names and arguments still work.
+      getNatRulesConfig is kept as a config.xml-only compatibility wrapper.
+  v2.3.0 - Native-API firewall rules + aliases (INCOMPLETE - see v2.4.0)
+    - Changelog claimed API-based rules but the code still parsed config.xml;
+      the firewall_rules=0 bug it was meant to fix was actually shipped. Fixed in v2.4.0.
   v2.2.1 (2026-03-02) - Fix Claude Desktop launch: upgrade mcp 1.9.4 → 1.26.0
     - Local venv mcp package too old, missing mcp.server.transport_security module
     - Upgraded /Users/jasoncheng/venvs/mcp-opnsense/ mcp dependency
@@ -86,7 +135,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("mcp-opnsense")
 
-__version__ = "2.3.0"
+__version__ = "2.4.1"
 
 
 # ───────────────────────── Configuration ─────────────────────────
@@ -161,6 +210,174 @@ def _R(obj) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+def _truthy(v: Any) -> bool:
+    """OPNsense encodes booleans as "1"/"0", "yes"/"no", true/false depending on endpoint."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1", "yes", "true", "on")
+
+
+def _sel(v: Any) -> str:
+    """Collapse an OPNsense dropdown field to its selected key.
+
+    Model reads (routing/settings/get, firewall/*/get) return option fields as
+    {"opt1": {"value": "Label", "selected": 0}, ...}; search_* endpoints return the
+    plain key instead. Accept both.
+    """
+    if isinstance(v, dict):
+        for key, opt in v.items():
+            if isinstance(opt, dict) and _truthy(opt.get("selected")):
+                return key
+        return ""
+    return "" if v is None else str(v)
+
+
+def _alias_meta(meta: Any) -> Dict[str, str]:
+    """Pull alias names + descriptions out of an alias_meta_<field> list.
+
+    Each entry is {"value", "%value", "isAlias", "description"}; only isAlias entries
+    are real aliases (plain networks like 192.0.2.0/24 appear here too).
+    """
+    if not isinstance(meta, list):
+        return {}
+    names, descs = [], []
+    for entry in meta:
+        if isinstance(entry, dict) and _truthy(entry.get("isAlias")):
+            if entry.get("value"):
+                names.append(str(entry["value"]))
+            if entry.get("description"):
+                descs.append(str(entry["description"]))
+    out = {}
+    if names:
+        out["alias"] = ",".join(names)
+    if descs:
+        out["alias_desc"] = "; ".join(descs)
+    return out
+
+
+def _iface_match(rule_iface: str, wanted: str) -> bool:
+    """A rule's interface field can list several interfaces ("wan,opt2")."""
+    if not wanted:
+        return True
+    parts = [p.strip().lower() for p in str(rule_iface).split(",") if p.strip()]
+    return wanted.strip().lower() in parts
+
+
+def _normalize_api_rule(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a firewall/filter/search_rule row into a compact, LLM-friendly rule.
+
+    Automatic/legacy rows and MVC rows have different shapes: MVC rows carry the raw
+    key plus a "%"-prefixed label ("action": "block" / "%action": "Block") and an
+    interface, while automatic rows carry only the already-human value and no
+    interface at all. Prefer the raw key, fall back to the label.
+    """
+    def pick(key: str) -> str:
+        return str(row.get(key) or row.get(f"%{key}") or "")
+
+    is_auto = _truthy(row.get("is_automatic")) or _truthy(row.get("legacy"))
+    rule = {
+        "uuid": row.get("uuid", ""),
+        "description": row.get("description") or row.get("descr") or "",
+        "enabled": _truthy(row.get("enabled")),
+        "action": pick("action").lower(),
+        "interface": row.get("interface", ""),
+        "direction": pick("direction").lower(),
+        "ipprotocol": pick("ipprotocol"),
+        "protocol": pick("protocol"),
+        "source": row.get("source_net", ""),
+        "source_port": row.get("source_port", ""),
+        "destination": row.get("destination_net", ""),
+        "destination_port": row.get("destination_port", ""),
+        "sequence": row.get("sequence", ""),
+        "is_automatic": is_auto,
+    }
+    if row.get("%interface"):
+        rule["interface_label"] = row["%interface"]
+    for field, prefix in (("source_net", "src"), ("destination_net", "dst")):
+        for key, val in _alias_meta(row.get(f"alias_meta_{field}")).items():
+            rule[f"{prefix}_{key}"] = val
+    if _truthy(row.get("log")):
+        rule["log"] = True
+    if row.get("gateway"):
+        rule["gateway"] = row["gateway"]
+    return {k: v for k, v in rule.items() if v not in ("", None, False) or k == "enabled"}
+
+
+def _normalize_dnat_rule(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a firewall/d_nat/search_rule row (port forward, OPNsense 26.1+).
+
+    d_nat differs from the other rule controllers: keys are dotted
+    ("destination.network"), state is "disabled" rather than "enabled", and the
+    anti-lockout rows it synthesizes carry a "lockout_N" uuid instead of the
+    is_automatic flag the other controllers use.
+    """
+    uuid = str(row.get("uuid", ""))
+    is_auto = _truthy(row.get("is_automatic")) or uuid.startswith("lockout_")
+
+    def pick(key: str) -> str:
+        return str(row.get(key) or row.get(f"%{key}") or "")
+
+    rule = {
+        "uuid": uuid,
+        "description": row.get("descr") or row.get("description") or "",
+        "enabled": not _truthy(row.get("disabled")),
+        "interface": row.get("interface", ""),
+        "ipprotocol": pick("ipprotocol"),
+        "protocol": pick("protocol"),
+        "source": row.get("source.network", ""),
+        "source_port": row.get("source.port", ""),
+        "destination": row.get("destination.network", ""),
+        "destination_port": row.get("destination.port", ""),
+        "nat_ip": row.get("target", ""),
+        "nat_port": row.get("local-port", ""),
+        "is_automatic": is_auto,
+    }
+    if row.get("%interface"):
+        rule["interface_label"] = row["%interface"]
+    for field, prefix in (("source.network", "src"), ("destination.network", "dst")):
+        for key, val in _alias_meta(row.get(f"alias_meta_{field}")).items():
+            rule[f"{prefix}_{key}"] = val
+    return {k: v for k, v in rule.items() if v not in ("", None, False) or k == "enabled"}
+
+
+def _normalize_gateway(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a routing/settings/search_gateway row (config + live status merged).
+
+    monitor_disable=1 with an empty monitor means dpinger never probes this gateway,
+    so status stays "Online" and it can never be marked down — worth surfacing
+    explicitly, because a gateway that "can't go down" looks identical to a healthy one.
+    """
+    monitor = str(row.get("monitor") or "")
+    monitor_disabled = _truthy(row.get("monitor_disable"))
+    gw = {
+        "name": row.get("name", ""),
+        "description": row.get("descr", ""),
+        "interface": _sel(row.get("interface")),
+        "interface_label": row.get("interface_descr", ""),
+        "gateway": row.get("gateway", ""),
+        "ipprotocol": _sel(row.get("ipprotocol")),
+        "enabled": not _truthy(row.get("disabled")),
+        "is_default": _truthy(row.get("defaultgw")),
+        "dynamic": _truthy(row.get("dynamic")),
+        "priority": str(row.get("priority", "")),
+        "weight": str(row.get("weight", "")),
+        # Config: what dpinger is told to probe.
+        "monitor_ip": monitor or (row.get("gateway", "") if not monitor_disabled else ""),
+        "monitor_explicit": bool(monitor),
+        "monitor_disabled": monitor_disabled,
+        # Live: dpinger's verdict.
+        "status": row.get("status", ""),
+        "loss": row.get("loss", ""),
+        "delay": row.get("delay", ""),
+        "stddev": row.get("stddev", ""),
+    }
+    if monitor_disabled:
+        gw["note"] = "monitoring disabled - status is always Online, gateway cannot be marked down"
+    if _truthy(row.get("force_down")):
+        gw["note"] = "force_down is set - gateway is administratively marked down"
+    return gw
+
+
 # ───────────────────────── Global State + FastMCP ─────────────────────────
 
 config: Optional[Config] = None
@@ -169,8 +386,52 @@ client: Optional['OPNsenseClient'] = None
 
 mcp = FastMCP(
     "OPNsense",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # Streamable HTTP without server-side sessions: a client that lost its connection
+    # (laptop sleep, network drop) never ends up on an uninitialized session.
+    stateless_http=True,
 )
+
+
+def _sse_and_http_app(server):
+    """Legacy SSE (/sse + /messages/) plus Streamable HTTP (/mcp) on one port.
+
+    SSE clients that auto-reconnect after a dropped connection (laptop sleep, network
+    blip) get a fresh session without re-sending `initialize`, and every call then fails
+    with -32602 "Invalid request parameters". /mcp runs stateless, so there is no
+    session to lose; clients that support Streamable HTTP should use it.
+    """
+    from starlette.applications import Starlette
+    sse = server.sse_app()
+    http = server.streamable_http_app()
+    return Starlette(routes=list(sse.routes) + list(http.routes),
+                     lifespan=http.router.lifespan_context)
+
+
+class _APIKeyAuth:
+    """API key check as plain ASGI middleware.
+
+    Starlette's BaseHTTPMiddleware breaks on streaming responses and logged an
+    AssertionError every time an SSE connection closed.
+    """
+    def __init__(self, app, api_key):
+        self.app = app
+        self.api_key = api_key.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            import hmac
+            from starlette.responses import JSONResponse
+            auth = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            token = auth[7:] if auth.startswith("Bearer ") else auth
+            if not hmac.compare_digest(token.encode(), self.api_key):
+                response = JSONResponse(
+                    {"error": "Unauthorized", "message": "Invalid or missing API key"},
+                    status_code=401
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 # ───────────────────────── OPNsenseClient ─────────────────────────
@@ -192,13 +453,19 @@ class OPNsenseClient:
         return ctx
 
     async def ensure_session(self):
-        """Lazy session creation - creates session on first use."""
+        """Lazy session creation - creates session on first use.
+
+        trust_env=True makes aiohttp honour HTTP_PROXY/HTTPS_PROXY, which the `requests`
+        path already did implicitly. Claude Desktop on macOS routes MCP traffic through
+        mcp_proxy to get around security software blocking its child processes; without
+        this, every API call from there fails and silently falls back to config.xml.
+        """
         if self.session is None or self.session.closed:
             connector = aiohttp.TCPConnector(ssl=self._ssl_context)
             auth = aiohttp.BasicAuth(self.cfg.API_KEY, self.cfg.API_SECRET)
             timeout = aiohttp.ClientTimeout(total=self.cfg.TIMEOUT)
             self.session = aiohttp.ClientSession(
-                connector=connector, auth=auth, timeout=timeout
+                connector=connector, auth=auth, timeout=timeout, trust_env=True
             )
 
     async def _request(self, method: str, endpoint: str, data: Dict = None,
@@ -399,6 +666,40 @@ class OPNsenseClient:
             })
         return interfaces
 
+    def _parse_gateways_from_xml(self, root: Element) -> List[Dict[str, Any]]:
+        """Fallback gateway config reader.
+
+        Gateways live in <gateways><gateway_item> on older releases and moved to
+        <OPNsense><Gateways><gateway_item> with the MVC model; check both. Dynamic
+        (DHCP/PPPoE) gateways have no config entry at all and only appear via the API.
+        """
+        def txt(elem: Optional[Element], default="") -> str:
+            return elem.text.strip() if elem is not None and elem.text else default
+
+        gateways: List[Dict[str, Any]] = []
+        nodes = root.findall("./gateways/gateway_item") + \
+            root.findall("./OPNsense/Gateways/gateway_item")
+        for node in nodes:
+            # 26.1 leaves a childless <gateway_item/> stub behind in the legacy
+            # <gateways> block; parsing it would yield a gateway with every field blank.
+            if len(node) == 0:
+                continue
+            gateways.append({
+                "name": txt(node.find("name")),
+                "interface": txt(node.find("interface")),
+                "gateway": txt(node.find("gateway")),
+                "monitor": txt(node.find("monitor")),
+                "monitor_disable": _truthy(txt(node.find("monitor_disable"))),
+                "priority": txt(node.find("priority")),
+                "weight": txt(node.find("weight")),
+                "defaultgw": _truthy(txt(node.find("defaultgw"))),
+                "ipprotocol": txt(node.find("ipprotocol")),
+                "description": txt(node.find("descr")),
+                "enabled": not _truthy(txt(node.find("disabled"))),
+                "dynamic": False,
+            })
+        return gateways
+
     # ── Service API Methods ──
 
     async def search_services(self, search_phrase: str = "", current: int = 1,
@@ -557,19 +858,51 @@ class OPNsenseClient:
                 continue
         raise Exception("No working routes endpoint found")
 
-    # ── NAT / Alias API Methods ──
+    # ── Firewall / NAT / Alias API Methods ──
+
+    async def search_filter_rules(self) -> Dict:
+        """Firewall rules via the MVC API.
+
+        show_all=1 is required on 25.x, where it is what pulls the legacy (config.xml)
+        and internal rules into the result at all. On 26.1 those are always merged and
+        show_all only adds pf counters, so sending it is harmless there. Send it either
+        way rather than version-sniffing.
+
+        Paging params are ignored on GET (OPNsense reads them with getPost()); a GET
+        returns the whole set up to its 9999-row default, which is what we want.
+        """
+        return await self._request("GET", "/api/firewall/filter/search_rule",
+                                   params={"show_all": "1"})
 
     async def search_nat_rules(self, nat_type: str = "source_nat", search_phrase: str = "",
-                               row_count: int = 100) -> Dict:
-        params = {"current": 1, "rowCount": row_count, "searchPhrase": search_phrase}
-        return await self._request("GET", f"/api/firewall/{nat_type}/searchRule", params=params)
+                               row_count: int = 5000) -> Dict:
+        """NAT rules via the MVC API.
 
-    async def search_aliases_api(self, search_phrase: str = "", row_count: int = 100) -> Dict:
+        nat_type is the API controller name: d_nat (port forward, 26.1+),
+        source_nat (outbound), one_to_one, npt.
+        """
         params = {"current": 1, "rowCount": row_count, "searchPhrase": search_phrase}
-        return await self._request("GET", "/api/firewall/alias/searchItem", params=params)
+        return await self._request("GET", f"/api/firewall/{nat_type}/search_rule", params=params)
+
+    async def search_aliases_api(self, search_phrase: str = "", row_count: int = 5000) -> Dict:
+        params = {"current": 1, "rowCount": row_count, "searchPhrase": search_phrase}
+        return await self._request("GET", "/api/firewall/alias/search_item", params=params)
 
     async def list_alias_content(self, alias_name: str) -> Dict:
         return await self._request("GET", f"/api/firewall/alias_util/list/{alias_name}")
+
+    # ── Gateway API Methods ──
+
+    async def search_gateways(self) -> Dict:
+        """Gateway config merged with live status (OPNsense 24.7+).
+
+        Richer than routes/gateway/status: includes monitor/priority/weight config and
+        dynamic (DHCP/PPPoE) gateways, whose uuid is the gateway name.
+        """
+        return await self._request("GET", "/api/routing/settings/search_gateway")
+
+    async def get_gateway_status(self) -> Dict:
+        return await self._request("GET", "/api/routes/gateway/status")
 
 
 # ───────────────────────── Helper: ensure client ─────────────────────────
@@ -594,7 +927,10 @@ async def getConfigSummary() -> str:
         c = await _ensure_client()
         root = await c.download_config_xml()
 
-        fw_rules = c._parse_firewall_rules_from_xml(root)
+        # Rules must come from the API: config.xml <filter><rule> is empty on 26.1,
+        # so counting it there reports 0 firewall rules on a box that has hundreds.
+        fw_rules, fw_source = await _fetch_firewall_rules()
+
         aliases = c._parse_aliases_from_xml(root)
         interfaces = c._parse_interfaces_from_xml(root)
         nat_fwd = c._parse_nat_rules_from_xml(root, "forward")
@@ -632,11 +968,15 @@ async def getConfigSummary() -> str:
         except Exception:
             pass
 
+        user_rules = [r for r in fw_rules if not r.get("is_automatic")]
+
         return _R({
             "system": sys_info,
             "stats": {
                 "firewall_rules": len(fw_rules),
-                "enabled_rules": sum(1 for r in fw_rules if r["enabled"]),
+                "firewall_rules_user": len(user_rules),
+                "firewall_rules_source": fw_source,
+                "enabled_rules": sum(1 for r in fw_rules if r.get("enabled")),
                 "aliases": len(aliases),
                 "interfaces": len(interfaces),
                 "nat_forward": len(nat_fwd),
@@ -651,45 +991,129 @@ async def getConfigSummary() -> str:
 
 
 # Tool 2: getFirewallRules
+async def _fetch_firewall_rules() -> tuple:
+    """Firewall rules, API first, config.xml as fallback. Returns (rules, source)."""
+    c = await _ensure_client()
+    try:
+        result = await c.search_filter_rules()
+        rows = result.get("rows", [])
+        if rows:
+            return [_normalize_api_rule(r) for r in rows], "api"
+    except Exception as api_exc:
+        logger.warning(f"filter/search_rule failed, falling back to config.xml: {api_exc}")
+    root = await c.download_config_xml()
+    return c._parse_firewall_rules_from_xml(root), "config"
+
+
 @mcp.tool()
 async def getFirewallRules(interface: Optional[str] = None, action: Optional[str] = None,
                            enabled_only: Optional[bool] = None,
-                           aliases_only: bool = False) -> str:
-    """Get firewall rules from config.xml with filtering.
+                           aliases_only: bool = False,
+                           include_automatic: bool = True) -> str:
+    """Get firewall rules (native API, config.xml fallback).
     [YES] "防火牆規則", "show firewall rules", "rules on LAN", "pass rules".
-    [NO] "NAT rules" -> use getNatRulesConfig().
+    [NO] "NAT rules" -> use getNatRules().
 
     Args:
-        interface: Filter by interface (e.g., wan, lan, opt1).
+        interface: Filter by interface (e.g., wan, lan, opt1). A rule may span
+            several interfaces ("wan,opt2"); it matches if any of them match.
         action: Filter by action (pass, block, reject).
         enabled_only: True=enabled only, False=disabled only, None=all.
-        aliases_only: Only show rules that reference aliases."""
+        aliases_only: Only show rules that reference aliases.
+        include_automatic: Include OPNsense's own automatic/internal rules.
+            False = only rules a human configured."""
     try:
-        c = await _ensure_client()
-        root = await c.download_config_xml()
-        rules = c._parse_firewall_rules_from_xml(root)
+        rules, source = await _fetch_firewall_rules()
 
+        if not include_automatic:
+            rules = [r for r in rules if not r.get("is_automatic")]
         if interface:
-            rules = [r for r in rules if r["interface"].lower() == interface.lower()]
+            rules = [r for r in rules if _iface_match(r.get("interface", ""), interface)]
         if action:
-            rules = [r for r in rules if r["action"].lower() == action.lower()]
+            rules = [r for r in rules if r.get("action", "").lower() == action.lower()]
         if enabled_only is not None:
-            rules = [r for r in rules if r["enabled"] == enabled_only]
+            rules = [r for r in rules if r.get("enabled") == enabled_only]
         if aliases_only:
-            rules = [r for r in rules if r["src_alias"] or r["dst_alias"]]
+            rules = [r for r in rules if r.get("src_alias") or r.get("dst_alias")]
 
-        return _R({"data": rules, "count": len(rules)})
+        return _R({"source": source, "data": rules, "count": len(rules)})
     except Exception as e:
         return _R({"error": str(e)})
 
 
-# Tool 3: getNatRulesConfig
+# Tool 3: getNatRules
+# Maps a caller-facing NAT type to (API controller, config.xml rule_type).
+# Legacy aliases keep pre-v2.4.0 callers working: "forward" was the old name for port
+# forward, "source" the old name for outbound.
+_NAT_TYPES = {
+    "port_forward": ("d_nat", "forward"),        # d_nat needs 26.1+, config.xml before
+    "forward": ("d_nat", "forward"),             # legacy alias
+    "outbound": ("source_nat", "outbound"),
+    "source_nat": ("source_nat", "outbound"),
+    "source": ("source_nat", "source"),          # legacy alias
+    "one_to_one": ("one_to_one", "one_to_one"),
+    "npt": ("npt", None),                        # API only, no config.xml equivalent
+}
+
+
+@mcp.tool()
+async def getNatRules(nat_type: str = "port_forward", enabled_only: Optional[bool] = None,
+                      search: Optional[str] = None,
+                      include_automatic: bool = False) -> str:
+    """Get NAT rules of any type (native API, config.xml fallback).
+    [YES] "NAT規則", "port forwarding rules", "轉port", "outbound NAT", "1:1 NAT", "NPTv6".
+    [NO] "Firewall rules" -> use getFirewallRules().
+
+    Args:
+        nat_type: port_forward (port forward / destination NAT), outbound (source NAT),
+            one_to_one, or npt. Aliases: "forward"=port_forward, "source_nat"/"source"=outbound.
+        enabled_only: True=enabled only, False=disabled only, None=all.
+        search: Filter by description (case-insensitive).
+        include_automatic: Include rules OPNsense synthesizes for display
+            (anti-lockout, automatic outbound NAT). These are not in the config."""
+    try:
+        key = (nat_type or "").lower()
+        if key not in _NAT_TYPES:
+            return _R({"error": f"Invalid nat_type. Must be one of: {sorted(_NAT_TYPES)}"})
+        api_ctrl, xml_type = _NAT_TYPES[key]
+
+        c = await _ensure_client()
+        rules, source = [], None
+
+        try:
+            result = await c.search_nat_rules(api_ctrl, search_phrase=search or "")
+            rows = result.get("rows", [])
+            normalize = _normalize_dnat_rule if api_ctrl == "d_nat" else _normalize_api_rule
+            rules, source = [normalize(r) for r in rows], "api"
+        except Exception as api_exc:
+            # d_nat is 26.1+; source_nat/one_to_one/npt are 24.x+. On older releases the
+            # endpoint 404s and config.xml is the only source (npt has none).
+            logger.warning(f"firewall/{api_ctrl}/search_rule failed, "
+                           f"falling back to config.xml: {api_exc}")
+            if xml_type is None:
+                return _R({"error": f"{key} requires the API (no config.xml equivalent): {api_exc}"})
+            root = await c.download_config_xml()
+            rules, source = c._parse_nat_rules_from_xml(root, xml_type), "config"
+
+        if not include_automatic:
+            rules = [r for r in rules if not r.get("is_automatic")]
+        if enabled_only is not None:
+            rules = [r for r in rules if r.get("enabled") == enabled_only]
+        if search:
+            rules = [r for r in rules if search.lower() in r.get("description", "").lower()]
+
+        return _R({"nat_type": key, "source": source, "data": rules, "count": len(rules)})
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Tool 3b: getNatRulesConfig - kept for backward compatibility with pre-v2.4.0 callers.
 @mcp.tool()
 async def getNatRulesConfig(rule_type: str = "forward", enabled_only: Optional[bool] = None,
                             search: Optional[str] = None) -> str:
-    """Get NAT rules from config.xml (forward, outbound, source, one_to_one).
-    [YES] "NAT規則", "port forwarding rules", "outbound NAT".
-    [NO] "API NAT rules" -> use getNatRules().
+    """Get NAT rules straight from config.xml, skipping the API.
+    [NO] Prefer getNatRules() - it reads the live API and falls back here automatically.
+    [YES] Only when you specifically need the on-disk config.xml view.
 
     Args:
         rule_type: forward, outbound, source, or one_to_one.
@@ -709,7 +1133,7 @@ async def getNatRulesConfig(rule_type: str = "forward", enabled_only: Optional[b
         if search:
             rules = [r for r in rules if search.lower() in r.get("description", "").lower()]
 
-        return _R({"rule_type": rule_type, "data": rules, "count": len(rules)})
+        return _R({"rule_type": rule_type, "source": "config", "data": rules, "count": len(rules)})
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1083,37 +1507,122 @@ async def getRoutes() -> str:
         return _R({"error": str(e)})
 
 
-# Tool 17: getNatRules
+# Tool 17: getGateways
 @mcp.tool()
-async def getNatRules(nat_type: str = "source_nat",
-                      search: Optional[str] = None) -> str:
-    """Get NAT rules via API (source_nat or one_to_one).
-    [YES] "API NAT rules", "source NAT", "1:1 NAT rules".
-    [NO] "Config.xml NAT rules" -> use getNatRulesConfig().
+async def getGateways(name: Optional[str] = None) -> str:
+    """Get gateways: configuration AND live status in one call.
+    [YES] "閘道", "gateway status", "is the gateway down", "Monitor IP", "WAN down",
+          "gateway loss/latency", "default gateway", "多 WAN".
+    [NO] "Routing table" -> use getRoutes().
+
+    Returns per gateway: interface, gateway IP, monitor_ip, monitor_disabled, priority,
+    weight, is_default, plus live status/loss/delay from dpinger.
+
+    Reading status alone is misleading: a gateway with monitor_disabled=true is never
+    probed, so it always reports "Online" and can never be marked down. That case is
+    flagged in the "note" field.
 
     Args:
-        nat_type: "source_nat" or "one_to_one".
-        search: Filter by description."""
+        name: Only this gateway (case-insensitive). None = all."""
     try:
         c = await _ensure_client()
-        result = await c.search_nat_rules(nat_type, search_phrase=search or "", row_count=500)
-        return _R(result)
+        gateways, source = [], None
+
+        try:
+            result = await c.search_gateways()
+            gateways = [_normalize_gateway(r) for r in result.get("rows", [])]
+            source = "api"
+        except Exception as api_exc:
+            logger.warning(f"routing/settings/search_gateway failed, "
+                           f"falling back to config.xml: {api_exc}")
+            root = await c.download_config_xml()
+            gateways = c._parse_gateways_from_xml(root)
+            source = "config"
+            # config.xml has no live state; merge in what the status endpoint knows.
+            # It also reports dynamic (DHCP/PPPoE) gateways, which have no config entry.
+            try:
+                status = await c.get_gateway_status()
+                by_name = {g["name"]: g for g in gateways}
+                for item in status.get("items", []):
+                    gw = by_name.get(item.get("name"))
+                    if gw is None:
+                        gw = {"name": item.get("name", ""), "dynamic": True, "enabled": True}
+                        gateways.append(gw)
+                    gw.update({
+                        "status": item.get("status_translated", ""),
+                        "loss": item.get("loss", ""),
+                        "delay": item.get("delay", ""),
+                        "stddev": item.get("stddev", ""),
+                    })
+            except Exception as status_exc:
+                logger.warning(f"routes/gateway/status failed: {status_exc}")
+
+        if name:
+            gateways = [g for g in gateways if g.get("name", "").lower() == name.lower()]
+
+        return _R({"source": source, "data": gateways, "count": len(gateways)})
     except Exception as e:
         return _R({"error": str(e)})
 
 
 # Tool 18: downloadConfigXml
 @mcp.tool()
-async def downloadConfigXml() -> str:
-    """Download and parse OPNsense config.xml, returning system info and section counts.
-    [YES] "下載設定檔", "download config", "config.xml backup".
-    [NO] "Firewall rules" -> use getFirewallRules().
-    [NO] "Full summary" -> use getConfigSummary().
+async def downloadConfigXml(section: Optional[str] = None,
+                            max_chars: int = 40000) -> str:
+    """Download OPNsense config.xml. With `section`, returns that section's raw XML.
+    [YES] "下載設定檔", "download config", "config.xml backup", "撈設定檔".
+    [YES] "show me the <gateways> section", "raw config for interfaces".
+    [NO] "Firewall rules" -> use getFirewallRules() (26.1 keeps them out of config.xml).
+    [NO] "Gateway monitor IP / status" -> use getGateways().
+
+    Args:
+        section: Top-level config.xml section to dump as raw XML, e.g. "gateways",
+            "system", "nat", "interfaces", "OPNsense". Also accepts a path like
+            "OPNsense/Gateways". None = system info + section counts (the summary).
+        max_chars: Truncate the XML at this many characters. The full config.xml is
+            typically 300KB+, which would blow the context window.
 
     Requires OPNsense >= 23.7.8 or os-api-backup plugin."""
     try:
         c = await _ensure_client()
         root = await c.download_config_xml()
+
+        if section:
+            path = section.strip().strip("/")
+            nodes = root.findall(f"./{path}")
+            if not nodes:
+                available = sorted({child.tag for child in root})
+                return _R({"error": f"Section '{section}' not found in config.xml",
+                           "available_sections": available})
+
+            out = {"section": path, "count": len(nodes)}
+
+            # Sections that migrated to an MVC model leave a stub at the legacy path
+            # (e.g. 26.1 keeps <gateways><gateway_item/></gateways> while the real data
+            # sits under <OPNsense><Gateways>). The stub is not childless - it holds an
+            # empty element - so test for actual content, not for children. Returning it
+            # silently reads as "this section is empty", which is wrong.
+            def _has_content(node: Element) -> bool:
+                return any((e.text or "").strip() for e in node.iter())
+
+            if not any(_has_content(n) for n in nodes):
+                leaf = path.split("/")[-1].lower()
+                mvc_root = root.find("./OPNsense")
+                elsewhere = [f"OPNsense/{child.tag}" for child in (mvc_root if mvc_root is not None else [])
+                             if child.tag.lower() == leaf and _has_content(child)]
+                if elsewhere:
+                    out["note"] = (f"'{path}' is an empty legacy stub; this data moved to "
+                                   f"{elsewhere[0]}. Retry with section='{elsewhere[0]}'.")
+                    out["see_also"] = elsewhere
+
+            xml = "\n".join(ET.tostring(n, encoding="unicode") for n in nodes)
+            if len(xml) > max_chars:
+                out["xml"] = xml[:max_chars]
+                out["truncated"] = True
+                out["total_chars"] = len(xml)
+            else:
+                out["xml"] = xml
+            return _R(out)
 
         def txt(elem, default=""):
             return elem.text.strip() if elem is not None and elem.text else default
@@ -1140,16 +1649,30 @@ async def downloadConfigXml() -> str:
             pass
 
         counts = {
-            "firewall_rules": len(root.findall("./filter/rule")),
+            # config.xml-only counts. On 26.1 filter/rule is empty (rules live in the
+            # MVC model), so this is the on-disk view, not the effective ruleset.
+            "firewall_rules_in_xml": len(root.findall("./filter/rule")),
             "aliases": len(root.findall(".//alias")),
             "interfaces": len(root.findall("./interfaces/*")),
+            "gateways": len(root.findall("./gateways/gateway_item")) +
+                        len(root.findall("./OPNsense/Gateways/gateway_item")),
             "nat_forward": len(root.findall("./nat/rule")),
             "nat_outbound": len(root.findall("./nat/outbound/rule")),
             "nat_source": len(root.findall("./nat/advancedoutbound/rule")) + len(root.findall("./nat/source/rule")),
             "nat_1to1": len(root.findall("./nat/onetoone/rule")),
         }
 
-        return _R({"system": sys_info, "counts": counts, "status": "ok"})
+        # The effective rule count comes from the API; report both so a 0 in the XML
+        # reads as "migrated to the MVC model", not "this firewall has no rules".
+        try:
+            fw_rules, fw_source = await _fetch_firewall_rules()
+            counts["firewall_rules"] = len(fw_rules)
+            counts["firewall_rules_source"] = fw_source
+        except Exception as exc:
+            counts["firewall_rules_error"] = str(exc)
+
+        return _R({"system": sys_info, "counts": counts,
+                   "sections": sorted({child.tag for child in root}), "status": "ok"})
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1309,32 +1832,16 @@ if __name__ == "__main__":
 
     if args.transport in ('sse', 'streamable-http'):
         import uvicorn
-        from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
 
         if args.transport == 'sse':
-            app = mcp.sse_app()
+            app = _sse_and_http_app(mcp)
         else:
             app = mcp.streamable_http_app()
 
         if args.mcp_api_key:
             _api_key = args.mcp_api_key
-
-            class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                async def dispatch(self, request, call_next):
-                    auth_header = request.headers.get('Authorization', '')
-                    if auth_header.startswith('Bearer '):
-                        token = auth_header[7:]
-                    else:
-                        token = auth_header
-                    if token != _api_key:
-                        return JSONResponse(
-                            {"error": "Unauthorized", "message": "Invalid or missing API key"},
-                            status_code=401
-                        )
-                    return await call_next(request)
-
-            app.add_middleware(APIKeyAuthMiddleware)
+            app = _APIKeyAuth(app, _api_key)
 
         uvicorn.run(app, host=args.listen, port=args.port)
     else:
