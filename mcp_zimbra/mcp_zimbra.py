@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MCP server for Zimbra Collaboration Suite - v1.10.0
+MCP server for Zimbra Collaboration Suite - v1.10.1
 ===============================================================================
 Author: Jason Cheng (co-created with Claude Code)
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Created: 2025-01-27
-Updated: 2026-09-04
+Updated: 2026-09-29
 
 Reference:
 This implementation follows design patterns from mcp_wazuh_sample.py
@@ -16,6 +16,17 @@ FastMCP-based Zimbra integration providing comprehensive email system monitoring
 and analysis capabilities through natural language interactions.
 
 Version History:
+- v1.10.1 (2026-09-29): FIX - SSE clients stuck on an uninitialized session
+  - Symptom: every tool call (even health_check) returned -32602 "Invalid request
+    parameters"; server log said "Received request before initialization was complete"
+  - Cause: the client's SSE connection dropped (laptop sleep), its EventSource
+    auto-reconnected and got a new session_id, but never re-sent `initialize`
+  - `--transport sse` now also serves Streamable HTTP at /mcp on the same port;
+    existing /sse clients keep working, clients should move to /mcp
+  - Streamable HTTP runs stateless (stateless_http=True): no server-side session to
+    lose, so a sleep/wake or server restart no longer breaks the client
+  - API key check rewritten as plain ASGI middleware (constant-time compare);
+    BaseHTTPMiddleware raised an AssertionError in the log on every SSE disconnect
 - v1.10.0 (2026-09-04): FEATURE - Calendar and Tasks read access
   - NEW TOOL searchCalendar: appointments in a date range, across all calendars or
     one folder; expands recurring events via calExpandInstStart/End; optional
@@ -662,7 +673,11 @@ def _query_user_soap(soap_body: str) -> ET.Element:
 
 mcp_server = FastMCP(
     "Zimbra",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # Streamable HTTP without server-side sessions: every request stands alone, so a
+    # client that lost its connection (laptop sleep, network drop) never ends up on an
+    # uninitialized session. Tools here never push server->client messages.
+    stateless_http=True,
 )
 
 def admin_only_tool():
@@ -6456,30 +6471,42 @@ if __name__ == "__main__":
         mcp_server.run()
 
     elif transport_mode in ('sse', 'streamable-http'):
+        import hmac
         import uvicorn
-        from starlette.middleware.base import BaseHTTPMiddleware
+        from starlette.applications import Starlette
         from starlette.responses import JSONResponse
 
         if transport_mode == 'sse':
-            app = mcp_server.sse_app()
+            # Legacy SSE (/sse + /messages/) for existing clients, plus Streamable HTTP
+            # (/mcp) on the same port. SSE clients that auto-reconnect after a drop get a
+            # fresh session without re-sending `initialize`, and every call then fails with
+            # -32602; clients that can should use /mcp instead.
+            sse = mcp_server.sse_app()
+            http = mcp_server.streamable_http_app()
+            app = Starlette(routes=list(sse.routes) + list(http.routes),
+                            lifespan=http.router.lifespan_context)
         else:
             app = mcp_server.streamable_http_app()
 
         if api_key:
-            class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                async def dispatch(self, request, call_next):
-                    auth_header = request.headers.get('Authorization', '')
-                    if auth_header.startswith('Bearer '):
-                        token = auth_header[7:]
-                    else:
-                        token = auth_header
-                    if token != api_key:
-                        return JSONResponse(
-                            {"error": "Unauthorized", "message": "Invalid or missing API key"},
-                            status_code=401
-                        )
-                    return await call_next(request)
-            app.add_middleware(APIKeyAuthMiddleware)
+            # Plain ASGI middleware: BaseHTTPMiddleware breaks on streaming responses and
+            # raised an AssertionError every time an SSE connection closed.
+            class APIKeyAuthMiddleware:
+                def __init__(self, inner):
+                    self.inner = inner
+
+                async def __call__(self, scope, receive, send):
+                    if scope["type"] == "http":
+                        auth_header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+                        token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
+                        if not hmac.compare_digest(token.encode(), api_key.encode()):
+                            response = JSONResponse(
+                                {"error": "Unauthorized", "message": "Invalid or missing API key"},
+                                status_code=401
+                            )
+                            await response(scope, receive, send)
+                            return
+                    await self.inner(scope, receive, send)
+            app = APIKeyAuthMiddleware(app)
 
         uvicorn.run(app, host=http_host, port=http_port)
-

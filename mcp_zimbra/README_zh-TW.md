@@ -4,7 +4,7 @@
 
 - 作者：Jason Cheng（與 Claude Code 共同建置）
 - 授權：MIT
-- 版本：v1.10.0（2026-09-04）
+- 版本：v1.10.1（2026-09-29）
 - 語言：[English](README.md) · [繁體中文](README_zh-TW.md)
 
 ---
@@ -82,14 +82,20 @@ python3 mcp_zimbra.py \
 ### SSE 模式（Chatbox、Jan.ai、OpenCode 等）
 
 ```bash
-python3 mcp_zimbra.py --transport sse --http-port 8010 --api-key YOUR_KEY
+python3 mcp_zimbra.py --transport sse --host 0.0.0.0 --port 8010 --api-key YOUR_KEY
 ```
+
+同一個連接埠提供兩種端點：
+- `/sse`：傳統 SSE，給只支援 SSE 的用戶端
+- `/mcp`：Streamable HTTP（v1.10.1 起）。用戶端支援的話**優先用這個**，例如 Claude Code 設 `"type": "http"`。
 
 ### Streamable HTTP 模式（多用戶端、Open WebUI）
 
 ```bash
-python3 mcp_zimbra.py --transport streamable-http --http-port 8000 --api-key YOUR_KEY
+python3 mcp_zimbra.py --transport streamable-http --host 0.0.0.0 --port 8000 --api-key YOUR_KEY
 ```
+
+端點為 `/mcp`，以無狀態模式執行，伺服器不保留工作階段。
 
 SSE 與 streamable-http 模式支援 `--api-key`，未帶正確的 `Authorization: Bearer` 標頭會回 401。
 
@@ -304,7 +310,7 @@ User=mcpuser
 EnvironmentFile=/etc/mcp/zimbra.env
 ExecStart=/usr/local/bin/uvx --with "mcp<2" --with requests --with urllib3 \
           --with uvicorn --with starlette --from /opt/mcp \
-          python3 /opt/mcp/mcp_zimbra.py --transport sse --http-port 8010
+          python3 /opt/mcp/mcp_zimbra.py --transport sse --host 0.0.0.0 --port 8010
 Restart=always
 
 [Install]
@@ -321,7 +327,9 @@ WantedBy=multi-user.target
 
 **421 Misdirected Request** — 走 SSE 或 streamable-http 且經過反向代理時出現。v1.9.1 起已停用 DNS rebinding 保護來避免這個問題。
 
-**`Invalid request parameters`（SSE 斷線重連後）** — 伺服器端記錄的是 `Received request before initialization was complete`。SSE 重連後不會重跑 MCP `initialize` 握手，目前只能重開用戶端工作階段。這個錯誤訊息容易被誤判為金鑰失效或參數寫錯。
+**`Invalid request parameters`（SSE 斷線重連後）** — 伺服器端記錄的是 `Received request before initialization was complete`。常見於筆電睡眠後：SSE 連線中斷，用戶端喚醒時自動重連並拿到新的工作階段，卻沒有重送 MCP `initialize`，之後所有工具（連 `health_check` 都一樣）都會失敗。這個錯誤訊息容易被誤判為金鑰失效或參數寫錯。
+- 根本解法（v1.10.1 起）：用戶端改連同一連接埠的 `/mcp`（Streamable HTTP，無狀態），就不會再發生。Claude Code 的設定改為 `"type": "http"`、`"url": "http://<host>:<port>/mcp"`。
+- 仍只能用 SSE 的用戶端：重新連線該 MCP（Claude Code 為 `/mcp` → 選該伺服器 → Reconnect）。
 
 **行事曆或工作查不到資料** — 先確認 `ZIMBRA_ENABLE_MAIL_READ=true`，再用 `listFolders` 確認該帳號確實有 `view=appointment` 或 `view=task` 的資料夾。
 

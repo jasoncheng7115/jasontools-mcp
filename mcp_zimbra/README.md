@@ -1,9 +1,9 @@
 # Zimbra MCP Server
 
-**Version:** 1.10.0
+**Version:** 1.10.1
 **Author:** Jason Cheng (co-created with Claude Code)
 **License:** MIT
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-09-29
 **Repository:** [github.com/jasoncheng7115/jasontools-mcp](https://github.com/jasoncheng7115/jasontools-mcp)
 **Language:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -288,7 +288,13 @@ Run as an SSE server for Chatbox / legacy MCP clients:
 python3 mcp_zimbra.py --transport sse --host 0.0.0.0 --port 8010 --api-key "your-api-key"
 ```
 
-Endpoint: `http://<host>:<port>/sse`
+Endpoints (same port):
+- `http://<host>:<port>/sse` — legacy SSE, for clients that only speak SSE
+- `http://<host>:<port>/mcp` — Streamable HTTP (since v1.10.1). **Prefer this** for any
+  client that supports it (Claude Code: `"type": "http"`). SSE clients that auto-reconnect
+  after a dropped connection (laptop sleep, network blip) get a fresh session without
+  re-sending `initialize`, after which every call fails with `-32602 Invalid request
+  parameters`. Streamable HTTP here is stateless, so there is no session to lose.
 
 ### Streamable HTTP Mode
 
@@ -298,7 +304,7 @@ Run as an HTTP server for modern MCP clients:
 python3 mcp_zimbra.py --transport streamable-http --host 0.0.0.0 --port 8000 --api-key "your-api-key"
 ```
 
-Endpoint: `http://<host>:<port>/mcp`
+Endpoint: `http://<host>:<port>/mcp` (stateless — no session is kept between requests)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -547,7 +553,24 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 
 ## 📜 Version History
 
-### v1.10.0 (2026-09-04) - Current
+### v1.10.1 (2026-09-29) - Current
+
+**FIX — SSE clients stuck on an uninitialized session**
+
+Every tool call, even `health_check`, returned `-32602 Invalid request parameters`, and
+the server log said `Received request before initialization was complete`. The client's
+SSE connection had dropped while the laptop slept; its EventSource reconnected on wake
+and received a new `session_id`, but never re-sent `initialize`.
+
+- `--transport sse` now also serves Streamable HTTP at `/mcp` on the same port. Existing
+  `/sse` clients keep working; clients that support Streamable HTTP should switch to `/mcp`.
+- Streamable HTTP runs stateless (`stateless_http=True`): there is no server-side session
+  to lose, so sleep/wake and server restarts no longer break the client.
+- API key check rewritten as plain ASGI middleware with a constant-time comparison.
+  The previous `BaseHTTPMiddleware` logged an `AssertionError` traceback every time an
+  SSE connection closed.
+
+### v1.10.0 (2026-09-04)
 
 **FEATURE — Calendar and Tasks read access**
 
