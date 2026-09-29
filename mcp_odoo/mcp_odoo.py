@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """
-MCP server for Odoo API – v1.9.0 Invoice Reading
+MCP server for Odoo API – v1.9.1 Invoice Reading
 ===============================================================================
 Author: Jason Cheng (Jason Tools)
 Created: 2025-07-14
-Updated: 2026-02-26
-Version: 1.9.0
+Updated: 2026-09-29
+Version: 1.9.1
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Tested: Odoo 13 Community Edition
 
 FastMCP-based Odoo integration with comprehensive business management capabilities.
+
+FIX in v1.9.1:
+- SSE mode now also serves Streamable HTTP at /mcp on the same port.
+  SSE clients that auto-reconnect after a dropped connection (laptop sleep) get a
+  fresh session without re-sending `initialize`; every call then fails with -32602
+  "Invalid request parameters" (server log: "Received request before initialization
+  was complete").
+- Streamable HTTP runs stateless: no server-side session to lose, so sleep/wake
+  and server restarts no longer break clients. Clients should move to /mcp.
+- API key check is now plain ASGI middleware with a constant-time compare;
+  BaseHTTPMiddleware logged an AssertionError on every SSE disconnect.
 
 NEW in v1.9.0:
 - Invoice reading (account.move): search_invoices, get_invoice_details, get_invoice_stats
@@ -355,7 +366,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Version information
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 __author__ = "Jason Cheng (Jason Tools)"
 
 # Configure logging
@@ -867,8 +878,52 @@ if '--help' not in sys.argv and '-h' not in sys.argv:
 # Create FastMCP server with DNS rebinding protection disabled for HTTP transports
 mcp = FastMCP(
     "Odoo",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    # Streamable HTTP without server-side sessions: a client that lost its connection
+    # (laptop sleep, network drop) never ends up on an uninitialized session.
+    stateless_http=True,
 )
+
+
+def _sse_and_http_app(server):
+    """Legacy SSE (/sse + /messages/) plus Streamable HTTP (/mcp) on one port.
+
+    SSE clients that auto-reconnect after a dropped connection (laptop sleep, network
+    blip) get a fresh session without re-sending `initialize`, and every call then fails
+    with -32602 "Invalid request parameters". /mcp runs stateless, so there is no
+    session to lose; clients that support Streamable HTTP should use it.
+    """
+    from starlette.applications import Starlette
+    sse = server.sse_app()
+    http = server.streamable_http_app()
+    return Starlette(routes=list(sse.routes) + list(http.routes),
+                     lifespan=http.router.lifespan_context)
+
+
+class _APIKeyAuth:
+    """API key check as plain ASGI middleware.
+
+    Starlette's BaseHTTPMiddleware breaks on streaming responses and logged an
+    AssertionError every time an SSE connection closed.
+    """
+    def __init__(self, app, api_key):
+        self.app = app
+        self.api_key = api_key.encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            import hmac
+            from starlette.responses import JSONResponse
+            auth = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
+            token = auth[7:] if auth.startswith("Bearer ") else auth
+            if not hmac.compare_digest(token.encode(), self.api_key):
+                response = JSONResponse(
+                    {"error": "Unauthorized", "message": "Invalid or missing API key"},
+                    status_code=401
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 # ───────────────────────── Helper Functions ─────────────────────────
 
@@ -6118,29 +6173,12 @@ Examples:
         from starlette.middleware import Middleware
         from starlette.responses import JSONResponse
 
-        app = mcp.sse_app()
+        app = _sse_and_http_app(mcp)
 
         # Add API key authentication middleware if api_key is set
         if args.api_key:
-            from starlette.middleware.base import BaseHTTPMiddleware
 
-            class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                async def dispatch(self, request, call_next):
-                    # Check Authorization header
-                    auth_header = request.headers.get('Authorization', '')
-                    if auth_header.startswith('Bearer '):
-                        token = auth_header[7:]
-                    else:
-                        token = auth_header
-
-                    if token != args.api_key:
-                        return JSONResponse(
-                            {"error": "Unauthorized", "message": "Invalid or missing API key"},
-                            status_code=401
-                        )
-                    return await call_next(request)
-
-            app.add_middleware(APIKeyAuthMiddleware)
+            app = _APIKeyAuth(app, args.api_key)
 
         uvicorn.run(app, host=args.host, port=args.port)
     else:
@@ -6160,24 +6198,7 @@ Examples:
 
         # Add API key authentication middleware if api_key is set
         if args.api_key:
-            from starlette.middleware.base import BaseHTTPMiddleware
 
-            class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-                async def dispatch(self, request, call_next):
-                    # Check Authorization header
-                    auth_header = request.headers.get('Authorization', '')
-                    if auth_header.startswith('Bearer '):
-                        token = auth_header[7:]
-                    else:
-                        token = auth_header
-
-                    if token != args.api_key:
-                        return JSONResponse(
-                            {"error": "Unauthorized", "message": "Invalid or missing API key"},
-                            status_code=401
-                        )
-                    return await call_next(request)
-
-            app.add_middleware(APIKeyAuthMiddleware)
+            app = _APIKeyAuth(app, args.api_key)
 
         uvicorn.run(app, host=args.host, port=args.port)

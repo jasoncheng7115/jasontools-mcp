@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.8.3
+- **Version:** 1.9.1
 - **Tested:** Odoo 13 Community Edition
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
@@ -70,7 +70,7 @@ The **Odoo connection is configured via environment variables**; transport/auth 
 | — | `--port` / `-p` | `8001` | HTTP port |
 | `MCP_API_KEY` | `--api-key` / `-k` | — | Bearer token to protect the HTTP/SSE endpoint |
 
-HTTP endpoints: streamable-http at `/mcp`, SSE at `/sse`.
+HTTP endpoints: streamable-http at `/mcp`, SSE at `/sse`. Since v1.9.1 the SSE mode serves `/mcp` as well.
 
 ---
 
@@ -90,6 +90,11 @@ python3 mcp_odoo.py
 python3 mcp_odoo.py --transport sse --host 0.0.0.0 --port 8009 --api-key YOUR_BEARER_TOKEN
 # (ODOO_* env vars must be set)
 ```
+
+SSE mode also serves **Streamable HTTP at `/mcp` on the same port** (since v1.9.1). Prefer `/mcp` for any
+client that supports it (e.g. Claude Code `"type": "http"`): SSE clients that auto-reconnect after a dropped
+connection (laptop sleep, network blip) get a fresh session without re-sending `initialize`, and every call then
+fails with `-32602 Invalid request parameters`. `/mcp` is stateless, so there is no session to lose.
 
 ### Streamable HTTP
 
@@ -219,6 +224,10 @@ Two behaviours worth knowing:
 ---
 
 ## Changelog (recent)
+
+### v1.9.1 — SSE reconnect fix
+
+SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 
 ### v1.9.0 — Invoice reading
 
