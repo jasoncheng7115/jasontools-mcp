@@ -1,11 +1,11 @@
 # Odoo MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **13 tools** for sales quotations, purchase orders, deliveries, products, stock and partners — with token-saving output controls tuned for small/local LLMs.
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **16 read tools** for sales quotations, purchase orders, deliveries, products, stock, invoices and partners — with token-saving output controls tuned for small/local LLMs — plus **9 opt-in write tools** for creating and editing quotations (`--enable-write`).
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.9.1
-- **Tested:** Odoo 13 Community Edition
+- **Version:** 1.10.0
+- **Tested:** Odoo 13 and 18 Community Edition (write tools: Odoo 18)
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -15,6 +15,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 - **Sales / quotations** — flexible search (partner, state, date & amount range, product names/keywords with AND/OR and exclude logic), quick stats, and full order details.
 - **Purchasing & delivery** — search purchase orders and delivery orders (stock pickings) with state / date / product-keyword filters; detailed views by ID.
 - **Products & stock** — keyword/multi-keyword product search, product details, and on-hand stock by warehouse/location.
+- **Quotation writing (opt-in)** — create quotations with note/section lines, edit header and lines, copy to another customer, confirm, set a customer's default pricelist / payment terms, add contacts, download the quotation or pro-forma PDF. Prices are protected from pricelist recomputation; every write is audited.
 - **Partners** — search partners (returns a Markdown link to the partner page) and create-or-get with VAT / 統一編號, customer/supplier flags and contacts.
 - **Token-saving controls** on every search: `count_only` (count without data), `compact` (essential fields only), `include_lines` / `include_moves` to skip line-item detail, plus `offset` pagination — designed for `gpt-oss:120b` and similar.
 - Multi-transport, optional API-key (Bearer) auth for HTTP, response caching with TTL, retry with backoff.
@@ -69,6 +70,14 @@ The **Odoo connection is configured via environment variables**; transport/auth 
 | — | `--host` / `-H` | `127.0.0.1` | HTTP bind address |
 | — | `--port` / `-p` | `8001` | HTTP port |
 | `MCP_API_KEY` | `--api-key` / `-k` | — | Bearer token to protect the HTTP/SSE endpoint |
+| `ODOO_ENABLE_WRITE` | `--enable-write` | off | Register the 9 write tools (see below) |
+
+### Write tools
+
+| Env var | Default | Description |
+|---|---|---|
+| `ODOO_AUDIT_LOG` | `~/.local/state/mcp_odoo/audit.jsonl` | One JSON line per write: time, Odoo user, client IP / user agent, action, record, changes |
+| `ODOO_PDF_DIR` | `~/Downloads` | Where `download_quotation_pdf` saves files in stdio mode |
 
 HTTP endpoints: streamable-http at `/mcp`, SSE at `/sse`. Since v1.9.1 the SSE mode serves `/mcp` as well.
 
@@ -149,7 +158,7 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 ---
 
-## Tools (16)
+## Tools (16 + 9 write)
 
 ### System
 
@@ -211,6 +220,43 @@ Two behaviours worth knowing:
 | `search_partners` | Search partners (customers/suppliers); returns a Markdown link to the partner page |
 | `create_or_get_partner` | Create a partner or return an existing match; supports VAT (統一編號), customer/supplier flags |
 
+### Quotation writing (only with `--enable-write`)
+
+| Tool | Description |
+|---|---|
+| `create_quotation` | Create a draft quotation: customer, company, sales team, salesperson, pricelist, payment terms, validity date, note, customer reference, lines |
+| `update_quotation` | Change header fields of a draft/sent quotation (customer, customer PO number, note, validity date, payment terms, pricelist, team, salesperson, addresses) |
+| `update_quotation_lines` | Add / change / delete lines, including `line_note` and `line_section` lines and `sequence` |
+| `preview_quotation_copy` | Show what a copy to another customer would look like; writes nothing |
+| `copy_quotation` | Copy a quotation to another customer (`confirm=True` required) |
+| `confirm_quotation` | Confirm a quotation into a sales order (`confirm=True` required; otherwise a preview) |
+| `update_partner_terms` | Set a customer's default pricelist and/or payment terms for one company |
+| `add_contact_to_partner` | Add a contact person under a company |
+| `download_quotation_pdf` | Quotation (`sale.report_saleorder`) or pro-forma PDF |
+
+Line spec example — a product line with its quantity formula as a separate note line below it:
+
+```json
+[
+  {"display_type": "line_section", "name": "Proxmox VE subscription"},
+  {"product_id": 126, "product_uom_qty": 6, "price_unit": 1180,
+   "note_after": "(3Nodes x 2CPUs x 1Year) = 6"}
+]
+```
+
+What the write tools guard against:
+
+- **Repricing.** Odoo recomputes `price_unit` from the pricelist when the quantity changes, so a quantity-only update keeps the line's current price, and explicit `price_unit` values are re-applied if Odoo overrode them. Changing the customer or copying an order puts the original pricelist (currency) and unit prices back. Everything undone is listed in `warnings`.
+- **Products from another company.** A product must belong to the order's company or to no company; otherwise the order becomes unreadable for that company. Nothing is written if any product fails the check.
+- **Wrong product names.** Writes run with `lang=zh_TW`; English product names may still carry stale `(copy)` suffixes.
+- **Mistyped customers.** `copy_quotation` takes `new_partner_id`, or a name that matches exactly one partner; it never creates a partner.
+
+Every write returns the record as read back from Odoo (untaxed / tax / total, currency, first line of each description), is appended to `ODOO_AUDIT_LOG`, and is posted as an internal note in the record's chatter.
+
+`download_quotation_pdf` renders through Odoo's web session (reports are not available over XML-RPC). Over HTTP it returns a link to `/files/<token>/<file>.pdf` that is valid for 15 minutes; the random token stands in for the API key, so the link can be fetched with plain `curl`. In stdio mode the file is saved to `ODOO_PDF_DIR`.
+
+Enable them only for clients that should change data. A typical setup runs one read-only instance for chat front ends (e.g. via mcpo) and one `--enable-write` instance for an agent.
+
 ---
 
 ## Notes
@@ -224,6 +270,10 @@ Two behaviours worth knowing:
 ---
 
 ## Changelog (recent)
+
+### v1.10.0 — Quotation writing
+
+Adds nine write tools behind `--enable-write` / `ODOO_ENABLE_WRITE=1`: `create_quotation`, `update_quotation`, `update_quotation_lines`, `preview_quotation_copy`, `copy_quotation`, `confirm_quotation`, `update_partner_terms`, `add_contact_to_partner`, `download_quotation_pdf`. Note and section lines, price protection against pricelist recomputation, company check on products, `zh_TW` product names, read-back results, audit log plus chatter note. Older disabled copies of the copy/update tools were rewritten for Odoo 18; `copy_quotation` no longer creates a partner from an unmatched name.
 
 ### v1.9.1 — SSE reconnect fix
 

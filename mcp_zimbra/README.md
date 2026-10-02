@@ -1,9 +1,9 @@
 # Zimbra MCP Server
 
-**Version:** 1.10.1
+**Version:** 1.11.0
 **Author:** Jason Cheng (co-created with Claude Code)
 **License:** MIT
-**Last Updated:** 2026-09-29
+**Last Updated:** 2026-10-02
 **Repository:** [github.com/jasoncheng7115/jasontools-mcp](https://github.com/jasoncheng7115/jasontools-mcp)
 **Language:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -395,21 +395,29 @@ Endpoint: `http://<host>:<port>/mcp` (stateless — no session is kept between r
 | `saveDraft` | Save new email or reply/forward as draft for review |
 | `searchContacts` | Search user's personal address book / contacts |
 
-### Calendar & Tasks (3 tools)
+### Calendar & Tasks (4 tools)
 
 | Tool | Description |
 |------|-------------|
 | `searchCalendar` | **⚡ NEW** - Appointments in a date range, all calendars or one folder; expands recurring events |
 | `getAppointment` | **⚡ NEW** - One appointment in full: description, attendees with reply status, recurrence, attachments |
 | `searchTasks` | **⚡ NEW** - Zimbra Tasks filtered by folder, status and due date |
+| `createAppointment` | **⚡ NEW** - Create a personal appointment: subject, start/end, location, notes, calendar, all-day, reminder |
 
 Appointments and tasks are calendar items, not messages, so `searchMail` can never
-return them. These three tools use `types="appointment"` / `types="task"` against the
+return them. The calendar and task tools use `types="appointment"` / `types="task"` against the
 same admin-delegated mail API and are gated by the same `ZIMBRA_ENABLE_MAIL_READ` flag.
 
-Unlike `searchMail`, `date_from` / `date_to` on `searchCalendar` are sent as SOAP
-attributes rather than merged into the query string, so a caller-supplied `query` and
-the date range apply together instead of the query silently overriding the dates.
+`date_from` / `date_to` on `searchCalendar` are sent as SOAP attributes, so they apply
+together with `query`. Since v1.11.0 `searchMail` also combines `query` with every other
+filter (sender, dates, folder, ...) instead of letting `query` replace them.
+
+`createAppointment` creates an appointment with no attendees, so no invitations are
+sent. Times are local to `timezone` (default `Asia/Taipei`). If the same calendar
+already has an appointment with the same subject starting at the same time, that one is
+returned with `status: "exists"` instead of creating a second copy, so a retried call is
+safe; pass `allow_duplicate=true` to create anyway. The result is read back with
+`getAppointment`.
 
 ### Directory & Search (1 tool)
 
@@ -553,7 +561,19 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 
 ## 📜 Version History
 
-### v1.10.1 (2026-09-29) - Current
+### v1.11.0 (2026-10-02) - Current
+
+**FEATURE — createAppointment; FIX — searchMail `query` dropped the other filters**
+
+- `createAppointment`: personal appointment with subject, start/end, location, notes,
+  calendar (fuzzy name, must match one), all-day and reminder. No attendees, so nothing
+  is sent to anyone. Duplicate guard on subject + start in the same calendar. Gated by
+  `ZIMBRA_ENABLE_MAIL_READ` like the other calendar tools.
+- `searchMail`: passing `query` used to replace every other filter, so `query` plus
+  `sender` / `date_from` / `folder` silently searched without them and the results looked
+  unfiltered. `query` is now ANDed with the other filters.
+
+### v1.10.1 (2026-09-29)
 
 **FIX — SSE clients stuck on an uninitialized session**
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MCP server for Zimbra Collaboration Suite - v1.10.1
+MCP server for Zimbra Collaboration Suite - v1.11.0
 ===============================================================================
 Author: Jason Cheng (co-created with Claude Code)
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Created: 2025-01-27
-Updated: 2026-09-29
+Updated: 2026-10-02
 
 Reference:
 This implementation follows design patterns from mcp_wazuh_sample.py
@@ -16,6 +16,14 @@ FastMCP-based Zimbra integration providing comprehensive email system monitoring
 and analysis capabilities through natural language interactions.
 
 Version History:
+- v1.11.0 (2026-10-02): FEATURE - createAppointment; FIX - searchMail query ignored other filters
+  - createAppointment: personal appointment (subject, start/end, location, notes, calendar,
+    all-day, reminder). No attendees, so no invitations go out. A retried call does not
+    create a second copy: same subject + start in the same calendar returns the existing one.
+    Result is read back with getAppointment. Registered with the mail read tools
+    (ZIMBRA_ENABLE_MAIL_READ), since it uses the same delegated mailbox access.
+  - searchMail: `query` used to replace every other filter, so query + sender/date/folder
+    silently dropped the sender/date/folder and looked unfiltered. They are now ANDed.
 - v1.10.1 (2026-09-29): FIX - SSE clients stuck on an uninitialized session
   - Symptom: every tool call (even health_check) returned -32602 "Invalid request
     parameters"; server log said "Received request before initialization was complete"
@@ -4481,7 +4489,7 @@ def searchMail(account: str,
 
     Args:
         account: Target account email. Example: "user@example.com".
-        query: Raw Zimbra search query (advanced). Example: "subject:meeting from:boss". Overrides other filters if provided.
+        query: Raw Zimbra search query (advanced). Example: "subject:meeting from:boss". Combined (AND) with any other filters given.
         subject: Search in subject line. Example: "meeting invitation".
         sender: Search by sender email (From). Example: "boss@example.com".
         recipient: Search by recipient email (To). Example: "team@example.com".
@@ -4497,65 +4505,62 @@ def searchMail(account: str,
     logger.info(f"Searching mail for account={account}, subject={subject}, sender={sender}, limit={limit}")
 
     try:
-        # Build search query from structured parameters
-        if query:
-            search_query = query
-        else:
-            parts = []
-            if subject:
-                parts.append(f'subject:("{subject}")')
-            if sender:
-                parts.append(f'from:({sender})')
-            if recipient:
-                parts.append(f'to:({recipient})')
-            if cc:
-                parts.append(f'cc:({cc})')
-            if content:
-                parts.append(f'content:("{content}")')
-            if folder:
-                # Check if it's an exact system folder name
-                system_folders = ('inbox', 'sent', 'drafts', 'junk', 'trash')
-                if folder.lower() in system_folders:
-                    parts.append(f'in:"{folder}"')
-                else:
-                    # Fuzzy match against account's folder list
-                    try:
-                        all_folders = _get_account_folders(account)
-                        matched = _fuzzy_match_folders(all_folders, folder)
-                        if matched:
-                            if len(matched) == 1:
-                                parts.append(f'in:"{matched[0]["path"]}"')
-                            else:
-                                or_parts = ' OR '.join(f'in:"{m["path"]}"' for m in matched)
-                                parts.append(f'({or_parts})')
+        # Build search query: raw query AND structured filters
+        parts = [f'({query.strip()})'] if query and query.strip() else []
+        if subject:
+            parts.append(f'subject:("{subject}")')
+        if sender:
+            parts.append(f'from:({sender})')
+        if recipient:
+            parts.append(f'to:({recipient})')
+        if cc:
+            parts.append(f'cc:({cc})')
+        if content:
+            parts.append(f'content:("{content}")')
+        if folder:
+            # Check if it's an exact system folder name
+            system_folders = ('inbox', 'sent', 'drafts', 'junk', 'trash')
+            if folder.lower() in system_folders:
+                parts.append(f'in:"{folder}"')
+            else:
+                # Fuzzy match against account's folder list
+                try:
+                    all_folders = _get_account_folders(account)
+                    matched = _fuzzy_match_folders(all_folders, folder)
+                    if matched:
+                        if len(matched) == 1:
+                            parts.append(f'in:"{matched[0]["path"]}"')
                         else:
-                            # No match found, use as-is (let Zimbra handle it)
-                            parts.append(f'in:"{folder}"')
-                    except Exception:
+                            or_parts = ' OR '.join(f'in:"{m["path"]}"' for m in matched)
+                            parts.append(f'({or_parts})')
+                    else:
+                        # No match found, use as-is (let Zimbra handle it)
                         parts.append(f'in:"{folder}"')
-            if date_from:
-                # Zimbra after: is exclusive, subtract 1 day to make inclusive
-                df = _parse_search_date(date_from)
-                if df is None:
-                    return tool_response({
-                        "status": "error",
-                        "message": f"Invalid date_from '{date_from}'. "
-                                   f"Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
-                    })
-                parts.append(f'after:{(df - timedelta(days=1)).strftime("%Y/%m/%d")}')
-            if date_to:
-                # Zimbra before: is exclusive, add 1 day to make inclusive
-                dt = _parse_search_date(date_to)
-                if dt is None:
-                    return tool_response({
-                        "status": "error",
-                        "message": f"Invalid date_to '{date_to}'. "
-                                   f"Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
-                    })
-                parts.append(f'before:{(dt + timedelta(days=1)).strftime("%Y/%m/%d")}')
-            if has_attachment:
-                parts.append('has:attachment')
-            search_query = ' '.join(parts) if parts else 'in:inbox'
+                except Exception:
+                    parts.append(f'in:"{folder}"')
+        if date_from:
+            # Zimbra after: is exclusive, subtract 1 day to make inclusive
+            df = _parse_search_date(date_from)
+            if df is None:
+                return tool_response({
+                    "status": "error",
+                    "message": f"Invalid date_from '{date_from}'. "
+                               f"Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
+                })
+            parts.append(f'after:{(df - timedelta(days=1)).strftime("%Y/%m/%d")}')
+        if date_to:
+            # Zimbra before: is exclusive, add 1 day to make inclusive
+            dt = _parse_search_date(date_to)
+            if dt is None:
+                return tool_response({
+                    "status": "error",
+                    "message": f"Invalid date_to '{date_to}'. "
+                               f"Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
+                })
+            parts.append(f'before:{(dt + timedelta(days=1)).strftime("%Y/%m/%d")}')
+        if has_attachment:
+            parts.append('has:attachment')
+        search_query = ' '.join(parts) if parts else 'in:inbox'
 
         soap_body = f"""
         <SearchRequest xmlns="urn:zimbraMail"
@@ -5526,6 +5531,169 @@ def getAppointment(account: str, appt_id: str) -> str:
         return tool_response({"status": "error", "message": f"Failed to get appointment: {message}"})
 
 
+def _parse_appt_time(value: str, all_day: bool):
+    """'2026-10-05 14:00', '2026-10-05T14:00', '2026/10/05 14:00' -> datetime; date only when all_day."""
+    value = str(value or "").strip().replace("T", " ")
+    if all_day:
+        return _parse_search_date(value.split(" ")[0])
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d %H:%M:%S"):
+        try:
+            return datetime.strptime(value[:19] if fmt.endswith("%S") else value[:16], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _xml_text(value: str) -> str:
+    return (str(value).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
+
+
+@mail_read_tool()
+def createAppointment(account: str,
+                      subject: str,
+                      start: str,
+                      end: Optional[str] = None,
+                      location: Optional[str] = None,
+                      notes: Optional[str] = None,
+                      calendar: Optional[str] = None,
+                      all_day: bool = False,
+                      reminder_minutes: Optional[int] = None,
+                      timezone: str = "Asia/Taipei",
+                      allow_duplicate: bool = False) -> str:
+    """Create a personal appointment in an account's calendar. No attendees, so no invitations are sent.
+
+    Before creating, the same calendar is checked for an appointment with the same subject and start; if one exists it is returned instead (set allow_duplicate=true to create anyway). The result is read back from Zimbra.
+
+    Args:
+        account: Calendar owner email. Example: "user@example.com".
+        subject: Title. Example: "PVE 叢集驗收會議".
+        start: Start, local time in `timezone`. Format "YYYY-MM-DD HH:MM" (or "YYYY-MM-DD" when all_day). Example: "2026-10-05 14:00".
+        end: End, same format. Default: start + 1 hour (all_day: same day). For all_day, the last day of the event, inclusive.
+        location: Location. Example: "台中辦公室". Default: none.
+        notes: Description / notes, plain text. Default: none.
+        calendar: Calendar folder name or path, fuzzy match; must match exactly one calendar. Example: "Calendar", "業務". Default: the main "Calendar".
+        all_day: All-day event. Default: false.
+        reminder_minutes: Pop-up reminder this many minutes before start. Default: none.
+        timezone: IANA time zone of start/end. Default: "Asia/Taipei".
+        allow_duplicate: Create even if the same subject already starts at the same time in that calendar. Default: false.
+    """
+    logger.info(f"Creating appointment for account={account}: {subject} @ {start}")
+
+    try:
+        if not subject or not subject.strip():
+            return tool_response({"status": "error", "message": "subject is required."})
+        start_dt = _parse_appt_time(start, all_day)
+        if start_dt is None:
+            return tool_response({"status": "error", "message":
+                                  f"Invalid start '{start}'. Use 'YYYY-MM-DD HH:MM'" + (" or 'YYYY-MM-DD'" if all_day else "") + "."})
+        if end:
+            end_dt = _parse_appt_time(end, all_day)
+            if end_dt is None:
+                return tool_response({"status": "error", "message": f"Invalid end '{end}'. Use the same format as start."})
+        else:
+            end_dt = start_dt if all_day else start_dt + timedelta(hours=1)
+        if end_dt < start_dt or (not all_day and end_dt == start_dt):
+            return tool_response({"status": "error", "message": f"end ({end_dt}) must be after start ({start_dt})."})
+
+        # Resolve the target calendar to exactly one folder
+        folders = _calendar_folders(account, "appointment")
+        wanted = (calendar or "Calendar").strip().lower()
+        matched = [f for f in folders if f["path"].lower().strip("/") == wanted.strip("/") or f["name"].lower() == wanted]
+        if not matched:
+            matched = [f for f in folders if wanted in f["path"].lower() or wanted in f["name"].lower()]
+        if len(matched) != 1:
+            return tool_response({
+                "status": "error",
+                "message": (f"Calendar '{calendar or 'Calendar'}' matched {len(matched)} calendars; pass a more specific name or path."),
+                "calendars": [f["path"] for f in (matched or folders)],
+            })
+        folder = matched[0]
+        folder_id = _folder_num(folder["id"])
+
+        if all_day:
+            s_attr, e_attr = start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d")
+            tz_attr = ""
+        else:
+            s_attr, e_attr = start_dt.strftime("%Y%m%dT%H%M%S"), end_dt.strftime("%Y%m%dT%H%M%S")
+            tz_attr = f' tz="{_xml_text(timezone)}"'
+
+        # Duplicate guard: a retried tool call must not create the same appointment twice
+        if not allow_duplicate:
+            day = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            dup_root = query_zimbra_mail_api(f"""
+            <SearchRequest xmlns="urn:zimbraMail" types="appointment" limit="100"
+                           calExpandInstStart="{int(day.timestamp() * 1000)}"
+                           calExpandInstEnd="{int((day + timedelta(days=1)).timestamp() * 1000)}">
+                <query>inid:{folder_id}</query>
+            </SearchRequest>""", account)
+            ns_mail = 'urn:zimbraMail'
+            for appt in dup_root.findall(f'.//{{{ns_mail}}}appt'):
+                if appt.get('name', '').strip() != subject.strip():
+                    continue
+                for inst in appt.findall(f'{{{ns_mail}}}inst'):
+                    same_start = (inst.get('allDay') == '1' or appt.get('allDay') == '1') if all_day else \
+                        abs(int(inst.get('s') or 0) - int(start_dt.timestamp() * 1000)) < 60000
+                    if same_start:
+                        existing = json.loads(getAppointment(account, appt.get('id')))
+                        return tool_response({
+                            "status": "exists",
+                            "message": "An appointment with the same subject and start already exists; not created. "
+                                       "Pass allow_duplicate=true to create another.",
+                            "appointment": existing.get("appointment", {"id": appt.get('id')}),
+                        })
+
+        alarm = ""
+        if reminder_minutes is not None and int(reminder_minutes) >= 0:
+            alarm = (f'<alarm action="DISPLAY"><trigger>'
+                     f'<rel m="{int(reminder_minutes)}" related="START" neg="1"/></trigger></alarm>')
+        desc = f"<desc>{_xml_text(notes)}</desc>" if notes else ""
+        loc = f' loc="{_xml_text(location)}"' if location else ""
+
+        soap_body = f"""
+        <CreateAppointmentRequest xmlns="urn:zimbraMail">
+            <m l="{folder_id}">
+                <inv>
+                    <comp name="{_xml_text(subject)}"{loc} allDay="{1 if all_day else 0}"
+                          fb="B" fba="B" transp="O" class="PUB" status="CONF">
+                        <s d="{s_attr}"{tz_attr}/>
+                        <e d="{e_attr}"{tz_attr}/>
+                        <or a="{_xml_text(account)}"/>
+                        {desc}
+                        {alarm}
+                    </comp>
+                </inv>
+                <su>{_xml_text(subject)}</su>
+                <mp ct="text/plain"><content>{_xml_text(notes or '')}</content></mp>
+            </m>
+        </CreateAppointmentRequest>
+        """
+        root = query_zimbra_mail_api(soap_body, account)
+        parse_zimbra_response(root, namespace="urn:zimbraMail")
+        resp = root.find('.//{urn:zimbraMail}CreateAppointmentResponse')
+        appt_id = resp.get('calItemId') or resp.get('apptId') if resp is not None else None
+        if not appt_id:
+            return tool_response({"status": "error", "message": "Zimbra did not return an appointment id."})
+
+        # getAppointment needs the same '<mailbox-uuid>:<id>' form searchCalendar returns
+        if ':' in str(folder["id"]) and ':' not in appt_id:
+            appt_id = f'{str(folder["id"]).split(":")[0]}:{appt_id}'
+        readback = json.loads(getAppointment(account, appt_id))
+        logger.info(f"AUDIT createAppointment {account} id={appt_id} '{subject}' {s_attr}-{e_attr} folder={folder['path']}")
+        return tool_response({
+            "status": "success",
+            "account": account,
+            "calendar": folder["path"],
+            "appointment": readback.get("appointment", {"id": appt_id}),
+            "display_message": f"Created '{subject}' in {folder['path']} ({start_dt:%Y-%m-%d %H:%M}"
+                               + ("" if all_day else f" - {end_dt:%H:%M}") + ")",
+        })
+
+    except Exception as e:
+        logger.error(f"Failed to create appointment: {e}")
+        return tool_response({"status": "error", "message": f"Failed to create appointment: {str(e)}"})
+
+
 @mail_read_tool()
 def searchTasks(account: str,
                 folder: Optional[str] = None,
@@ -6407,17 +6575,18 @@ if __name__ == "__main__":
     setup_http_session()
 
     logger.info("=" * 80)
-    logger.info("Zimbra Collaboration MCP Server v1.9.2")
+    logger.info("Zimbra Collaboration MCP Server v1.11.0")
     logger.info("=" * 80)
 
     # Calculate tool count based on feature toggles
-    mail_read_count = 5 if zimbra_config.enable_mail_read else 0
+    mail_read_count = 9 if zimbra_config.enable_mail_read else 0
     if zimbra_config.auth_mode == "user":
         tool_count = 13 + mail_read_count  # 13 base + 5 mail_read
         logger.info(f"Available Tools ({tool_count} total, user mode: {zimbra_config.user_email}):")
         if zimbra_config.enable_mail_read:
             logger.info("  Mail Read: searchMail, getMailDetail, getConversation,")
             logger.info("             getMailAttachment, listFolders")
+            logger.info("  Calendar: searchCalendar, getAppointment, createAppointment, searchTasks")
         else:
             logger.info("  Mail Read: DISABLED (set ZIMBRA_ENABLE_MAIL_READ=true to enable)")
         logger.info("  Mail Write: saveDraft, searchContacts")
@@ -6443,6 +6612,7 @@ if __name__ == "__main__":
         if zimbra_config.enable_mail_read:
             logger.info("  Mail Read: searchMail, getMailDetail, getConversation,")
             logger.info("             getMailAttachment, listFolders")
+            logger.info("  Calendar: searchCalendar, getAppointment, createAppointment, searchTasks")
         else:
             logger.info("  Mail Read: DISABLED (set ZIMBRA_ENABLE_MAIL_READ=true to enable)")
         logger.info("  Mail Write: saveDraft, searchContacts")

@@ -1,10 +1,10 @@
 # Zimbra MCP Server
 
-以 FastMCP 為基礎的 Zimbra Collaboration Suite 整合工具，讓 LLM 可透過自然語言查詢與管理 Zimbra 郵件系統。提供 52 個 MCP 工具，涵蓋帳號、網域、郵件佇列、權限稽核、信件內容、行事曆與工作項目。
+以 FastMCP 為基礎的 Zimbra Collaboration Suite 整合工具，讓 LLM 可透過自然語言查詢與管理 Zimbra 郵件系統。提供 53 個 MCP 工具，涵蓋帳號、網域、郵件佇列、權限稽核、信件內容、行事曆與工作項目。
 
 - 作者：Jason Cheng（與 Claude Code 共同建置）
 - 授權：MIT
-- 版本：v1.10.1（2026-09-29）
+- 版本：v1.11.0（2026-10-02）
 - 語言：[English](README.md) · [繁體中文](README_zh-TW.md)
 
 ---
@@ -44,7 +44,7 @@ export ZIMBRA_ADMIN_USER="admin"
 export ZIMBRA_ADMIN_PASS="CHANGE_ME"
 ```
 
-可用工具：44 個基本工具 + 8 個信件讀取工具。
+可用工具：44 個基本工具 + 9 個信件讀取工具。
 
 ### 使用者模式
 
@@ -55,11 +55,11 @@ export ZIMBRA_USER_EMAIL="user@example.com"
 export ZIMBRA_USER_PASS="CHANGE_ME"
 ```
 
-可用工具：13 個基本工具 + 8 個信件讀取工具。管理類工具不會註冊。
+可用工具：13 個基本工具 + 9 個信件讀取工具。管理類工具不會註冊。
 
 ### 信件讀取開關
 
-信件、行事曆、工作項目這 8 個工具**預設關閉**，要明確開啟：
+信件、行事曆、工作項目這 9 個工具**預設關閉**，要明確開啟：
 
 ```bash
 export ZIMBRA_ENABLE_MAIL_READ="true"
@@ -207,15 +207,16 @@ SSE 與 streamable-http 模式支援 `--api-key`，未帶正確的 `Authorizatio
 | `saveDraft` | 新信或回覆／轉寄存成草稿供人工確認後送出 |
 | `searchContacts` | 搜尋個人通訊錄 |
 
-### 行事曆與工作（3 個）†
+### 行事曆與工作（4 個）†
 
 | 工具 | 說明 |
 |------|------|
 | `searchCalendar` | 查詢期間內的約會，可指定單一行事曆；自動展開重複事件 |
 | `getAppointment` | 取單一約會完整內容：描述、參與者與答覆狀態、重複規則、附件 |
 | `searchTasks` | 查詢工作項目，可依資料夾、狀態、到期日篩選 |
+| `createAppointment` | 建立個人約會：主旨、起迄時間、地點、備註、所屬行事曆、全天、提醒 |
 
-約會與工作屬於行事曆項目而非郵件，`searchMail` 永遠找不到它們。這三個工具改用 `types="appointment"` 與 `types="task"`，走的是同一套管理員委派的郵件 API，同樣受 `ZIMBRA_ENABLE_MAIL_READ` 控制。
+約會與工作屬於行事曆項目而非郵件，`searchMail` 永遠找不到它們。行事曆與工作的工具改用 `types="appointment"` 與 `types="task"`，走的是同一套管理員委派的郵件 API，同樣受 `ZIMBRA_ENABLE_MAIL_READ` 控制。
 
 ### 通訊錄查詢（1 個）
 
@@ -283,9 +284,11 @@ user@example.com 的待辦事項裡，還沒完成、且今年到期的有哪些
 
 ## 使用上要知道的幾件事
 
-**`searchMail` 一旦傳入 `query`，`date_from` 與 `date_to` 會被忽略。** 日期必須寫進查詢字串裡，格式為 `after:MM/DD/YYYY`、`before:MM/DD/YYYY`。這是 Zimbra 查詢語法的限制。
+**`searchMail` 的 `query` 會和其他條件一起套用（v1.11.0 起）。** 之前傳入 `query` 時，寄件者、日期、資料夾等條件都會被忽略，結果看起來像沒有過濾；現在一律以 AND 合併。
 
-**`searchCalendar` 沒有這個問題。** 它的 `date_from` 與 `date_to` 是以 SOAP 屬性（`calExpandInstStart` / `calExpandInstEnd`）送出，不會併進查詢字串，所以日期與 `query` 可以同時生效。
+**`searchCalendar` 的 `date_from` 與 `date_to`** 是以 SOAP 屬性（`calExpandInstStart` / `calExpandInstEnd`）送出，不會併進查詢字串，所以日期與 `query` 可以同時生效。
+
+**`createAppointment` 不帶參與者，不會寄出任何邀請。** 時間以 `timezone`（預設 `Asia/Taipei`）的當地時間解讀。同一個行事曆若已有相同主旨、相同開始時間的約會，會回傳既有那筆（`status: "exists"`）而不重複建立，所以重試是安全的；確定要再建一筆時帶 `allow_duplicate=true`。建立後會用 `getAppointment` 讀回結果。
 
 **`getMailDetail` 的參數是 `msg_id`，`getAppointment` 是 `appt_id`。** 不是 `message_id` 或 `appointment_id`，寫錯會被參數驗證擋下。
 
