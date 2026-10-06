@@ -4,7 +4,7 @@
 
 - 作者：Jason Cheng（與 Claude Code 共同建置）
 - 授權：MIT
-- 版本：v1.11.0（2026-10-02）
+- 版本：v1.11.1（2026-10-06）
 - 語言：[English](README.md) · [繁體中文](README_zh-TW.md)
 
 ---
@@ -133,7 +133,7 @@ SSE 與 streamable-http 模式支援 `--api-key`，未帶正確的 `Authorizatio
 
 | 工具 | 說明 |
 |------|------|
-| `getAccountInfo` | 查詢帳號資訊（配額、狀態、建立日期等） |
+| `getAccountInfo` | 查詢帳號資訊（配額、狀態、建立日期等），並附 `login_state`：能不能登入、不能的原因 |
 | `getAccountQuota` | 查詢帳號配額與使用量 |
 | `getAccountAliases` | 查詢帳號的所有別名 |
 | `unlockAccount` | 解鎖被鎖定的帳號 |
@@ -325,6 +325,14 @@ WantedBy=multi-user.target
 ---
 
 ## 常見問題排除
+
+**帳號明明正常，模型卻說「已被鎖定」** — 多半是把 `zimbraPasswordLocked: TRUE` 當成鎖定。這個屬性的意思是「使用者不能自己改密碼，只能由管理員改」，跟能不能登入無關。帳號是否鎖定只看 `zimbraAccountStatus`：
+- `active`：正常，可以登入
+- `locked`：管理員鎖定
+- `lockout`：密碼錯太多次被自動鎖定，`zimbraPasswordLockoutLockedTime` 記錄鎖定時間
+- `maintenance`、`pending`、`closed`：無法登入
+
+v1.11.1 起 `getAccountInfo` 會回傳整理好的 `login_state`（`can_login`、`locked_reason`、`auto_unlock_at`、`user_can_change_password`），模型不必再自己解讀原始屬性。
 
 **401 Unauthorized** — 管理員帳密錯誤，或 SSE／HTTP 模式的 `--api-key` 不符。
 

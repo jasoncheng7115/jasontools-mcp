@@ -1,9 +1,9 @@
 # Zimbra MCP Server
 
-**Version:** 1.11.0
+**Version:** 1.11.1
 **Author:** Jason Cheng (co-created with Claude Code)
 **License:** MIT
-**Last Updated:** 2026-10-02
+**Last Updated:** 2026-10-06
 **Repository:** [github.com/jasoncheng7115/jasontools-mcp](https://github.com/jasoncheng7115/jasontools-mcp)
 **Language:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -321,7 +321,7 @@ Endpoint: `http://<host>:<port>/mcp` (stateless — no session is kept between r
 
 | Tool | Description |
 |------|-------------|
-| `getAccountInfo` | Get account information (quota, status, creation date, etc.) |
+| `getAccountInfo` | Get account information (quota, status, creation date, etc.) plus `login_state`: whether the account can log in and why not |
 | `getAccountQuota` | Get account quota and usage statistics |
 | `getAccountAliases` | Get all aliases for an account |
 | `unlockAccount` | Unlock a locked account (only works on locked accounts) |
@@ -505,6 +505,23 @@ python3 examples_unlock_account.py
 
 ### Common Issues
 
+#### Account reported as locked although it is active
+
+`zimbraPasswordLocked: TRUE` does **not** lock the account. It only means the user
+cannot change their own password (an administrator has to). Whether an account is
+locked is decided by `zimbraAccountStatus` alone:
+
+| zimbraAccountStatus | Meaning |
+|---|---|
+| `active` | Normal, can log in |
+| `locked` | Locked by an administrator |
+| `lockout` | Locked automatically after too many failed passwords; `zimbraPasswordLockoutLockedTime` holds the time |
+| `maintenance` / `pending` / `closed` | Cannot log in |
+
+Since v1.11.1 `getAccountInfo` returns a `login_state` block with this already worked
+out (`can_login`, `locked_reason`, `auto_unlock_at`, `user_can_change_password`), so a
+model no longer has to interpret the raw attributes.
+
 #### 1. Authentication Failed
 
 **Error:** `No authToken in response`
@@ -561,7 +578,19 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 
 ## 📜 Version History
 
-### v1.11.0 (2026-10-02) - Current
+### v1.11.1 (2026-10-06) - Current
+
+**FIX — active accounts reported as locked**
+
+A model reading `getAccountInfo` saw `zimbraPasswordLocked: TRUE` and concluded the
+account was locked, although `zimbraAccountStatus` was `active`. That attribute only
+stops the user from changing their own password. `getAccountInfo` now returns
+`login_state`, derived from `zimbraAccountStatus` only: `can_login`, `meaning`,
+`locked_reason` (administrator lock vs. failed-password lockout), `locked_since` and
+`auto_unlock_at` for lockouts, `user_can_change_password`,
+`must_change_password_at_next_login`, and a note on how to read the attributes.
+
+### v1.11.0 (2026-10-02)
 
 **FEATURE — createAppointment; FIX — searchMail `query` dropped the other filters**
 

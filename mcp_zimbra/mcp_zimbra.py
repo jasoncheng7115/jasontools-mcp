@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MCP server for Zimbra Collaboration Suite - v1.11.0
+MCP server for Zimbra Collaboration Suite - v1.11.1
 ===============================================================================
 Author: Jason Cheng (co-created with Claude Code)
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Created: 2025-01-27
-Updated: 2026-10-02
+Updated: 2026-10-06
 
 Reference:
 This implementation follows design patterns from mcp_wazuh_sample.py
@@ -16,6 +16,14 @@ FastMCP-based Zimbra integration providing comprehensive email system monitoring
 and analysis capabilities through natural language interactions.
 
 Version History:
+- v1.11.1 (2026-10-06): FIX - models reported active accounts as locked
+  - zimbraPasswordLocked=TRUE (user may not change their own password) was read as an
+    account lock; a user's model concluded "帳號目前已被鎖定" for an active account
+  - getAccountInfo now returns `login_state` derived only from zimbraAccountStatus:
+    can_login, meaning, locked_reason (admin lock vs failed-password lockout),
+    locked_since / auto_unlock_at for lockouts, user_can_change_password,
+    must_change_password_at_next_login, and a note on how to read the attributes
+  - Tool description tells the model to judge locks from login_state only
 - v1.11.0 (2026-10-02): FEATURE - createAppointment; FIX - searchMail query ignored other filters
   - createAppointment: personal appointment (subject, start/end, location, notes, calendar,
     all-day, reminder). No attendees, so no invitations go out. A retried call does not
@@ -305,7 +313,7 @@ import time
 import argparse
 import base64
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 import logging
 import hashlib
@@ -1215,9 +1223,80 @@ def format_jt_zmmsgtrace_result(api_response: Dict[str, Any], tool_name: str = N
 
 # ------------------- Account Management -------------------
 
+_ACCOUNT_STATUS_TEXT = {
+    "active": "active - normal, can log in",
+    "locked": "locked - locked by an administrator; cannot log in until unlocked",
+    "lockout": "lockout - locked automatically after too many failed password attempts",
+    "maintenance": "maintenance - mailbox under maintenance; cannot log in",
+    "pending": "pending - account not activated yet; cannot log in",
+    "closed": "closed - account closed; cannot log in",
+}
+
+
+def _parse_zimbra_time(value: Optional[str]) -> Optional[datetime]:
+    """LDAP generalized time ('20261006083000Z' or '20261006083000.123Z') -> aware UTC datetime."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.split('.')[0].rstrip('Z'), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _parse_zimbra_duration(value: Optional[str]) -> Optional[timedelta]:
+    """'1h', '30m', '60s', '1d', '500ms', bare seconds -> timedelta."""
+    m = re.fullmatch(r"\s*(\d+)\s*(ms|s|m|h|d)?\s*", value or "")
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2) or "s"
+    return {"ms": timedelta(milliseconds=n), "s": timedelta(seconds=n), "m": timedelta(minutes=n),
+            "h": timedelta(hours=n), "d": timedelta(days=n)}[unit]
+
+
+def _login_state(attrs: Dict[str, Any]) -> Dict[str, Any]:
+    """Whether the account can log in, derived only from zimbraAccountStatus.
+
+    zimbraPasswordLocked is a password-policy flag ("the user may not change their own
+    password"), not an account lock, and models reading raw attributes kept reporting
+    accounts with zimbraPasswordLocked=TRUE as locked.
+    """
+    status = (attrs.get("zimbraAccountStatus") or "").lower()
+    state = {
+        "can_login": status == "active",
+        "account_status": status or None,
+        "meaning": _ACCOUNT_STATUS_TEXT.get(status, f"{status} - unknown status"),
+        "locked_reason": None,
+        "user_can_change_password": str(attrs.get("zimbraPasswordLocked", "FALSE")).upper() != "TRUE",
+        "must_change_password_at_next_login": str(attrs.get("zimbraPasswordMustChange", "FALSE")).upper() == "TRUE",
+        "how_to_read": ("Only zimbraAccountStatus decides whether the account is locked. "
+                        "zimbraPasswordLocked=TRUE only means the user cannot change their own "
+                        "password; it is NOT an account lock."),
+    }
+    if status == "locked":
+        state["locked_reason"] = "locked by an administrator"
+    elif status == "lockout":
+        locked_at = _parse_zimbra_time(attrs.get("zimbraPasswordLockoutLockedTime"))
+        duration = _parse_zimbra_duration(attrs.get("zimbraPasswordLockoutDuration"))
+        state["locked_reason"] = "too many failed password attempts"
+        if locked_at:
+            state["locked_since"] = locked_at.astimezone().isoformat()
+        if locked_at and duration:
+            unlock_at = locked_at + duration
+            state["auto_unlock_at"] = unlock_at.astimezone().isoformat()
+            if unlock_at <= datetime.now(timezone.utc):
+                state["can_login"] = True
+                state["meaning"] += "; lockout period has passed, the next correct login clears it"
+        elif duration == timedelta(0):
+            state["auto_unlock_at"] = None
+            state["meaning"] += "; no automatic unlock (lockout duration 0), use unlockAccount"
+    return state
+
+
 @admin_only_tool()
 def getAccountInfo(email: str) -> str:
-    """Get all attributes and settings for an email account.
+    """Get all attributes and settings for an email account, plus `login_state`: whether the account can log in.
+
+    To decide if an account is locked or usable, read `login_state` (derived from zimbraAccountStatus: active / locked / lockout / maintenance / pending / closed). zimbraPasswordLocked=TRUE is NOT an account lock - it only stops the user from changing their own password.
 
     Args:
         email: Account email address. Example: "user@example.com". Case-insensitive.
@@ -1243,10 +1322,12 @@ def getAccountInfo(email: str) -> str:
                 "message": f"Account not found: {email}"
             })
 
+        attrs = parse_attributes(account_elem)
         account_info = {
             "id": account_elem.get('id'),
             "name": account_elem.get('name'),
-            "attributes": parse_attributes(account_elem)
+            "login_state": _login_state(attrs),
+            "attributes": attrs
         }
 
         return tool_response({
@@ -6575,7 +6656,7 @@ if __name__ == "__main__":
     setup_http_session()
 
     logger.info("=" * 80)
-    logger.info("Zimbra Collaboration MCP Server v1.11.0")
+    logger.info("Zimbra Collaboration MCP Server v1.11.1")
     logger.info("=" * 80)
 
     # Calculate tool count based on feature toggles
