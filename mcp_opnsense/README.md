@@ -1,13 +1,13 @@
 # OPNsense MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **OPNsense**, built on FastMCP and optimized for weak/small LLMs (e.g. `gpt-oss`, `gemma`). It exposes **21 read-only tools** with compact JSON output and camelCase tool names.
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **OPNsense**, built on FastMCP and optimized for weak/small LLMs (e.g. `gpt-oss`, `gemma`). It exposes **28 read-only tools** with compact JSON output and camelCase tool names.
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 2.4.1
+- **Version:** 2.5.0
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
-> Tested against **OPNsense 26.1.10**. Reads use the native API where one exists and fall back to `config.xml`, so older releases degrade instead of breaking — see [Minimum OPNsense version per data source](#minimum-opnsense-version-per-data-source). **Port forward needs 26.1+** for the API path; **firewall rules need 26.1+** to be complete (below that, see the cutover note).
+> Tested against **OPNsense 26.1.2 and 26.1.10**. Reads use the native API where one exists and fall back to `config.xml`, so older releases degrade instead of breaking — see [Minimum OPNsense version per data source](#minimum-opnsense-version-per-data-source). **Port forward needs 26.1+** for the API path; **firewall rules need 26.1+** to be complete (below that, see the cutover note).
 
 ---
 
@@ -18,8 +18,11 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 - **Aliases** with resolved entry list and live item counts.
 - **All four NAT types** through one tool — port forward (26.1 `d_nat` API), outbound, one-to-one, NPTv6.
 - **Gateways**: configuration *and* live dpinger status in one call — monitor IP, `monitor_disable`, priority, weight, loss/latency, including dynamic DHCP/PPPoE gateways.
-- Services, DHCP leases/settings, interfaces, ARP/NDP, routes.
+- **Troubleshooting**: firewall log with the rule that matched, live state table, system/audit/service logs, Suricata IDS alerts, per-rule hit counters (find unused rules).
+- **Health**: uptime, load, memory, disk, temperature, state-table usage and system notices; VPN tunnels (WireGuard handshakes, OpenVPN clients, IPsec SAs); certificate expiry.
+- Services, DHCP leases/settings for **Kea, Dnsmasq and ISC**, interfaces with link speed, ARP/NDP, the live routing table.
 - Firmware status/info/config, packages and plugins (`os-*`).
+- **Strictly read-only**: no tool starts a job on the firewall (no update check, audit, health check or connectivity test), and private keys are never returned.
 - Config summary, plus raw XML export of any `config.xml` section.
 - API-first with automatic `config.xml` fallback; every answer reports the `source` it came from.
 - Multi-transport, optional API-key auth for HTTP, response caching with TTL, retry with backoff.
@@ -135,7 +138,7 @@ Each tool is then available at `POST http://host:8016/<toolName>` with `Authoriz
 
 ---
 
-## Tools (21)
+## Tools (28)
 
 | Tool | Description |
 |---|---|
@@ -148,18 +151,25 @@ Each tool is then available at `POST http://host:8016/<toolName>` with `Authoriz
 | `getAliasContent` | Resolved entries of a specific alias |
 | `getServices` | Service overview (running / stopped / locked) |
 | `getServiceStatus` | Status of one service |
-| `getFirmwareStatus` | Update availability + health check |
-| `getFirmwareInfo` | Full package list + security audit |
-| `getFirmwareConfig` | Firmware settings, mirror options, repo connectivity |
+| `getFirmwareStatus` | Pending updates and reboot from the router's last update check (does not start one) |
+| `getFirmwareInfo` | Product version, series, package/plugin counts (no 400 KB package dump) |
+| `getFirmwareConfig` | Firmware settings and mirror options |
 | `getPackageInfo` | Details / license / changelog for one package |
-| `getDhcpLeases` | DHCPv4 leases (optional search) |
-| `getDhcpSettings` | DHCP service status + settings |
-| `getInterfaces` | Interfaces from config.xml + API (optional stats) |
+| `getDhcpLeases` | Leases from Kea, Dnsmasq and ISC (v4/v6), merged; search by IP/MAC/hostname/vendor |
+| `getDhcpSettings` | Active DHCP server, subnets, pools, options handed out, static reservations |
+| `getInterfaces` | Interfaces with status, IPs, link speed/duplex, gateway; optional counters |
 | `getNetworkNeighbors` | ARP (IPv4) and/or NDP (IPv6) tables |
-| `getRoutes` | Routing table |
+| `getRoutes` | Kernel routing table in use + configured static routes |
 | `downloadConfigXml` | config.xml: summary, or raw XML of a named section |
 | `getPlugins` | OPNsense plugins (`os-*`); filter by status/search |
 | `getPackages` | System packages (non `os-*`); filter by status/search |
+| `getSystemHealth` | Uptime, load, memory, swap, disk, temperature, state table, system notices |
+| `getFirewallLog` | Firewall log with the matching rule; filter by action/interface/IP/port |
+| `getFirewallStates` | Live state table (current connections); filter by IP/port/rule |
+| `getSystemLog` | System, audit, gateways, Kea, WireGuard, Suricata and other logs; severity filter |
+| `getVpnStatus` | WireGuard peers (last handshake, traffic), OpenVPN sessions, IPsec SAs |
+| `getIdsAlerts` | Suricata IDS/IPS alerts |
+| `getCertificates` | Certificates with expiry and days left (private keys never returned) |
 
 Every tool that can read from either source reports which one it used in a `source` field (`"api"` or `"config"`).
 
@@ -212,6 +222,10 @@ Tools read the native MVC API first and fall back to `config.xml` when it is una
 | Alias contents | `firewall/alias_util/list/{name}` | **23.7** | — |
 | Gateways | `routing/settings/search_gateway` | **24.1** | config.xml + `routes/gateway/status` |
 | config.xml download | `core/backup/download/this` | **23.7.8** | requires the `os-api-backup` plugin |
+| DHCP leases | `kea/leases4/search`, `dnsmasq/leases/search`, `dhcpv4/leases/searchLease` | Kea 24.1, Dnsmasq 24.7; ISC is a plugin from **26.1** | whichever servers answer are merged |
+| Interfaces | `interfaces/overview/interfacesInfo` | **23.1** | — |
+| Rule hit counters | `firewall/filter_util/rule_stats` | **24.7** | `include_stats` returns an error |
+| Logs | `diagnostics/log/core/{scope}` | **23.7** | — |
 
 ### The 26.1 firewall-rule cutover (read this before trusting a rule count)
 
@@ -235,10 +249,19 @@ Gateways moved the same way: 26.1 leaves an empty `<gateways><gateway_item/></ga
 - The HTTP client honours `HTTP_PROXY` / `HTTPS_PROXY`. Claude Desktop on macOS needs this to route through `mcp_proxy` when security software blocks its child processes.
 - **Reading gateway status alone is misleading.** A gateway with `monitor_disable` set is never probed by dpinger, so it always reports `Online` and *cannot* be marked down. `getGateways` flags that case in a `note` field rather than letting it look healthy.
 - Rules OPNsense generates itself (automatic filter rules, anti-lockout port forwards, automatic outbound NAT) are tagged `is_automatic`. They are display-only and not in the config.
+- **Read-only means read-only.** Several firmware endpoints that look like reads are POSTs that start a job on the firewall: `core/firmware/check` (update check), `audit`, `health` (package integrity check) and `connection`. Up to v2.4.1 `getFirmwareStatus`, `getFirmwareInfo` and `getFirmwareConfig` called them on every request. They are no longer called; `getFirmwareStatus` reports the router's last check and how old it is.
+- **`trust/cert/search` returns private keys** (`prv`, `prv_payload`). `getCertificates` copies only an allowlist of fields.
+- `getSystemLog` only accepts a fixed list of log names: `diagnostics/log/core/<scope>/clear` wipes a log, so the path is never built from free text.
+- Use a dedicated API user with read-only privileges, not root's key: everything this server does is a read.
+- HTTP 4xx (endpoint missing on this release, plugin not installed, no privilege) is no longer retried; v2.4.1 retried each one three times with back-off (~3.5 s).
 
 ---
 
 ## Changelog (recent)
+
+- **v2.5.0** — Review against a live 26.1 firewall and the 26.1/26.7 API.
+  - **Fixes:** DHCP leases were always empty on Kea/Dnsmasq firewalls (only the ISC API was queried; ISC is a plugin since 26.1) — now Kea, Dnsmasq and ISC are merged, and `getDhcpSettings` shows Kea subnets, pools, options and reservations. `getRoutes` returned only static routes (empty on most firewalls) — now the kernel routing table. `getInterfaces(interface=...)` returned every interface — now one, with link speed and IPs from `interfaces/overview`. `getServiceStatus` matches service ids like `kea-dhcp/v4` and descriptions. `getFirmwareStatus` / `getFirmwareInfo` / `getFirmwareConfig` no longer start an update check, audit, health check or connectivity test on the firewall, and `getFirmwareInfo` dropped from ~400 KB to under 1 KB. `getAliasContent` gets `search` (an IP finds the networks containing it) and `limit` (a GeoIP alias was 140 KB), and returns the configured ports for port aliases. `getAliases` returns the same fields from API and config.xml, with live item counts. `getConfigSummary` 10 s → ~1 s. 4xx no longer retried.
+  - **New:** `getSystemHealth`, `getFirewallLog`, `getFirewallStates`, `getSystemLog`, `getVpnStatus`, `getIdsAlerts`, `getCertificates`; `getFirewallRules(include_stats, unused_only)` for per-rule hit counters.
 
 - **v2.4.1** — SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 - **v2.4.0** — **Fixes `getFirewallRules` / `getConfigSummary` returning 0 rules on OPNsense 26.1** (they read config.xml, which 26.1 leaves empty). Reads are now API-first with a config.xml fallback and report their `source`. New `getGateways` (config + live status, incl. dynamic DHCP/PPPoE gateways). `getNatRules` becomes the single NAT entry point and gains port forward via the 26.1 `firewall/d_nat` API. `downloadConfigXml` gains `section` to return real XML instead of only counts. Backward compatible: all v2.3.0 tool names and arguments still work.

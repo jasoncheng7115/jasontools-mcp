@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-OPNsense MCP Server - v2.4.1 (FastMCP Rewrite)
+OPNsense MCP Server - v2.5.0 (FastMCP Rewrite)
 ================================================
 Author: Jason Cheng (Jason Tools) - Enhanced by Claude
 License: MIT
 Created: 2025-06-25
-Updated: 2026-09-29
+Updated: 2026-10-07
 
 FastMCP-based OPNsense integration optimized for weak/small LLMs.
-21 tools, compact responses, camelCase tool names.
+28 tools, compact responses, camelCase tool names. Strictly read-only.
 Supports stdio, streamable-http, and sse transport.
 
 pip install mcp aiohttp requests defusedxml uvicorn
@@ -38,6 +38,37 @@ rules on 25.x. We read the API first (with show_all=1, which on 25.x is what mer
 the legacy config.xml rules into the response) and fall back to config.xml.
 
 Changelog:
+  v2.5.0 (2026-10-07) - Fixes from a live 26.1 review; 7 new read-only tools
+    - FIX getDhcpLeases: always empty on Kea/Dnsmasq firewalls (only the ISC API was
+      read, and ISC DHCP is a plugin since 26.1). Kea v4/v6, Dnsmasq and ISC v4/v6 are
+      queried in parallel and merged; each lease says which server it came from.
+    - FIX getDhcpSettings: 404 on 26.1. Now reports the active server and, for Kea,
+      subnets, pools, routers/DNS/NTP handed out and static reservations.
+    - FIX getRoutes: returned only System > Routes (static), empty on most firewalls.
+      Now the kernel routing table (diagnostics/interface/getRoutes) + static routes.
+    - FIX getInterfaces(interface=x): getInterfaceConfig ignores its argument and
+      returned every interface. Rewritten on interfaces/overview/interfacesInfo: name,
+      device, status, IPv4/IPv6, gateway, media (link speed), MTU, MAC.
+    - FIX getServiceStatus: core/service/status/<x> does not exist; ids such as
+      kea-dhcp/v4 could not be looked up. Now matches id/name/description.
+    - FIX read-only: getFirmwareStatus/getFirmwareInfo/getFirmwareConfig POSTed
+      core/firmware/{check,audit,health,connection}, which START jobs on the firewall
+      (every LLM question triggered an update check). Removed; status now reports the
+      router's last check and its age.
+    - FIX size: getFirmwareInfo ~400 KB -> <1 KB; getFirmwareStatus 46 KB -> <1 KB;
+      getAliasContent gets search (IP -> containing networks) + limit (GeoIP 140 KB).
+    - getAliasContent: port aliases are not pf tables (returned 0); falls back to the
+      configured content.
+    - getAliases: API is the default source, same fields as config.xml, plus live
+      current_items / last_updated.
+    - getConfigSummary/downloadConfigXml: version from system_information instead of
+      the 400 KB firmware/info (10 s -> ~1 s).
+    - _request: HTTP 4xx is not retried (each missing endpoint cost ~3.5 s).
+    - NEW getSystemHealth, getFirewallLog (rule name resolved from rid; wan/WAN2 mapped
+      to devices), getFirewallStates, getSystemLog (fixed scope list - the same path
+      family has a "clear" action), getVpnStatus, getIdsAlerts, getCertificates
+      (allowlisted fields: trust/cert/search also returns private keys).
+    - getFirewallRules: include_stats / unused_only via firewall/filter_util/rule_stats.
   v2.4.1 (2026-09-29) - SSE clients stuck on an uninitialized session
     - SSE mode now also serves Streamable HTTP at /mcp on the same port.
       SSE clients that auto-reconnect after a dropped connection (laptop sleep) get a
@@ -113,6 +144,7 @@ json.dumps = lambda *args, **kwargs: _json_dumps_original(*args, **{**{'ensure_a
 
 import asyncio
 import hashlib
+import ipaddress
 import logging
 import os
 import ssl
@@ -135,7 +167,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("mcp-opnsense")
 
-__version__ = "2.4.1"
+__version__ = "2.5.0"
 
 
 # ───────────────────────── Configuration ─────────────────────────
@@ -393,6 +425,114 @@ mcp = FastMCP(
 )
 
 
+DHCP_LEASE_ENDPOINTS = [
+    ("kea_v4", "/api/kea/leases4/search"),
+    ("kea_v6", "/api/kea/leases6/search"),
+    ("dnsmasq", "/api/dnsmasq/leases/search"),
+    ("isc_v4", "/api/dhcpv4/leases/searchLease"),
+    ("isc_v6", "/api/dhcpv6/leases/searchLease"),
+]
+
+
+def _epoch_iso(v: Any) -> Optional[str]:
+    try:
+        n = int(float(v))
+        return datetime.fromtimestamp(n).astimezone().isoformat(timespec="seconds") if n > 0 else None
+    except (TypeError, ValueError):
+        return str(v) if v not in (None, "") else None
+
+
+def _normalize_lease(server: str, r: Dict[str, Any]) -> Dict[str, Any]:
+    """Kea, Dnsmasq and ISC lease rows use different field names; map them to one shape."""
+    if server.startswith("kea"):
+        lease = {"ip": r.get("address"), "mac": r.get("hwaddr"), "hostname": r.get("hostname"),
+                 "interface": r.get("if_descr"), "interface_name": r.get("if_name"), "device": r.get("if"),
+                 "expires": _epoch_iso(r.get("expire")), "vendor": r.get("mac_info"),
+                 "state": {"0": "active", "1": "declined", "2": "expired-reclaimed"}.get(str(r.get("state")), r.get("state"))}
+    elif server == "dnsmasq":
+        lease = {"ip": r.get("address"), "mac": r.get("hwaddr"), "hostname": r.get("hostname"),
+                 "interface": r.get("if_descr"), "interface_name": r.get("if_name"), "device": r.get("if"),
+                 "expires": _epoch_iso(r.get("expire")), "vendor": r.get("mac_info"),
+                 "static": _truthy(r.get("is_reserved"))}
+    else:
+        lease = {"ip": r.get("address"), "mac": r.get("mac"), "hostname": r.get("hostname"),
+                 "interface": r.get("if_descr"), "interface_name": r.get("if"),
+                 "expires": r.get("ends"), "vendor": r.get("man"),
+                 "state": r.get("state"), "static": r.get("type") == "static",
+                 "online": r.get("status")}
+    lease["server"] = server
+    return {k: v for k, v in lease.items() if v not in (None, "")}
+
+
+def _normalize_interface(r: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = r.get("config") or {}
+    out = {
+        "name": r.get("identifier") or "",
+        "description": r.get("description"),
+        "device": r.get("device"),
+        "status": r.get("status"),
+        "enabled": r.get("enabled"),
+        "ipv4": r.get("addr4") or None,
+        "ipv6": r.get("addr6") or None,
+        "type": r.get("link_type"),
+        "gateways": r.get("gateways") or None,
+        "media": r.get("media"),
+        "mtu": r.get("mtu"),
+        "mac": r.get("macaddr"),
+        "vlan_tag": r.get("vlan_tag"),
+        "physical": r.get("is_physical"),
+    }
+    if isinstance(cfg, dict) and cfg.get("if") and cfg.get("if") != r.get("device"):
+        out["parent"] = cfg.get("if")
+    return {k: v for k, v in out.items() if v not in (None, "", [])}
+
+
+def _normalize_api_alias(r: Dict[str, Any]) -> Dict[str, Any]:
+    content = [x for x in str(r.get("content") or "").replace(",", "\n").split("\n") if x.strip()]
+    out = {
+        "name": r.get("name"),
+        "type": r.get("type"),
+        "description": r.get("description") or "",
+        "enabled": _truthy(r.get("enabled")),
+        "content_list": content,
+        "content_count": len(content),
+        "current_items": int(r["current_items"]) if str(r.get("current_items", "")).isdigit() else None,
+        "last_updated": r.get("last_updated") or None,
+        "category": r.get("%categories") or None,
+        "update_freq_days": r.get("updatefreq") or None,
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _alias_entries_matching(entries: List[Any], search: str) -> List[Any]:
+    """IP search -> entries whose host/network contains it; otherwise substring match."""
+    try:
+        addr = ipaddress.ip_address(search)
+    except ValueError:
+        return [e for e in entries if search.lower() in str(e).lower()]
+    hits = []
+    for e in entries:
+        try:
+            if addr in ipaddress.ip_network(str(e).strip(), strict=False):
+                hits.append(e)
+        except ValueError:
+            continue
+    return hits
+
+
+def _check_age_days(last_check: Optional[str]) -> Optional[int]:
+    """'Wed Oct  7 08:38:10 CST 2026' -> whole days since then."""
+    if not last_check:
+        return None
+    parts = str(last_check).split()
+    try:
+        # drop the time zone word (CST, UTC, ...), which strptime cannot parse reliably
+        dt = datetime.strptime(" ".join(parts[:4] + parts[5:6]), "%a %b %d %H:%M:%S %Y")
+        return max(0, (datetime.now() - dt).days)
+    except (ValueError, IndexError):
+        return None
+
+
 def _sse_and_http_app(server):
     """Legacy SSE (/sse + /messages/) plus Streamable HTTP (/mcp) on one port.
 
@@ -435,6 +575,10 @@ class _APIKeyAuth:
 
 
 # ───────────────────────── OPNsenseClient ─────────────────────────
+
+class _ClientError(Exception):
+    """HTTP 4xx from OPNsense: not retried."""
+
 
 class OPNsenseClient:
     """OPNsense API client for config.xml reading, service management, and firmware/package info"""
@@ -501,8 +645,14 @@ class OPNsenseClient:
                         if cache_key and cache is not None:
                             cache.set(cache_key, result)
                         return result
+                    elif 400 <= response.status < 500:
+                        # Missing endpoint (older release / plugin not installed) or no
+                        # privilege: retrying cannot help and cost ~3 s per probe.
+                        raise _ClientError(f"API error {response.status}: {response_text[:200]}")
                     else:
                         raise Exception(f"API error {response.status}: {response_text[:200]}")
+            except _ClientError:
+                raise
             except Exception as e:
                 last_exc = e
                 if attempt < self.cfg.MAX_RETRIES - 1:
@@ -702,6 +852,20 @@ class OPNsenseClient:
 
     # ── Service API Methods ──
 
+    async def fetch_all_rows(self, endpoint: str, page_size: int = 500, max_rows: int = 20000) -> List[Dict]:
+        """GET a search_* endpoint page by page and return every row."""
+        rows, current = [], 1
+        while len(rows) < max_rows:
+            result = await self._request("GET", endpoint,
+                                         params={"current": current, "rowCount": page_size, "searchPhrase": ""})
+            page = result.get("rows", []) if isinstance(result, dict) else (result if isinstance(result, list) else [])
+            rows.extend(page)
+            total = int(result.get("total", 0) or 0) if isinstance(result, dict) else 0
+            if not page or len(page) < page_size or (total and len(rows) >= total):
+                break
+            current += 1
+        return rows
+
     async def search_services(self, search_phrase: str = "", current: int = 1,
                               row_count: int = 100) -> Dict:
         data = {"current": current, "rowCount": row_count, "searchPhrase": search_phrase, "sort": {}}
@@ -743,28 +907,43 @@ class OPNsenseClient:
         return {"service": service_name, "error": "Service not found"}
 
     # ── Firmware API Methods ──
+    # Read-only on purpose: core/firmware/{check,audit,health,connection} are POSTs that
+    # start a job on the firewall (update check, security audit, pkg integrity check).
 
     async def get_firmware_status(self) -> Dict:
         return await self._request("GET", "/api/core/firmware/status")
 
+    async def get_product_version(self) -> Dict[str, str]:
+        """Product and OS version from the small dashboard endpoint.
+
+        core/firmware/info has the same data but is ~400 KB (every package) and took
+        ~7 s, which made getConfigSummary slow; use it only as a fallback.
+        """
+        try:
+            info = await self._request("GET", "/api/diagnostics/system/system_information")
+            out = {}
+            for v in info.get("versions", []):
+                if v.startswith("OPNsense"):
+                    out["product_name"] = "OPNsense"
+                    out["product_version"] = v.split()[1].rsplit("-", 1)[0] if len(v.split()) > 1 else ""
+                elif v.startswith(("FreeBSD", "HardenedBSD")):
+                    out["os_version"] = v
+            if out.get("product_version"):
+                return out
+        except Exception:
+            pass
+        try:
+            fw = await self.get_firmware_info()
+            return {"product_name": "OPNsense", "product_version": fw.get("product_version", "")}
+        except Exception:
+            return {}
+
     async def get_firmware_info(self) -> Dict:
         return await self._request("GET", "/api/core/firmware/info")
-
-    async def get_firmware_check(self) -> Dict:
-        return await self._request("POST", "/api/core/firmware/check", data={})
 
     async def get_firmware_changelog(self, version: str = None) -> Dict:
         ep = f"/api/core/firmware/changelog/{version}" if version else "/api/core/firmware/changelog"
         return await self._request("POST", ep, data={})
-
-    async def get_firmware_audit(self) -> Dict:
-        return await self._request("POST", "/api/core/firmware/audit", data={})
-
-    async def get_firmware_health(self) -> Dict:
-        return await self._request("POST", "/api/core/firmware/health", data={})
-
-    async def get_firmware_connection(self) -> Dict:
-        return await self._request("POST", "/api/core/firmware/connection", data={})
 
     async def get_firmware_options(self) -> Dict:
         return await self._request("GET", "/api/core/firmware/getOptions")
@@ -950,23 +1129,8 @@ async def getConfigSummary() -> str:
                 "timezone": txt(sys_node.find("timezone")),
             }
 
-        # Get OPNsense version from firmware API (config.xml doesn't have it)
-        try:
-            fw_info = await c.get_firmware_info()
-            sys_info["product_version"] = fw_info.get("product_version", "")
-            sys_info["product_name"] = fw_info.get("product_id", "OPNsense")
-            # Enrich from product sub-object if available
-            product = fw_info.get("product", {})
-            if not sys_info["product_version"] and product:
-                sys_info["product_version"] = product.get("product_version", "")
-            if product.get("product_name"):
-                sys_info["product_name"] = product["product_name"]
-            if product.get("product_nickname"):
-                sys_info["product_nickname"] = product["product_nickname"]
-            if fw_info.get("os_version"):
-                sys_info["os_version"] = fw_info["os_version"]
-        except Exception:
-            pass
+        # OPNsense version (config.xml doesn't have it)
+        sys_info.update(await c.get_product_version())
 
         user_rules = [r for r in fw_rules if not r.get("is_automatic")]
 
@@ -1009,10 +1173,14 @@ async def _fetch_firewall_rules() -> tuple:
 async def getFirewallRules(interface: Optional[str] = None, action: Optional[str] = None,
                            enabled_only: Optional[bool] = None,
                            aliases_only: bool = False,
-                           include_automatic: bool = True) -> str:
+                           include_automatic: bool = True,
+                           include_stats: bool = False,
+                           unused_only: bool = False) -> str:
     """Get firewall rules (native API, config.xml fallback).
-    [YES] "防火牆規則", "show firewall rules", "rules on LAN", "pass rules".
+    [YES] "防火牆規則", "show firewall rules", "rules on LAN", "pass rules",
+          "沒用到的規則", "unused rules", "rule hit count", "規則命中數".
     [NO] "NAT rules" -> use getNatRules().
+    [NO] "Why was X blocked / firewall log" -> use getFirewallLog().
 
     Args:
         interface: Filter by interface (e.g., wan, lan, opt1). A rule may span
@@ -1021,9 +1189,26 @@ async def getFirewallRules(interface: Optional[str] = None, action: Optional[str
         enabled_only: True=enabled only, False=disabled only, None=all.
         aliases_only: Only show rules that reference aliases.
         include_automatic: Include OPNsense's own automatic/internal rules.
-            False = only rules a human configured."""
+            False = only rules a human configured.
+        include_stats: Add pf counters per rule (evaluations, packets, bytes, states)
+            since the last rule reload / reboot.
+        unused_only: Only enabled rules that have matched no packets (implies
+            include_stats). Candidates for cleanup - counters reset on reload."""
     try:
         rules, source = await _fetch_firewall_rules()
+        if include_stats or unused_only:
+            c = await _ensure_client()
+            try:
+                stats = (await c._request("GET", "/api/firewall/filter_util/rule_stats")).get("stats", {})
+                for r in rules:
+                    st = stats.get(r.get("uuid", ""))
+                    if st:
+                        r["stats"] = {k: st.get(k) for k in ("evaluations", "packets", "bytes", "states")}
+            except Exception as exc:
+                return _R({"error": f"rule statistics unavailable (needs OPNsense 24.7+): {exc}"})
+        if unused_only:
+            rules = [r for r in rules if r.get("enabled") and r.get("stats") is not None
+                     and not r["stats"].get("packets")]
 
         if not include_automatic:
             rules = [r for r in rules if not r.get("is_automatic")]
@@ -1140,51 +1325,91 @@ async def getNatRulesConfig(rule_type: str = "forward", enabled_only: Optional[b
 
 # Tool 4: getAliases
 @mcp.tool()
-async def getAliases(source: str = "config", alias_type: Optional[str] = None,
+async def getAliases(source: str = "api", alias_type: Optional[str] = None,
                      enabled_only: Optional[bool] = None,
                      search: Optional[str] = None) -> str:
-    """Get aliases from config.xml or API.
+    """Get aliases (name, type, content, description, enabled).
     [YES] "別名清單", "list aliases", "show host aliases", "alias search".
     [NO] "Alias content/entries" -> use getAliasContent().
 
+    Both sources return the same fields. The API also reports how many entries the
+    alias currently resolves to (current_items) and when it was last updated, which
+    matters for URL/GeoIP aliases whose content is fetched, not typed in.
+
     Args:
-        source: "config" (config.xml) or "api" (REST API).
-        alias_type: Filter by type (host, network, port, url, etc.).
+        source: "api" (default; falls back to config.xml on error) or "config".
+        alias_type: Filter by type (host, network, port, url, urltable, geoip, ...).
         enabled_only: True=enabled only, None=all.
-        search: Filter by name (case-insensitive partial match)."""
+        search: Filter by name or description (case-insensitive partial match)."""
     try:
         c = await _ensure_client()
-        if source == "api":
-            result = await c.search_aliases_api(search_phrase=search or "", row_count=500)
-            aliases = result.get("rows", [])
-            return _R({"source": "api", "data": aliases, "count": len(aliases)})
-        else:
+        aliases, used = None, "config"
+        if source != "config":
+            try:
+                result = await c.search_aliases_api(row_count=5000)
+                aliases = [_normalize_api_alias(r) for r in result.get("rows", [])]
+                used = "api"
+            except Exception as api_exc:
+                logger.warning(f"firewall/alias/search_item failed, falling back to config.xml: {api_exc}")
+        if aliases is None:
             root = await c.download_config_xml()
             aliases = c._parse_aliases_from_xml(root)
-            if alias_type:
-                aliases = [a for a in aliases if a["type"].lower() == alias_type.lower()]
-            if enabled_only is not None:
-                aliases = [a for a in aliases if a["enabled"] == enabled_only]
-            if search:
-                aliases = [a for a in aliases if search.lower() in a["name"].lower()]
-            return _R({"source": "config", "data": aliases, "count": len(aliases)})
+        if alias_type:
+            aliases = [a for a in aliases if str(a.get("type", "")).lower() == alias_type.lower()]
+        if enabled_only is not None:
+            aliases = [a for a in aliases if bool(a.get("enabled")) == enabled_only]
+        if search:
+            s = search.lower()
+            aliases = [a for a in aliases
+                       if s in str(a.get("name", "")).lower() or s in str(a.get("description", "")).lower()]
+        return _R({"source": used, "data": aliases, "count": len(aliases)})
     except Exception as e:
         return _R({"error": str(e)})
 
 
 # Tool 5: getAliasContent
 @mcp.tool()
-async def getAliasContent(alias_name: str) -> str:
-    """Get resolved content entries for a specific alias.
-    [YES] "Show entries in alias X", "alias content", "別名內容".
+async def getAliasContent(alias_name: str, search: Optional[str] = None, limit: int = 200) -> str:
+    """Get the entries an alias currently resolves to (IPs, networks, ports).
+    [YES] "Show entries in alias X", "alias content", "別名內容", "is 1.2.3.4 in alias X".
     [NO] "List all aliases" -> use getAliases().
 
+    GeoIP and URL aliases can hold thousands of networks; only the first `limit`
+    entries are returned, with the full count in `total`. Use `search` to check
+    whether a specific address or prefix is in the alias.
+
     Args:
-        alias_name: The alias name to get content for."""
+        alias_name: The alias name.
+        search: An IP address returns the entries (hosts or networks) that contain it,
+                e.g. "203.0.113.5" matches "203.0.113.0/24". Anything else is a text match.
+        limit: Max entries returned (default 200)."""
     try:
         c = await _ensure_client()
         result = await c.list_alias_content(alias_name)
-        return _R({"alias": alias_name, "data": result})
+        rows = result.get("rows", []) if isinstance(result, dict) else []
+        entries = [r.get("ip", r) if isinstance(r, dict) else r for r in rows]
+        source = "pf_table"
+        if not entries:
+            # Port aliases (and disabled ones) are not loaded as pf tables; show what is configured.
+            try:
+                found = await c.search_aliases_api(search_phrase=alias_name, row_count=50)
+                for r in found.get("rows", []):
+                    if r.get("name") == alias_name:
+                        entries = _normalize_api_alias(r).get("content_list", [])
+                        source = "configured"
+                        break
+            except Exception:
+                pass
+        total = len(entries)
+        if search:
+            entries = _alias_entries_matching(entries, search.strip())
+        matched = len(entries)
+        out = {"alias": alias_name, "source": source, "total": total, "entries": entries[:max(1, limit)]}
+        if search:
+            out["matched"] = matched
+        if matched > limit:
+            out["truncated"] = True
+        return _R(out)
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1222,43 +1447,77 @@ async def getServices(search: Optional[str] = None) -> str:
 # Tool 7: getServiceStatus
 @mcp.tool()
 async def getServiceStatus(service_name: str) -> str:
-    """Get detailed status for a specific service.
-    [YES] "Check unbound status", "is dhcpd running?", "service X status".
+    """Status of one service: running or stopped.
+    [YES] "Is unbound running?", "kea 有沒有在跑", "suricata status", "某服務狀態".
     [NO] "All services" -> use getServices().
 
+    Matches the service id, name or description (case-insensitive, partial), so
+    "kea", "dhcp", "suricata" or "wireguard" all work. Several matches are all returned.
+
     Args:
-        service_name: Name or ID of the service (e.g., unbound, dhcpd, openvpn)."""
+        service_name: Service id, name or part of its description."""
     try:
         c = await _ensure_client()
-        result = await c.get_service_status(service_name)
-        return _R(result)
+        wanted = service_name.strip().lower()
+        services = await c.get_all_services()
+        exact = [s for s in services if wanted in (str(s.get("id", "")).lower(), str(s.get("name", "")).lower())]
+        matches = exact or [s for s in services
+                            if wanted in str(s.get("id", "")).lower()
+                            or wanted in str(s.get("name", "")).lower()
+                            or wanted in str(s.get("description", "")).lower()]
+        if matches:
+            return _R({"query": service_name, "data": [{
+                "id": s.get("id"), "name": s.get("name"), "description": s.get("description"),
+                "running": bool(s.get("running")), "locked": bool(s.get("locked")),
+            } for s in matches], "count": len(matches)})
+        # Not in the service list: it may be installed but disabled
+        try:
+            st = await c._request("GET", f"/api/{wanted}/service/status")
+            return _R({"query": service_name, "data": [{"id": wanted, "status": st.get("status")}],
+                       "note": "Not in the running service list; status from the module itself."})
+        except Exception:
+            return _R({"query": service_name, "data": [], "count": 0,
+                       "note": "No such service. Use getServices() for the list."})
     except Exception as e:
         return _R({"error": str(e)})
 
 
 # Tool 8: getFirmwareStatus
 @mcp.tool()
-async def getFirmwareStatus() -> str:
-    """Get firmware status, update availability, and health check.
-    [YES] "韌體狀態", "firmware update?", "is OPNsense up to date?", "firmware health".
-    [NO] "Package list" -> use getFirmwareInfo().
-    [NO] "Firmware settings" -> use getFirmwareConfig()."""
+async def getFirmwareStatus(include_packages: bool = False) -> str:
+    """Firmware version and pending updates, from the router's last update check.
+    [YES] "韌體狀態", "firmware update?", "is OPNsense up to date?", "需要更新嗎", "needs reboot".
+    [NO] "Package list" -> use getPackages() / getPlugins().
+    [NO] "Firmware settings" -> use getFirmwareConfig().
+
+    Read-only: shows the result of the last check the router ran (see last_check and
+    last_check_age_days); it does not start a new check. If the check is old, run
+    "Check for updates" in the GUI first.
+
+    Args:
+        include_packages: Also list the names of packages that would be upgraded/added."""
     try:
         c = await _ensure_client()
-        result = {}
-        try:
-            result["status"] = await c.get_firmware_status()
-        except Exception as e:
-            result["status_error"] = str(e)
-        try:
-            result["check"] = await c.get_firmware_check()
-        except Exception as e:
-            result["check_error"] = str(e)
-        try:
-            result["health"] = await c.get_firmware_health()
-        except Exception as e:
-            result["health_error"] = str(e)
-        return _R(result)
+        st = await c.get_firmware_status()
+        out = {k: st.get(k) for k in (
+            "product_version", "os_version", "status", "status_msg",
+            "needs_reboot", "upgrade_major_version", "upgrade_major_message", "last_check",
+            "connection", "repository") if st.get(k) not in (None, "")}
+        out["needs_reboot"] = _truthy(st.get("needs_reboot") or st.get("status_reboot"))
+        age = _check_age_days(st.get("last_check"))
+        if age is not None:
+            out["last_check_age_days"] = age
+            if age > 7:
+                out["note"] = f"Last update check was {age} days ago; the pending list may be out of date."
+        counts = {k: len(st.get(k) or []) for k in (
+            "upgrade_packages", "new_packages", "reinstall_packages", "remove_packages", "downgrade_packages")}
+        out["counts"] = {k: v for k, v in counts.items() if v}
+        if include_packages:
+            out["upgrade_packages"] = [
+                f"{p.get('name')} {p.get('current_version', '')}->{p.get('new_version', '')}".strip()
+                for p in st.get("upgrade_packages") or []]
+            out["new_packages"] = [f"{p.get('name')} {p.get('version', '')}".strip() for p in st.get("new_packages") or []]
+        return _R(out)
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1266,27 +1525,36 @@ async def getFirmwareStatus() -> str:
 # Tool 9: getFirmwareInfo
 @mcp.tool()
 async def getFirmwareInfo() -> str:
-    """Get firmware info including full package list and security audit.
-    [YES] "firmware audit", "firmware info", "all packages raw".
+    """Installed OPNsense product and package counts.
+    [YES] "firmware info", "OPNsense 版本", "how many packages/plugins installed".
     [NO] "Firmware update status" -> use getFirmwareStatus().
     [NO] "Specific package" -> use getPackageInfo().
     [NO] "已安裝 plugin", "plugin list" -> use getPlugins().
     [NO] "已安裝套件", "installed packages" -> use getPackages().
 
-    Returns ALL packages (hundreds), plugins, and security audit.
-    For filtered views, prefer getPlugins() or getPackages()."""
+    The full package list is several hundred KB; search it with getPackages() /
+    getPlugins() instead."""
     try:
         c = await _ensure_client()
-        result = {}
-        try:
-            result["info"] = await c.get_firmware_info()
-        except Exception as e:
-            result["info_error"] = str(e)
-        try:
-            result["audit"] = await c.get_firmware_audit()
-        except Exception as e:
-            result["audit_error"] = str(e)
-        return _R(result)
+        info = await c.get_firmware_info()
+        pkgs = info.get("package") or []
+        plugins = info.get("plugin") or []
+        product = info.get("product") or {}
+        out = {k: info.get(k) for k in ("product_id", "product_version") if info.get(k)}
+        for key, label in (("CORE_PRODUCT", "product_name"), ("CORE_NICKNAME", "nickname"),
+                           ("CORE_SERIES", "series"), ("CORE_NEXT", "next_major"), ("CORE_ARCH", "arch"),
+                           ("CORE_REPOSITORY", "repository"), ("CORE_HASH", "commit")):
+            if isinstance(product, dict) and product.get(key):
+                out[label] = str(product.get(key)).strip()
+        out["packages_installed"] = sum(1 for p in pkgs if _truthy(p.get("installed")))
+        out["plugins_installed"] = sorted(p.get("name") for p in plugins if _truthy(p.get("installed")))
+        missing = sorted(p.get("name") for p in plugins if _truthy(p.get("configured")) and not _truthy(p.get("installed")))
+        if missing:
+            # Listed in the firmware config but not installed - usually a third-party
+            # repository that is no longer configured, so these never get updates.
+            out["plugins_configured_not_installed"] = missing
+        out["plugins_available"] = len(plugins)
+        return _R(out)
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1308,10 +1576,9 @@ async def getFirmwareConfig() -> str:
             result["options"] = await c.get_firmware_options()
         except Exception as e:
             result["options_error"] = str(e)
-        try:
-            result["connection"] = await c.get_firmware_connection()
-        except Exception as e:
-            result["connection_error"] = str(e)
+        # core/firmware/connection is left out on purpose: it is a POST that runs a
+        # connectivity test against the mirror. getFirmwareStatus() reports the result
+        # of the last check ("connection", "repository").
         return _R(result)
     except Exception as e:
         return _R({"error": str(e)})
@@ -1323,7 +1590,7 @@ async def getPackageInfo(package_name: str, include_license: bool = False,
                          changelog_version: Optional[str] = None) -> str:
     """Get details for a specific package, optionally with license and changelog.
     [YES] "Package os-theme-rebellion info", "package license", "changelog for 24.7".
-    [NO] "All packages" -> use getFirmwareInfo().
+    [NO] "All packages" -> use getPackages() / getPlugins().
 
     Args:
         package_name: Package name (e.g., os-theme-rebellion, os-haproxy).
@@ -1350,30 +1617,44 @@ async def getPackageInfo(package_name: str, include_license: bool = False,
 
 # Tool 12: getDhcpLeases
 @mcp.tool()
-async def getDhcpLeases(search: Optional[str] = None) -> str:
-    """Get DHCP leases, optionally filtered by search phrase.
-    [YES] "DHCP租約", "show leases", "find lease for 192.168.1.100", "MAC lease".
-    [NO] "DHCP settings" -> use getDhcpSettings().
+async def getDhcpLeases(search: Optional[str] = None, interface: Optional[str] = None) -> str:
+    """DHCP leases from whichever DHCP server the firewall runs (Kea, Dnsmasq or ISC).
+    [YES] "DHCP租約", "show leases", "find lease for 192.168.1.100", "MAC lease", "誰拿了這個 IP".
+    [NO] "DHCP settings / pool / reservations" -> use getDhcpSettings().
+
+    OPNsense 24.x+ ships Kea and Dnsmasq; ISC DHCP is a plugin from 26.1. All three
+    are queried and merged; `server` says where each lease came from.
 
     Args:
-        search: Filter by IP, MAC, or hostname (partial match)."""
+        search: Filter by IP, MAC, hostname or vendor (partial match).
+        interface: Only this interface (e.g. lan, LAN, igb0)."""
     try:
         c = await _ensure_client()
-        all_leases = []
-        current_page = 1
-        while True:
-            result = await c.search_dhcp_leases(
-                search_phrase=search or "", current=current_page, row_count=100
-            )
-            if 'rows' in result and result['rows']:
-                all_leases.extend(result['rows'])
-                total = result.get('total', 0)
-                if (total > 0 and len(all_leases) >= total) or len(result['rows']) < 100:
-                    break
-                current_page += 1
-            else:
-                break
-        return _R({"data": all_leases, "count": len(all_leases)})
+        leases, servers, errors = [], {}, {}
+        results = await asyncio.gather(*(c.fetch_all_rows(path) for _, path in DHCP_LEASE_ENDPOINTS),
+                                       return_exceptions=True)
+        for (server, _), rows in zip(DHCP_LEASE_ENDPOINTS, results):
+            if isinstance(rows, Exception):
+                if "404" not in str(rows):
+                    errors[server] = str(rows)[:200]
+                continue
+            servers[server] = len(rows)
+            leases.extend(_normalize_lease(server, r) for r in rows)
+        if interface:
+            w = interface.lower()
+            leases = [l for l in leases if w in (str(l.get("interface", "")).lower(), str(l.get("interface_name", "")).lower(),
+                                                 str(l.get("device", "")).lower())]
+        if search:
+            s = search.lower()
+            leases = [l for l in leases if any(s in str(v).lower() for v in
+                                               (l.get("ip"), l.get("mac"), l.get("hostname"), l.get("vendor")))]
+        leases.sort(key=lambda l: tuple(int(x) if x.isdigit() else 0 for x in str(l.get("ip", "")).split(".")))
+        out = {"servers": servers, "data": leases, "count": len(leases)}
+        if errors:
+            out["errors"] = errors
+        if not servers:
+            out["note"] = "No DHCP lease endpoint answered; check that the API user has DHCP privileges."
+        return _R(out)
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1381,87 +1662,136 @@ async def getDhcpLeases(search: Optional[str] = None) -> str:
 # Tool 13: getDhcpSettings
 @mcp.tool()
 async def getDhcpSettings(interface: Optional[str] = None) -> str:
-    """Get DHCP service status and settings, optionally for a specific interface.
-    [YES] "DHCP設定", "DHCP service status", "DHCP config for lan".
-    [NO] "DHCP leases" -> use getDhcpLeases().
+    """Which DHCP server is active and how it is set up: interfaces, subnets, pools,
+    DNS/router options handed out, and static reservations.
+    [YES] "DHCP設定", "DHCP pool", "DHCP 範圍", "static mapping", "固定 IP 保留", "DHCP 發的 DNS".
+    [NO] "Current leases" -> use getDhcpLeases().
 
     Args:
-        interface: Specific interface (e.g., lan, opt1). None=global settings."""
+        interface: Only subnets/reservations on this interface (e.g. lan). None = all."""
     try:
         c = await _ensure_client()
-        result = {}
+        out: Dict[str, Any] = {}
+        services = await c.get_all_services()
+        out["services"] = [{"id": s.get("id"), "description": s.get("description"), "running": bool(s.get("running"))}
+                           for s in services if any(k in str(s.get("id", "")).lower() for k in ("kea", "dhcpd", "dnsmasq"))]
+
+        # Kea
         try:
-            result["service_status"] = await c.get_dhcp_service_status()
-        except Exception as e:
-            result["service_status_error"] = str(e)
+            kea = (await c._request("GET", "/api/kea/dhcpv4/get")).get("dhcpv4", {})
+            gen = kea.get("general", {})
+            if _truthy(gen.get("enabled")):
+                subnets = (await c._request("GET", "/api/kea/dhcpv4/search_subnet")).get("rows", [])
+                res = await c.fetch_all_rows("/api/kea/dhcpv4/search_reservation")
+                kea_out = {
+                    "enabled": True,
+                    "interfaces": [k for k, v in (gen.get("interfaces") or {}).items()
+                                   if isinstance(v, dict) and _truthy(v.get("selected"))],
+                    "valid_lifetime": gen.get("valid_lifetime"),
+                    "subnets": [{
+                        "subnet": s.get("subnet"), "pools": s.get("pools"),
+                        "routers": s.get("option_data.routers"),
+                        "dns_servers": s.get("option_data.domain_name_servers"),
+                        "domain_name": s.get("option_data.domain_name"),
+                        "ntp_servers": s.get("option_data.ntp_servers"),
+                        "description": s.get("description"),
+                    } for s in subnets],
+                    "reservations": [{
+                        "ip": r.get("ip_address"), "mac": r.get("hw_address"), "hostname": r.get("hostname"),
+                        "subnet": r.get("%subnet") or r.get("subnet"), "description": r.get("description"),
+                    } for r in res],
+                }
+                out["kea_dhcpv4"] = kea_out
+        except Exception as exc:
+            if "404" not in str(exc):
+                out["kea_error"] = str(exc)[:200]
+
+        # Dnsmasq
         try:
-            result["settings"] = await c.get_dhcp_settings()
-        except Exception as e:
-            result["settings_error"] = str(e)
+            dm = (await c._request("GET", "/api/dnsmasq/settings/get")).get("dnsmasq", {})
+            if _truthy(dm.get("enable")):
+                ranges = await c.fetch_all_rows("/api/dnsmasq/settings/search_range")
+                hosts = await c.fetch_all_rows("/api/dnsmasq/settings/search_host")
+                out["dnsmasq"] = {
+                    "enabled": True,
+                    "interfaces": [k for k, v in (dm.get("interface") or {}).items()
+                                   if isinstance(v, dict) and _truthy(v.get("selected"))],
+                    "ranges": [{k: r.get(k) for k in ("interface", "start_addr", "end_addr", "lease_time", "domain", "description")
+                                if r.get(k)} for r in ranges],
+                    "hosts": [{k: h.get(k) for k in ("host", "domain", "ip", "hwaddr", "description") if h.get(k)}
+                              for h in hosts],
+                }
+        except Exception as exc:
+            if "404" not in str(exc):
+                out["dnsmasq_error"] = str(exc)[:200]
+
+        # ISC (plugin from 26.1; core before)
+        try:
+            isc = await c._request("GET", "/api/dhcpv4/service/status")
+            if isc.get("status") not in (None, "disabled", "unknown"):
+                out["isc_dhcpv4"] = {"status": isc.get("status"),
+                                     "note": "ISC DHCP settings are not exposed by the API; see downloadConfigXml(section=\"dhcpd\")."}
+        except Exception:
+            pass
+
         if interface:
-            try:
-                result["interface_settings"] = await c.get_dhcp_interface_settings(interface)
-                result["interface"] = interface
-            except Exception as e:
-                result["interface_settings_error"] = str(e)
-        return _R(result)
+            w = interface.lower()
+            if "kea_dhcpv4" in out and w not in out["kea_dhcpv4"]["interfaces"]:
+                out["kea_dhcpv4"]["note"] = f"Kea is not serving {interface}."
+            if "dnsmasq" in out:
+                out["dnsmasq"]["ranges"] = [r for r in out["dnsmasq"]["ranges"] if str(r.get("interface", "")).lower() == w]
+
+        active = [k for k in ("kea_dhcpv4", "dnsmasq", "isc_dhcpv4") if k in out]
+        out["active_servers"] = active
+        if not active:
+            out["note"] = "No DHCP server is enabled on this firewall (addresses may be handed out elsewhere)."
+        return _R(out)
     except Exception as e:
         return _R({"error": str(e)})
 
 
 # Tool 14: getInterfaces
 @mcp.tool()
-async def getInterfaces(interface: Optional[str] = None,
+async def getInterfaces(interface: Optional[str] = None, include_unassigned: bool = False,
                         include_stats: bool = False) -> str:
-    """Get network interfaces from config.xml and API, optionally with statistics.
-    [YES] "網路介面", "show interfaces", "WAN interface config", "interface stats".
+    """Network interfaces: name, device, link status, speed/duplex, IPv4/IPv6, gateway, MTU, MAC.
+    [YES] "網路介面", "show interfaces", "WAN IP", "WAN interface", "link speed", "介面是不是 up",
+          "網卡速度", "interface stats", "errors/drops".
     [NO] "ARP/NDP table" -> use getNetworkNeighbors().
+    [NO] "Gateway up/down, latency" -> use getGateways().
+
+    `media` shows the negotiated speed: a gigabit port that reports 100baseTX usually
+    means a bad cable or a 100M switch port.
 
     Args:
-        interface: Specific interface name (e.g., wan, lan). None=all interfaces.
-        include_stats: Include interface traffic statistics."""
+        interface: One interface by name (wan, lan, opt1), description (WAN2) or device (igb0, pppoe0).
+        include_unassigned: Also list NIC ports not assigned to any interface.
+        include_stats: Add packet/byte/error counters."""
     try:
         c = await _ensure_client()
-        result = {}
-
+        rows = await c.fetch_all_rows("/api/interfaces/overview/interfacesInfo")
+        ifaces = [_normalize_interface(r) for r in rows]
         if interface:
+            w = interface.lower()
+            ifaces = [i for i in ifaces if w in (str(i.get("name", "")).lower(), str(i.get("description", "")).lower(),
+                                                 str(i.get("device", "")).lower())]
+        elif not include_unassigned:
+            ifaces = [i for i in ifaces if i.get("name")]
+        if include_stats and ifaces:
             try:
-                result["config"] = await c.get_interface_config(interface)
-            except Exception as e:
-                result["config_error"] = str(e)
-        else:
-            # API interfaces
-            try:
-                overview = await c.get_interface_overview()
-                if 'data' in overview and isinstance(overview['data'], dict):
-                    ifaces = []
-                    for key, value in overview['data'].items():
-                        if isinstance(value, dict):
-                            iface = value.copy()
-                            iface['name'] = key
-                            ifaces.append(iface)
-                        else:
-                            ifaces.append({"name": key, "data": value})
-                    result["api_interfaces"] = ifaces
-                else:
-                    result["api_interfaces"] = overview.get('data', [])
-            except Exception as e:
-                result["api_error"] = str(e)
-
-            # Config.xml interfaces
-            try:
-                root = await c.download_config_xml()
-                result["config_interfaces"] = c._parse_interfaces_from_xml(root)
-            except Exception as e:
-                result["config_error"] = str(e)
-
-        if include_stats:
-            try:
-                result["statistics"] = await c.get_interface_statistics()
-            except Exception as e:
-                result["statistics_error"] = str(e)
-
-        return _R(result)
+                stats = await c.get_interface_statistics()
+                stats = stats.get("statistics", stats) if isinstance(stats, dict) else {}
+                for i in ifaces:
+                    for key, val in stats.items():
+                        if isinstance(val, dict) and (val.get("name") == i.get("device") or key.endswith(f"({i.get('device')})")
+                                                      or key == i.get("device")):
+                            i["stats"] = {k: val.get(k) for k in (
+                                "received-packets", "sent-packets", "received-bytes", "sent-bytes",
+                                "received-errors", "send-errors", "dropped-packets", "collisions") if k in val}
+                            break
+            except Exception as exc:
+                return _R({"data": ifaces, "count": len(ifaces), "stats_error": str(exc)})
+        return _R({"data": ifaces, "count": len(ifaces)})
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1495,14 +1825,42 @@ async def getNetworkNeighbors(protocol: str = "all") -> str:
 
 # Tool 16: getRoutes
 @mcp.tool()
-async def getRoutes() -> str:
-    """Get routing table.
-    [YES] "路由表", "routing table", "show routes", "default gateway".
-    [NO] "ARP table" -> use getNetworkNeighbors()."""
+async def getRoutes(search: Optional[str] = None, proto: str = "all", include_static_config: bool = True) -> str:
+    """Routing table actually in use (kernel routes), plus configured static routes.
+    [YES] "路由表", "routing table", "show routes", "default route", "how is 10.0.0.0/8 routed".
+    [NO] "ARP table" -> use getNetworkNeighbors().
+    [NO] "Gateway status/latency" -> use getGateways().
+
+    Args:
+        search: Filter by destination, gateway or interface (partial match).
+        proto: "ipv4", "ipv6" or "all".
+        include_static_config: Also return the static routes configured under System > Routes."""
     try:
         c = await _ensure_client()
-        result = await c.get_routes()
-        return _R(result)
+        out: Dict[str, Any] = {}
+        table = await c._request("GET", "/api/diagnostics/interface/getRoutes")
+        rows = table if isinstance(table, list) else table.get("rows", [])
+        routes = [{
+            "proto": r.get("proto"), "destination": r.get("destination"), "gateway": r.get("gateway"),
+            "flags": r.get("flags"), "interface": r.get("netif"), "interface_label": r.get("intf_description"),
+            "mtu": r.get("mtu"),
+        } for r in rows]
+        if proto in ("ipv4", "ipv6"):
+            routes = [r for r in routes if r["proto"] == proto]
+        if search:
+            s = search.lower()
+            routes = [r for r in routes if any(s in str(r.get(k, "")).lower()
+                                               for k in ("destination", "gateway", "interface", "interface_label"))]
+        out["routes"] = routes
+        out["count"] = len(routes)
+        if include_static_config:
+            try:
+                static = await c.get_routes()
+                out["static_routes"] = [{k: r.get(k) for k in ("network", "gateway", "descr", "disabled") if k in r}
+                                        for r in static.get("rows", [])]
+            except Exception as exc:
+                out["static_routes_error"] = str(exc)[:200]
+        return _R(out)
     except Exception as e:
         return _R({"error": str(e)})
 
@@ -1636,17 +1994,8 @@ async def downloadConfigXml(section: Optional[str] = None,
                 "timezone": txt(sys_node.find("timezone")),
             }
 
-        try:
-            fw_info = await c.get_firmware_info()
-            sys_info["product_version"] = fw_info.get("product_version", "")
-            sys_info["product_name"] = fw_info.get("product_id", "OPNsense")
-            product = fw_info.get("product", {})
-            if not sys_info["product_version"] and product:
-                sys_info["product_version"] = product.get("product_version", "")
-            if product.get("product_name"):
-                sys_info["product_name"] = product["product_name"]
-        except Exception:
-            pass
+        # OPNsense version (config.xml doesn't have it)
+        sys_info.update(await c.get_product_version())
 
         counts = {
             # config.xml-only counts. On 26.1 filter/rule is empty (rules live in the
@@ -1780,6 +2129,376 @@ async def getPackages(status: str = "installed", search: Optional[str] = None) -
 
 
 # ───────────────────────── Main Entry Point ─────────────────────────
+
+# Tool 22: getSystemHealth
+@mcp.tool()
+async def getSystemHealth() -> str:
+    """Firewall health at a glance: version, uptime, load, memory, swap, disk, CPU
+    temperature, state table usage, and system notices (crash reports, pending reboot...).
+    [YES] "系統狀態", "健康狀態", "uptime", "開機多久", "CPU 溫度", "記憶體", "磁碟空間",
+          "load", "state table full?", "系統告警", "crash report".
+    [NO] "Firmware updates" -> use getFirmwareStatus().
+    [NO] "Interface errors / link speed" -> use getInterfaces(include_stats=True)."""
+    try:
+        c = await _ensure_client()
+        endpoints = {
+            "info": "/api/diagnostics/system/system_information",
+            "time": "/api/diagnostics/system/system_time",
+            "resources": "/api/diagnostics/system/systemResources",
+            "swap": "/api/diagnostics/system/system_swap",
+            "disk": "/api/diagnostics/system/systemDisk",
+            "temperature": "/api/diagnostics/system/system_temperature",
+            "states": "/api/diagnostics/firewall/pf_states",
+            "notices": "/api/core/system/status",
+        }
+        got = dict(zip(endpoints, await asyncio.gather(
+            *(c._request("GET", ep, use_cache=False) for ep in endpoints.values()), return_exceptions=True)))
+        out: Dict[str, Any] = {}
+        errors = {k: str(v)[:150] for k, v in got.items() if isinstance(v, Exception)}
+        ok = {k: v for k, v in got.items() if not isinstance(v, Exception)}
+
+        if "info" in ok:
+            out["hostname"] = ok["info"].get("name")
+            out["versions"] = ok["info"].get("versions")
+        if "time" in ok:
+            t = ok["time"]
+            out.update({"uptime": t.get("uptime"), "boot_time": t.get("boottime"),
+                        "load_average": t.get("loadavg"), "last_config_change": t.get("config")})
+        if "resources" in ok:
+            mem = ok["resources"].get("memory", {})
+            try:
+                total, used = int(mem.get("total", 0)), int(mem.get("used", 0))
+                out["memory"] = {"total_mb": total // 1048576, "used_mb": used // 1048576,
+                                 "used_pct": round(used * 100 / total, 1) if total else None,
+                                 "zfs_arc_mb": int(mem.get("arc", 0)) // 1048576 if mem.get("arc") else None}
+            except (TypeError, ValueError):
+                out["memory"] = mem
+        if "swap" in ok:
+            out["swap"] = [{"device": s_.get("device"), "total_mb": int(s_.get("total", 0)) // 1024,
+                            "used_mb": int(s_.get("used", 0)) // 1024} for s_ in ok["swap"].get("swap", [])]
+        if "disk" in ok:
+            out["disk"] = [{k: d.get(k) for k in ("mountpoint", "type", "blocks", "used", "available", "used_pct")}
+                           for d in ok["disk"].get("devices", [])
+                           if d.get("mountpoint") in ("/", "/var/log", "/tmp", "/var") or (d.get("used_pct") or 0) >= 80]
+        if "temperature" in ok:
+            temps = [float(x["temperature"]) for x in ok["temperature"] if str(x.get("temperature", "")).replace(".", "", 1).isdigit()]
+            if temps:
+                out["temperature_c"] = {"max": max(temps), "avg": round(sum(temps) / len(temps), 1), "sensors": len(temps)}
+        if "states" in ok:
+            try:
+                cur, lim = int(ok["states"].get("current", 0)), int(ok["states"].get("limit", 0))
+                out["state_table"] = {"current": cur, "limit": lim, "used_pct": round(cur * 100 / lim, 2) if lim else None}
+            except (TypeError, ValueError):
+                out["state_table"] = ok["states"]
+        if "notices" in ok:
+            subs = ok["notices"].get("subsystems", {})
+            out["notices"] = [{"subsystem": k, "status": v.get("status"), "message": v.get("message"), "age": v.get("age")}
+                              for k, v in (subs.items() if isinstance(subs, dict) else [])
+                              if isinstance(v, dict) and v.get("status") not in ("OK", None)]
+        if errors:
+            out["errors"] = errors
+        return _R(out)
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Tool 23: getFirewallLog
+@mcp.tool()
+async def getFirewallLog(action: Optional[str] = None, interface: Optional[str] = None,
+                         ip: Optional[str] = None, port: Optional[str] = None,
+                         search: Optional[str] = None, limit: int = 50) -> str:
+    """Recent firewall log entries (newest first): which packets were blocked or passed, and by which rule.
+    [YES] "防火牆日誌", "firewall log", "為什麼被擋", "why is X blocked", "blocked traffic from IP",
+          "誰在掃我的 port", "live log".
+    [NO] "Rule list" -> use getFirewallRules().
+    [NO] "Current connections" -> use getFirewallStates().
+
+    Only rules with logging enabled (and the default deny rule) appear in the log.
+
+    Args:
+        action: pass, block or rdr. None = all.
+        interface: Interface name or label (wan, LAN, WAN2, pppoe0 ...).
+        ip: Source or destination IP.
+        port: Source or destination port.
+        search: Text in the rule label/description.
+        limit: Max entries returned (default 50, max 500). Up to 2000 recent lines are scanned."""
+    try:
+        c = await _ensure_client()
+        scan = 2000 if any((action, interface, ip, port, search)) else max(1, min(limit, 500))
+        rows = await c._request("GET", "/api/diagnostics/firewall/log", params={"limit": scan}, use_cache=False)
+        rows = rows if isinstance(rows, list) else rows.get("rows", [])
+        # The log records the device (pppoe0, igb2); accept wan / WAN2 / opt1 as well.
+        devices, labels = set(), {}
+        try:
+            for i in await c.fetch_all_rows("/api/interfaces/overview/interfacesInfo"):
+                if i.get("device"):
+                    labels[i["device"]] = i.get("description") or i.get("identifier")
+                    if interface and interface.lower() in (str(i.get("identifier", "")).lower(),
+                                                           str(i.get("description", "")).lower(),
+                                                           str(i.get("device", "")).lower()):
+                        devices.add(i["device"])
+        except Exception:
+            pass
+        if interface and not devices:
+            devices.add(interface)
+        out = []
+        for r in rows:
+            if action and r.get("action") != action.lower():
+                continue
+            if interface and r.get("interface") not in devices:
+                continue
+            if ip and ip not in (r.get("src"), r.get("dst")):
+                continue
+            if port and str(port) not in (str(r.get("srcport")), str(r.get("dstport"))):
+                continue
+            if search and search.lower() not in str(r.get("label", "")).lower():
+                continue
+            out.append({k: r.get(k) for k in ("__timestamp__", "action", "interface_name", "interface", "dir",
+                                              "protoname", "src", "srcport", "dst", "dstport", "label", "rid", "tcpflags")
+                        if r.get(k) not in (None, "")})
+            if len(out) >= min(limit, 500):
+                break
+        rule_names = {}
+        if out:
+            try:
+                rules, _ = await _fetch_firewall_rules()
+                rule_names = {r.get("uuid"): r.get("description") or r.get("source") for r in rules}
+            except Exception:
+                pass
+        for e in out:
+            e["time"] = e.pop("__timestamp__", None)
+            if not e.get("label") and rule_names.get(e.get("rid")):
+                e["rule"] = rule_names[e["rid"]]
+            if e.get("interface") in labels:
+                e["interface_label"] = labels[e["interface"]]
+        return _R({"scanned": len(rows), "data": out, "count": len(out)})
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Tool 24: getFirewallStates
+@mcp.tool()
+async def getFirewallStates(search: Optional[str] = None, limit: int = 50) -> str:
+    """Current connections in the firewall state table (who talks to whom, via which rule, how much traffic).
+    [YES] "目前連線", "state table", "active connections", "誰連到外面", "192.168.1.50 有哪些連線",
+          "連線數", "top connections".
+    [NO] "Past blocked traffic" -> use getFirewallLog().
+    [NO] "State table size only" -> use getSystemHealth().
+
+    Args:
+        search: IP, port or rule description to filter by (strongly recommended - a busy
+            firewall has thousands of states).
+        limit: Max states returned (default 50, max 500)."""
+    try:
+        c = await _ensure_client()
+        limit = max(1, min(limit, 500))
+        res = await c._request("POST", "/api/diagnostics/firewall/query_states", use_cache=False,
+                               data={"current": 1, "rowCount": limit, "searchPhrase": search or "", "sort": {}})
+        rows = res.get("rows", []) if isinstance(res, dict) else []
+        data = [{
+            "proto": r.get("proto"), "src": f"{r.get('src_addr')}:{r.get('src_port')}",
+            "dst": f"{r.get('dst_addr')}:{r.get('dst_port')}",
+            "nat": f"{r.get('nat_addr')}:{r.get('nat_port')}" if r.get("nat_addr") else None,
+            "state": r.get("state"), "direction": r.get("direction"), "age": r.get("age"),
+            "packets": sum(r.get("pkts") or []) if isinstance(r.get("pkts"), list) else r.get("pkts"),
+            "bytes": sum(r.get("bytes") or []) if isinstance(r.get("bytes"), list) else r.get("bytes"),
+            "rule": r.get("descr"), "gateway": r.get("gateway"),
+        } for r in rows]
+        data = [{k: v for k, v in d.items() if v not in (None, "")} for d in data]
+        return _R({"total_matching": res.get("total", len(rows)), "data": data, "count": len(data)})
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Log scopes that may be read. Exactly two path segments: diagnostics/log/<module>/<scope>
+# also has a "clear" action that wipes the log, so the path is never built from free text.
+_LOG_SCOPES = ("system", "audit", "filter", "gateways", "routing", "resolver", "kea", "dnsmasq",
+               "dhcpd", "wireguard", "openvpn", "ipsec", "suricata", "ntpd", "pkg", "configd",
+               "lighttpd", "portalauth", "monit", "boot", "dhcrelay", "hostwatch")
+_SEVERITIES = ("Emergency", "Alert", "Critical", "Error", "Warning", "Notice", "Informational", "Debug")
+
+
+# Tool 25: getSystemLog
+@mcp.tool()
+async def getSystemLog(log: str = "system", search: Optional[str] = None,
+                       min_severity: Optional[str] = None, limit: int = 50) -> str:
+    """Read an OPNsense log (newest first).
+    [YES] "系統日誌", "system log", "audit log", "誰登入過", "login failures", "設定變更紀錄",
+          "DHCP log", "WireGuard log", "Suricata log", "gateway log", "DNS log".
+    [NO] "Firewall packet log" -> use getFirewallLog().
+    [NO] "IDS alerts" -> use getIdsAlerts().
+
+    Args:
+        log: One of system, audit (logins, API calls, config changes), gateways, routing,
+            resolver, kea, dnsmasq, dhcpd, wireguard, openvpn, ipsec, suricata, ntpd, pkg,
+            configd, lighttpd, portalauth, monit, boot, dhcrelay, hostwatch.
+        search: Text to search for.
+        min_severity: Only this severity and worse: Emergency, Alert, Critical, Error,
+            Warning, Notice, Informational, Debug.
+        limit: Max lines (default 50, max 500)."""
+    try:
+        scope = (log or "").strip().lower()
+        if scope not in _LOG_SCOPES:
+            return _R({"error": f"Unknown log '{log}'.", "available": list(_LOG_SCOPES)})
+        body: Dict[str, Any] = {"current": 1, "rowCount": max(1, min(limit, 500)), "searchPhrase": search or ""}
+        if min_severity:
+            sev = min_severity.strip().capitalize()
+            if sev not in _SEVERITIES:
+                return _R({"error": f"Unknown severity '{min_severity}'.", "available": list(_SEVERITIES)})
+            body["severity"] = ",".join(_SEVERITIES[:_SEVERITIES.index(sev) + 1])
+        c = await _ensure_client()
+        res = await c._request("POST", f"/api/diagnostics/log/core/{scope}", data=body, use_cache=False)
+        rows = [{"time": r.get("timestamp"), "severity": r.get("severity"), "process": r.get("process_name"),
+                 "message": (r.get("line") or "").strip()} for r in res.get("rows", [])]
+        return _R({"log": scope, "total_matching": res.get("total_rows", res.get("total")), "data": rows, "count": len(rows)})
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Tool 26: getVpnStatus
+@mcp.tool()
+async def getVpnStatus(vpn_type: str = "all") -> str:
+    """VPN tunnel status: WireGuard peers (last handshake, traffic), OpenVPN connected
+    clients, IPsec phase 1/2 SAs.
+    [YES] "VPN 狀態", "tunnel up?", "WireGuard 有沒有連上", "last handshake", "誰連上 VPN",
+          "OpenVPN clients", "IPsec SA", "site-to-site".
+    [NO] "VPN logs" -> use getSystemLog(log="wireguard"/"openvpn"/"ipsec").
+
+    Args:
+        vpn_type: wireguard, openvpn, ipsec or all."""
+    try:
+        c = await _ensure_client()
+        want = vpn_type.lower()
+        out: Dict[str, Any] = {}
+
+        async def fetch(path):
+            try:
+                return await c._request("GET", path, use_cache=False)
+            except Exception as exc:
+                return exc
+
+        if want in ("all", "wireguard"):
+            wg = await fetch("/api/wireguard/service/show")
+            if isinstance(wg, Exception):
+                if "404" not in str(wg):
+                    out["wireguard_error"] = str(wg)[:150]
+            else:
+                rows = wg.get("rows", [])
+                ifaces = {r.get("if"): r for r in rows if r.get("type") == "interface"}
+                peers = []
+                for r in rows:
+                    if r.get("type") != "peer":
+                        continue
+                    peers.append({k: v for k, v in {
+                        "interface": r.get("if"), "instance": ifaces.get(r.get("if"), {}).get("name"),
+                        "peer": r.get("name"), "endpoint": r.get("endpoint"), "allowed_ips": r.get("allowed-ips"),
+                        "status": r.get("peer-status"), "latest_handshake_age_s": r.get("latest-handshake-age"),
+                        "latest_handshake": _epoch_iso(r.get("latest-handshake-epoch")),
+                        "rx_bytes": r.get("transfer-rx"), "tx_bytes": r.get("transfer-tx"),
+                    }.items() if v not in (None, "")})
+                out["wireguard"] = {"instances": [{"interface": k, "name": v.get("name"), "status": v.get("status"),
+                                                   "listen_port": v.get("listen-port")} for k, v in ifaces.items()],
+                                    "peers": peers}
+        if want in ("all", "openvpn"):
+            ov = await fetch("/api/openvpn/service/search_sessions")
+            if isinstance(ov, Exception):
+                if "404" not in str(ov):
+                    out["openvpn_error"] = str(ov)[:150]
+            else:
+                out["openvpn_sessions"] = [{k: r.get(k) for k in (
+                    "description", "type", "common_name", "real_address", "virtual_address", "connected_since",
+                    "bytes_received", "bytes_sent", "status") if r.get(k) not in (None, "")} for r in ov.get("rows", [])]
+        if want in ("all", "ipsec"):
+            p1 = await fetch("/api/ipsec/sessions/search_phase1")
+            if isinstance(p1, Exception):
+                if "404" not in str(p1):
+                    out["ipsec_error"] = str(p1)[:150]
+            else:
+                p2 = await fetch("/api/ipsec/sessions/search_phase2")
+                out["ipsec"] = {"phase1": [{k: r.get(k) for k in (
+                    "name", "phase1desc", "local-addrs", "remote-addrs", "connected", "install-time", "state")
+                    if r.get(k) not in (None, "")} for r in p1.get("rows", [])],
+                    "phase2_count": len(p2.get("rows", [])) if isinstance(p2, dict) else None}
+        return _R(out)
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Tool 27: getIdsAlerts
+@mcp.tool()
+async def getIdsAlerts(search: Optional[str] = None, limit: int = 50) -> str:
+    """Suricata IDS/IPS alerts (newest first): signature, source/destination, action taken.
+    [YES] "IDS 告警", "Suricata alerts", "入侵偵測", "intrusion alerts", "was this IP flagged",
+          "被 IPS 擋下的".
+    [NO] "Firewall rule blocks" -> use getFirewallLog().
+
+    Args:
+        search: IP, signature text or SID to filter by.
+        limit: Max alerts (default 50, max 500)."""
+    try:
+        c = await _ensure_client()
+        status = None
+        try:
+            status = (await c._request("GET", "/api/ids/service/status", use_cache=False)).get("status")
+        except Exception:
+            pass
+        res = await c._request("POST", "/api/ids/service/query_alerts", use_cache=False,
+                               data={"current": 1, "rowCount": max(1, min(limit, 500)),
+                                     "searchPhrase": search or "", "fileid": ""})
+        data = [{k: v for k, v in {
+            "time": r.get("timestamp"), "signature": r.get("alert"), "sid": r.get("alert_sid"),
+            "action": r.get("alert_action"), "src": f"{r.get('src_ip')}:{r.get('src_port')}",
+            "dst": f"{r.get('dest_ip')}:{r.get('dest_port')}", "proto": r.get("proto"),
+            "app_proto": r.get("app_proto"), "interface": r.get("in_iface"),
+        }.items() if v not in (None, "")} for r in res.get("rows", [])]
+        return _R({"ids_status": status, "total_matching": res.get("total"), "data": data, "count": len(data)})
+    except Exception as e:
+        return _R({"error": str(e)})
+
+
+# Tool 28: getCertificates
+@mcp.tool()
+async def getCertificates(expiring_within_days: Optional[int] = None, in_use_only: bool = False) -> str:
+    """Certificates in System > Trust with expiry dates and days left.
+    [YES] "憑證", "certificate expiry", "憑證到期", "SSL cert expired?", "Web GUI certificate",
+          "which certs expire soon".
+    [NO] "ACME / Let's Encrypt renewal log" -> use getSystemLog().
+
+    Private keys are never returned.
+
+    Args:
+        expiring_within_days: Only certificates that expire within this many days
+            (already expired ones included). None = all.
+        in_use_only: Only certificates OPNsense is using."""
+    try:
+        c = await _ensure_client()
+        rows = await c.fetch_all_rows("/api/trust/cert/search")
+        now = time.time()
+        certs = []
+        for r in rows:
+            # Copy only these fields: the search rows also carry prv / prv_payload (private keys).
+            try:
+                valid_to = int(r.get("valid_to") or 0)
+            except ValueError:
+                valid_to = 0
+            days_left = int((valid_to - now) // 86400) if valid_to else None
+            cert = {
+                "description": r.get("descr"), "common_name": r.get("commonname"), "subject": r.get("name"),
+                "type": r.get("%cert_type") or r.get("cert_type"), "in_use": _truthy(r.get("in_use")),
+                "valid_from": _epoch_iso(r.get("valid_from")), "valid_to": _epoch_iso(r.get("valid_to")),
+                "days_left": days_left, "expired": days_left is not None and days_left < 0,
+                "san_dns": r.get("altnames_dns") or None, "key": r.get("%key_type") or None,
+            }
+            certs.append({k: v for k, v in cert.items() if v is not None})
+        if in_use_only:
+            certs = [x for x in certs if x.get("in_use")]
+        if expiring_within_days is not None:
+            certs = [x for x in certs if x.get("days_left") is not None and x["days_left"] <= expiring_within_days]
+        certs.sort(key=lambda x: x.get("days_left", 1 << 30))
+        return _R({"data": certs, "count": len(certs)})
+    except Exception as e:
+        return _R({"error": str(e)})
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
