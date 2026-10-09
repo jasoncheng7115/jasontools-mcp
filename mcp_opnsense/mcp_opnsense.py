@@ -183,7 +183,7 @@ class Config:
             self.CACHE_TTL = args.cache_ttl if args.cache_ttl is not None else int(os.getenv("OPNSENSE_CACHE_TTL", "300"))
             self.MAX_RETRIES = args.max_retries if args.max_retries is not None else int(os.getenv("OPNSENSE_MAX_RETRIES", "3"))
         else:
-            self.HOST = os.getenv("OPNSENSE_HOST", "https://192.168.1.1")
+            self.HOST = os.getenv("OPNSENSE_HOST", "https://opnsense.example.com")
             self.API_KEY = os.getenv("OPNSENSE_API_KEY", "")
             self.API_SECRET = os.getenv("OPNSENSE_API_SECRET", "")
             self.VERIFY_SSL = os.getenv("OPNSENSE_VERIFY_SSL", "false").lower() in ("true", "1", "yes")
@@ -2507,16 +2507,16 @@ def parse_arguments():
         epilog="""
 Examples:
   # stdio mode (default):
-  python3 mcp_opnsense.py --host "https://192.168.1.1" --api-key KEY --api-secret SECRET
+  python3 mcp_opnsense.py --host "https://opnsense.example.com" --api-key KEY --api-secret SECRET
 
   # Streamable HTTP mode:
-  python3 mcp_opnsense.py --transport streamable-http --port 8000 --host "https://192.168.1.1" --api-key KEY --api-secret SECRET
+  python3 mcp_opnsense.py --transport streamable-http --port 8000 --host "https://opnsense.example.com" --api-key KEY --api-secret SECRET
 
   # SSE mode:
-  python3 mcp_opnsense.py --transport sse --port 8000 --host "https://192.168.1.1" --api-key KEY --api-secret SECRET
+  python3 mcp_opnsense.py --transport sse --port 8000 --host "https://opnsense.example.com" --api-key KEY --api-secret SECRET
         """
     )
-    parser.add_argument('--host', help='OPNsense base URL (e.g., https://192.168.1.1)')
+    parser.add_argument('--host', help='OPNsense base URL (e.g., https://opnsense.example.com)')
     parser.add_argument('--api-key', dest='api_key', help='OPNsense API key')
     parser.add_argument('--api-secret', dest='api_secret', help='OPNsense API secret')
     parser.add_argument('--verify-ssl', type=lambda x: x.lower() in ('true', '1', 'yes'),

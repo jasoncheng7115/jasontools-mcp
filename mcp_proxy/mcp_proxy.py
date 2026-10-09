@@ -19,6 +19,7 @@ Then set in Claude Desktop config for each MCP server:
 
 Author: Jason Cheng (jason@jason.tools)
 License: MIT
+Repository: https://github.com/jasoncheng7115/jasontools-mcp
 """
 
 import asyncio
@@ -432,8 +433,11 @@ async def handle_client(client_reader, client_writer, sse_command=None):
                     line = await client_reader.readline()
                     if line in (b'\r\n', b'\n', b''):
                         break
-                    # Skip proxy headers
-                    if not line.lower().startswith(b'proxy-'):
+                    # Skip proxy headers, and the client's Host: - one is written
+                    # below, and forwarding both makes the request have two Host
+                    # headers, which web servers reject with 400 Bad Request.
+                    low = line.lower()
+                    if not low.startswith(b'proxy-') and not low.startswith(b'host:'):
                         headers.append(line)
 
                 try:

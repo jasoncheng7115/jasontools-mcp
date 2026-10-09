@@ -49,7 +49,7 @@ Settings are resolved in this order: **CLI args > environment variables > defaul
 
 | Env var | CLI arg | Default | Description |
 |---|---|---|---|
-| `OPNSENSE_HOST` | `--host` | — (required) | Base URL, e.g. `https://192.168.1.1` |
+| `OPNSENSE_HOST` | `--host` | — (required) | Base URL, e.g. `https://opnsense.example.com` |
 | `OPNSENSE_API_KEY` | `--api-key` | — | OPNsense API key |
 | `OPNSENSE_API_SECRET` | `--api-secret` | — | OPNsense API secret |
 | `OPNSENSE_VERIFY_SSL` | `--verify-ssl` | `false` | Verify TLS certificate |
@@ -127,7 +127,7 @@ Expose the stdio server as an OpenAPI endpoint with [`mcpo`](https://github.com/
 
 ```bash
 uvx mcpo --port 8016 --api-key "YOUR_MCPO_KEY" -- \
-  env OPNSENSE_HOST=https://192.168.1.1 \
+  env OPNSENSE_HOST=https://opnsense.example.com \
       OPNSENSE_API_KEY=KEY \
       OPNSENSE_API_SECRET=SECRET \
       OPNSENSE_VERIFY_SSL=false \

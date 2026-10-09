@@ -46,9 +46,13 @@ systemextensionsctl list
 ```
 /path/to/mcp_proxy/
 ├── mcp_proxy.py          # 代理程式 + SSE Bridge
-├── start_proxy.command   # macOS 啟動腳本（點兩下執行）
+├── start_proxy.command   # macOS 啟動腳本（點兩下執行，前台）
+├── start_proxy_bg.sh     # 背景啟動腳本
 ├── README.md             # 本文件
 └── CHANGELOG.md          # 版本記錄
+
+~/Applications/
+└── MCP Proxy.app         # Login Items 用 AppleScript app（推薦）
 ```
 
 ### CLI 參數
@@ -163,6 +167,26 @@ curl http://127.0.0.1:28080/sse
 ## 開機自動啟動
 
 ### macOS
+
+> **重要**：不能使用 launchd（LaunchAgents），因為 Avast Network Extension 會阻擋 launchd 啟動的 process 的對外連線。必須透過 Login Items 在 user session context 啟動。
+
+**方法一：使用 MCP Proxy.app（推薦）**
+
+已預建 AppleScript app 包裝，會在 Terminal 視窗中啟動 proxy：
+
+```bash
+# 建立 app（已完成，位於 ~/Applications/MCP Proxy.app）
+osacompile -o ~/Applications/"MCP Proxy.app" -e '
+tell application "Terminal"
+	do script "pkill -f mcp_proxy.py 2>/dev/null; sleep 1; /usr/local/bin/python3 -u mcp_proxy.py"
+end tell
+'
+
+# 加入登入項目
+osascript -e 'tell application "System Events" to make login item at end with properties {path:"/Users/jasoncheng/Applications/MCP Proxy.app", hidden:true, name:"MCP Proxy"}'
+```
+
+**方法二：手動加入 Login Items**
 
 1. 打開 **系統設定** → **一般** → **登入項目**
 2. 點選 **+** 加入 `start_proxy.command`
@@ -284,12 +308,12 @@ Error: Port already in use
 
 ## 注意事項
 
-- 代理必須從**終端機手動啟動**，不能用 launchd
+- 代理必須從**終端機或 user session context** 啟動，**不能用 launchd**（Avast Network Extension 會阻擋 launchd process 的對外連線）
 - 代理需要保持執行，關閉終端機視窗會停止代理
-- 建議使用 `start_proxy.command` 並加入登入項目
+- 推薦使用 `MCP Proxy.app`（~/Applications/）加入 Login Items 自動啟動
 - SSE Bridge 的每個 `GET /sse` 連線會產生一個獨立的子程序，斷線時自動清理
 
 ---
 
 **作者**: Jason Cheng (jason@jason.tools)
-**最後更新**: 2026-02-26
+**最後更新**: 2026-03-09

@@ -3,9 +3,10 @@
 MCP Server for phpIPAM API – v2.5
 ===================================================
 Author: Jason Cheng (Jason Tools)
+License: MIT
+Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Created: 2025-06-28
 Modified: 2026-02-26
-License: MIT
 
 FastMCP-based phpIPAM integration with comprehensive IP management operations,
 advanced search, and network resource tracking.
@@ -23,7 +24,7 @@ Optimized for compatibility with smaller LLMs (e.g. gpt-oss:120b):
 - SSE/Streamable-HTTP: uvicorn direct run, DNS rebinding protection disabled
 - Optional API key auth via --api-key / MCP_API_KEY (Bearer token middleware)
 - Pure ASGI auth middleware (BaseHTTPMiddleware breaks SSE streaming)
-- Deployed: stdio via mcpo (:8007), SSE direct (:8012) on 192.168.1.40
+- Deployed: stdio via mcpo (:8007), SSE direct (:8012) on mcp-host.example.com
 """
 
 import argparse

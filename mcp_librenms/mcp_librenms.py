@@ -3093,13 +3093,13 @@ def parse_arguments():
         epilog="""
 Examples:
   # stdio mode (default):
-  python3 mcp_librenms.py --url "http://192.168.1.68" --token "your_token"
+  python3 mcp_librenms.py --url "http://librenms.example.com" --token "your_token"
 
   # Streamable HTTP mode:
-  python3 mcp_librenms.py --transport streamable-http --port 8000 --url "http://192.168.1.68" --token "your_token"
+  python3 mcp_librenms.py --transport streamable-http --port 8000 --url "http://librenms.example.com" --token "your_token"
 
   # SSE mode:
-  python3 mcp_librenms.py --transport sse --port 8000 --url "http://192.168.1.68" --token "your_token"
+  python3 mcp_librenms.py --transport sse --port 8000 --url "http://librenms.example.com" --token "your_token"
         """
     )
     parser.add_argument('--url', '--host', dest='url',

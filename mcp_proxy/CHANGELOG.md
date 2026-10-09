@@ -2,6 +2,25 @@
 
 All notable changes to MCP HTTP Proxy will be documented in this file.
 
+## [1.1.1] - 2026-03-09
+
+### Added
+
+- `start_proxy_bg.sh`：背景啟動腳本，搭配 Login Items 使用
+- `MCP Proxy.app`（~/Applications/）：AppleScript app 包裝，透過 Terminal 啟動 proxy
+
+### Fixed
+
+- **開機自動啟動**：改用 Login Items + AppleScript app 取代 launchd
+  - 發現 Avast Network Extension 會阻擋 launchd 啟動的 process 對外連線（`[Errno 65] No route to host`）
+  - 只有從 user terminal session 啟動的 process 才能正常連線
+  - launchd (LaunchAgents) 和 AppleScript `do shell script` 都無法繞過此限制
+  - 必須透過 Terminal.app 執行才算 "互動式" process
+
+### Changed
+
+- README.md 更新開機自動啟動章節，標註 launchd 不可用的原因
+
 ## [1.1.0] - 2026-02-26
 
 ### Added

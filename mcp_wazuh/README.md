@@ -41,8 +41,8 @@ pip install mcp requests urllib3 uvicorn
 
 ```bash
 python3 mcp_wazuh.py \
-  --manager-host 192.168.1.40 --manager-user wazuh  --manager-pass CHANGE_ME \
-  --indexer-host 192.168.1.40 --indexer-user admin  --indexer-pass CHANGE_ME
+  --manager-host mcp-host.example.com --manager-user wazuh  --manager-pass CHANGE_ME \
+  --indexer-host mcp-host.example.com --indexer-user admin  --indexer-pass CHANGE_ME
 ```
 
 ### SSE transport (Chatbox and similar legacy MCP clients)
@@ -50,8 +50,8 @@ python3 mcp_wazuh.py \
 ```bash
 python3 mcp_wazuh.py --transport sse --host 0.0.0.0 --port 8014 \
   --api-key YOUR_SECRET_KEY \
-  --manager-host 192.168.1.40 --manager-user wazuh --manager-pass CHANGE_ME \
-  --indexer-host 192.168.1.40 --indexer-user admin --indexer-pass CHANGE_ME
+  --manager-host mcp-host.example.com --manager-user wazuh --manager-pass CHANGE_ME \
+  --indexer-host mcp-host.example.com --indexer-user admin --indexer-pass CHANGE_ME
 ```
 
 Endpoint: `http://<host>:8014/sse`
@@ -61,8 +61,8 @@ Endpoint: `http://<host>:8014/sse`
 ```bash
 python3 mcp_wazuh.py --transport streamable-http --host 0.0.0.0 --port 8000 \
   --api-key YOUR_SECRET_KEY \
-  --manager-host 192.168.1.40 --manager-user wazuh --manager-pass CHANGE_ME \
-  --indexer-host 192.168.1.40 --indexer-user admin --indexer-pass CHANGE_ME
+  --manager-host mcp-host.example.com --manager-user wazuh --manager-pass CHANGE_ME \
+  --indexer-host mcp-host.example.com --indexer-user admin --indexer-pass CHANGE_ME
 ```
 
 Endpoint: `http://<host>:8000/mcp`
@@ -202,8 +202,8 @@ ExecStartPre=/usr/bin/fuser -k 8014/tcp
 ExecStart=/opt/mcp/venv/bin/python3 /opt/mcp/mcp_wazuh.py \
     --transport sse --host 0.0.0.0 --port 8014 \
     --api-key REDACTED \
-    --manager-host 192.168.1.40 --manager-user wazuh --manager-pass REDACTED \
-    --indexer-host 192.168.1.40 --indexer-user admin --indexer-pass REDACTED
+    --manager-host mcp-host.example.com --manager-user wazuh --manager-pass REDACTED \
+    --indexer-host mcp-host.example.com --indexer-user admin --indexer-pass REDACTED
 # Clean up after crash so next ExecStartPre does not see ghost children.
 ExecStopPost=/usr/bin/fuser -k 8014/tcp
 Restart=on-failure

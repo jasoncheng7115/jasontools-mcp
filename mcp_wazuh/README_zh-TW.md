@@ -38,8 +38,8 @@ pip install mcp requests urllib3 uvicorn
 
 ```bash
 python3 mcp_wazuh.py \
-  --manager-host 192.168.1.40 --manager-user wazuh  --manager-pass CHANGE_ME \
-  --indexer-host 192.168.1.40 --indexer-user admin  --indexer-pass CHANGE_ME
+  --manager-host mcp-host.example.com --manager-user wazuh  --manager-pass CHANGE_ME \
+  --indexer-host mcp-host.example.com --indexer-user admin  --indexer-pass CHANGE_ME
 ```
 
 ### SSE 模式 (Chatbox 等舊版 MCP client)
@@ -47,8 +47,8 @@ python3 mcp_wazuh.py \
 ```bash
 python3 mcp_wazuh.py --transport sse --host 0.0.0.0 --port 8014 \
   --api-key YOUR_SECRET_KEY \
-  --manager-host 192.168.1.40 --manager-user wazuh --manager-pass CHANGE_ME \
-  --indexer-host 192.168.1.40 --indexer-user admin --indexer-pass CHANGE_ME
+  --manager-host mcp-host.example.com --manager-user wazuh --manager-pass CHANGE_ME \
+  --indexer-host mcp-host.example.com --indexer-user admin --indexer-pass CHANGE_ME
 ```
 
 端點：`http://<host>:8014/sse`
@@ -58,8 +58,8 @@ python3 mcp_wazuh.py --transport sse --host 0.0.0.0 --port 8014 \
 ```bash
 python3 mcp_wazuh.py --transport streamable-http --host 0.0.0.0 --port 8000 \
   --api-key YOUR_SECRET_KEY \
-  --manager-host 192.168.1.40 --manager-user wazuh --manager-pass CHANGE_ME \
-  --indexer-host 192.168.1.40 --indexer-user admin --indexer-pass CHANGE_ME
+  --manager-host mcp-host.example.com --manager-user wazuh --manager-pass CHANGE_ME \
+  --indexer-host mcp-host.example.com --indexer-user admin --indexer-pass CHANGE_ME
 ```
 
 端點：`http://<host>:8000/mcp`
@@ -196,8 +196,8 @@ ExecStartPre=/usr/bin/fuser -k 8014/tcp
 ExecStart=/opt/mcp/venv/bin/python3 /opt/mcp/mcp_wazuh.py \
     --transport sse --host 0.0.0.0 --port 8014 \
     --api-key REDACTED \
-    --manager-host 192.168.1.40 --manager-user wazuh --manager-pass REDACTED \
-    --indexer-host 192.168.1.40 --indexer-user admin --indexer-pass REDACTED
+    --manager-host mcp-host.example.com --manager-user wazuh --manager-pass REDACTED \
+    --indexer-host mcp-host.example.com --indexer-user admin --indexer-pass REDACTED
 # 崩潰後再清一次，避免子 process 占 port
 ExecStopPost=/usr/bin/fuser -k 8014/tcp
 Restart=on-failure

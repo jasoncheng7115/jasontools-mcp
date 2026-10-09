@@ -2448,9 +2448,9 @@ def normalize_query_string(query: str, auto_fix_escaping: bool = False) -> str:
     4. Optionally auto-fixes unescaped special characters
     
     Examples:
-    - source:router\\-004.jason.tools -> source:router\-004.jason.tools (fix double escape)
-    - source:"router-004.jason.tools" -> unchanged (quoted strings don't need escaping)
-    - source:router\-004.jason.tools -> unchanged (correctly escaped)
+    - source:router\\-01.example.com -> source:router\-01.example.com (fix double escape)
+    - source:"router-01.example.com" -> unchanged (quoted strings don't need escaping)
+    - source:router\-01.example.com -> unchanged (correctly escaped)
     """
     original_query = query
     
@@ -3885,7 +3885,7 @@ async def main():
             print("  --api-key <key>     - API key for SSE/HTTP authentication")
             print()
             print("Example:")
-            print("  export GRAYLOG_HOST='http://192.168.1.127:9000'")
+            print("  export GRAYLOG_HOST='http://graylog.example.com:9000'")
             print("  export GRAYLOG_API_TOKEN='your_api_token_here'")
             print("  python3 mcp_graylog.py --test --debug")
             print()
@@ -3904,7 +3904,7 @@ async def main():
         # Validate required settings
         if not config['host']:
             print("Error: GRAYLOG_HOST environment variable or --host parameter is required", file=sys.stderr)
-            print("Example: GRAYLOG_HOST=http://192.168.1.127:9000", file=sys.stderr)
+            print("Example: GRAYLOG_HOST=http://graylog.example.com:9000", file=sys.stderr)
             sys.exit(1)
         
         # Check authentication
