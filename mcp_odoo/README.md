@@ -1,10 +1,10 @@
 # Odoo MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **16 read tools** for sales quotations, purchase orders, deliveries, products, stock, invoices and partners — with token-saving output controls tuned for small/local LLMs — plus **9 opt-in write tools** for creating and editing quotations (`--enable-write`).
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **18 read tools** for sales quotations, sales analysis, purchase orders, deliveries, products, stock, invoices, partners and chatter history — with token-saving output controls tuned for small/local LLMs — plus **13 opt-in write tools** for quotations and customers (`--enable-write`).
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.10.0
+- **Version:** 1.11.0
 - **Tested:** Odoo 13 and 18 Community Edition (write tools: Odoo 18)
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
@@ -70,13 +70,20 @@ The **Odoo connection is configured via environment variables**; transport/auth 
 | — | `--host` / `-H` | `127.0.0.1` | HTTP bind address |
 | — | `--port` / `-p` | `8001` | HTTP port |
 | `MCP_API_KEY` | `--api-key` / `-k` | — | Bearer token to protect the HTTP/SSE endpoint |
-| `ODOO_ENABLE_WRITE` | `--enable-write` | off | Register the 9 write tools (see below) |
+| `ODOO_ENABLE_WRITE` | `--enable-write` | off | Register the 13 write tools (see below) |
 
 ### Write tools
 
 | Env var | Default | Description |
 |---|---|---|
 | `ODOO_AUDIT_LOG` | `~/.local/state/mcp_odoo/audit.jsonl` | One JSON line per write: time, Odoo user, client IP / user agent, action, record, changes |
+| `ODOO_DEFAULT_COMPANY_ID` | — | Company for new quotations, partners and contacts (default: the Odoo user's current company) |
+| `ODOO_DEFAULT_TEAM_ID` | — | Sales team for new quotations |
+| `ODOO_DEFAULT_SALESPERSON_ID` | — | Salesperson (user ID) for new quotations |
+| `ODOO_DEFAULT_PRICELIST_ID` | — | Pricelist for new quotations, partners and contacts (Odoo's own default may be a foreign-currency list) |
+| `ODOO_DEFAULT_SALE_TAX_IDS` | — | Comma-separated tax IDs put on new product lines that name no tax (only for the default company) |
+
+The IDs are specific to one database, so they are settings, not code. Unset means Odoo's own default.
 | `ODOO_PDF_DIR` | `~/Downloads` | Where `download_quotation_pdf` saves files in stdio mode |
 
 HTTP endpoints: streamable-http at `/mcp`, SSE at `/sse`. Since v1.9.1 the SSE mode serves `/mcp` as well.
@@ -158,7 +165,7 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 ---
 
-## Tools (16 + 9 write)
+## Tools (18 + 13 write)
 
 ### System
 
@@ -170,9 +177,12 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 | Tool | Description |
 |---|---|
-| `search_quotations` | Search quotations/sales orders (partner, state, date & amount range, `product_names`/`product_keywords` with `product_match_mode` any/all + exclude, pagination) |
+| `search_quotations` | Search quotations/sales orders (partner, state, `invoice_status` e.g. "to invoice", customer PO number `client_order_ref`, note text `description_contains` — end customers often appear only in the note — date & amount range, `product_names`/`product_keywords` with `product_match_mode` any/all + exclude, pagination) |
+| `search_quotation_lines` | Search past quotation lines by description keywords (AND): order, customer, date, quantity, unit price, plus min/max/average price per currency — "what did we quote for X before" |
+| `get_sales_report` | Revenue of confirmed orders grouped by month / quarter / year / customer / product / category / salesperson / team, with invoiced vs to-invoice amounts |
 | `get_quotation_stats` | Quick aggregated quotation statistics (counts/amounts) by partner/state |
 | `get_quotation_details` | Full quotation / sales order detail by ID |
+| `get_record_messages` | Chatter of a quotation, partner, invoice, delivery or purchase order: notes, emails, and field changes (who changed what from which value), in local time |
 
 ### Purchasing & delivery
 
@@ -187,7 +197,7 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 | Tool | Description |
 |---|---|
-| `search_products` | Search products by `keywords` (multi-keyword AND match) |
+| `search_products` | Search products by `keywords` (multi-keyword AND match); returns `company_id` and `quote_line_name` (the exact text the first line of a quotation line must start with) |
 | `get_product_details` | Full product detail by ID |
 | `get_product_stock` | On-hand stock/quantity by warehouse / location |
 
@@ -217,21 +227,24 @@ Two behaviours worth knowing:
 
 | Tool | Description |
 |---|---|
-| `search_partners` | Search partners (customers/suppliers); returns a Markdown link to the partner page |
-| `create_or_get_partner` | Create a partner or return an existing match; supports VAT (統一編號), customer/supplier flags |
+| `search_partners` | Search partners by name, email, phone/mobile, or VAT / 統一編號; returns a Markdown link to the partner page |
 
 ### Quotation writing (only with `--enable-write`)
 
 | Tool | Description |
 |---|---|
-| `create_quotation` | Create a draft quotation: customer, company, sales team, salesperson, pricelist, payment terms, validity date, note, customer reference, lines |
-| `update_quotation` | Change header fields of a draft/sent quotation (customer, customer PO number, note, validity date, payment terms, pricelist, team, salesperson, addresses) |
+| `create_quotation` | Create a draft quotation: customer, lines, note, validity date, customer PO number, payment terms; company / team / salesperson / pricelist / tax from the site defaults unless given |
+| `update_quotation` | Change header fields of a draft/sent quotation (customer, PO number, note, validity date, quotation date, payment terms, pricelist, team, salesperson, addresses); on a confirmed order only the PO number. Returns before → after per field |
 | `update_quotation_lines` | Add / change / delete lines, including `line_note` and `line_section` lines and `sequence` |
 | `preview_quotation_copy` | Show what a copy to another customer would look like; writes nothing |
 | `copy_quotation` | Copy a quotation to another customer (`confirm=True` required) |
 | `confirm_quotation` | Confirm a quotation into a sales order (`confirm=True` required; otherwise a preview) |
 | `update_partner_terms` | Set a customer's default pricelist and/or payment terms for one company |
-| `add_contact_to_partner` | Add a contact person under a company |
+| `add_contact_to_partner` | Add a contact person under a company; the contact gets the company's pricelist |
+| `create_or_get_partner` | Create a company/individual with the default pricelist, or return the existing one with the same exact name or tax ID |
+| `update_partner` | Change a partner's name, tax ID, email, phone, mobile, address, country, job position, language, notes, reference, company flag, default pricelist |
+| `post_note` | Internal note on a quotation, partner, invoice, delivery or purchase order (no email is sent) |
+| `change_quotation_state` | Set a sent/cancelled quotation back to draft, or mark a draft as sent (no email). Cancelling is deliberately not offered |
 | `download_quotation_pdf` | Quotation (`sale.report_saleorder`) or pro-forma PDF |
 
 Line spec example — a product line with its quantity formula as a separate note line below it:
@@ -239,7 +252,8 @@ Line spec example — a product line with its quantity formula as a separate not
 ```json
 [
   {"display_type": "line_section", "name": "Proxmox VE subscription"},
-  {"product_id": 126, "product_uom_qty": 6, "price_unit": 1180,
+  {"product_id": 126, "qty": 6, "price_unit": 1180,
+   "name": "<exact product name>\n<subscription period ...>",
    "note_after": "(3Nodes x 2CPUs x 1Year) = 6"}
 ]
 ```
@@ -248,7 +262,11 @@ What the write tools guard against:
 
 - **Repricing.** Odoo recomputes `price_unit` from the pricelist when the quantity changes, so a quantity-only update keeps the line's current price, and explicit `price_unit` values are re-applied if Odoo overrode them. Changing the customer or copying an order puts the original pricelist (currency) and unit prices back. Everything undone is listed in `warnings`.
 - **Products from another company.** A product must belong to the order's company or to no company; otherwise the order becomes unreadable for that company. Nothing is written if any product fails the check.
-- **Wrong product names.** Writes run with `lang=zh_TW`; English product names may still carry stale `(copy)` suffixes.
+- **Wrong product names.** Writes run with `lang=zh_TW`; English product names may still carry stale `(copy)` suffixes. When a product line's `name` is given, its first line must be exactly the product's name (`quote_line_name` from `search_products`) — the quotation PDF prints only the description, so an abbreviated first line is what the customer sees. Anything else is refused.
+- **Wrong currency.** Results carry a warning when the quotation's currency is not the company's.
+- **Missing PO number.** `confirm_quotation` warns when `client_order_ref` is empty.
+- **Trying it first.** Every write tool takes `dry_run=True` (or, for copy / confirm / state change, works as a preview until `confirm=True`) and reports exactly what it would change.
+- **Nothing destructive.** There is no tool to delete or cancel a quotation or to delete a partner.
 - **Mistyped customers.** `copy_quotation` takes `new_partner_id`, or a name that matches exactly one partner; it never creates a partner.
 
 Every write returns the record as read back from Odoo (untaxed / tax / total, currency, first line of each description), is appended to `ODOO_AUDIT_LOG`, and is posted as an internal note in the record's chatter.
@@ -270,6 +288,14 @@ Enable them only for clients that should change data. A typical setup runs one r
 ---
 
 ## Changelog (recent)
+
+### v1.11.0 — Sales analysis, line search, partner editing, safer writes
+
+- New read tools: `get_sales_report` (revenue by month / customer / product / salesperson …), `search_quotation_lines` (past prices by description keyword), `get_record_messages` (chatter: notes, emails, field changes). `search_quotations` gains `invoice_status` and `client_order_ref`; `search_partners` gains `vat`; product search returns `company_id` and `quote_line_name`.
+- New write tools: `update_partner`, `post_note`, `change_quotation_state` (draft / mark sent only). `create_or_get_partner` moved behind `--enable-write` (it creates records) and matches existing partners by tax ID too.
+- Site defaults (`ODOO_DEFAULT_*`) for company, team, salesperson, pricelist and sale tax; new partners and contacts get the default / company pricelist instead of Odoo's foreign-currency default.
+- Product-name check on quotation lines, currency and missing-PO warnings, before/after diffs, `dry_run` on every write tool, `date_order` editable, PO number editable on confirmed orders.
+- Fixes: `count_only` never exceeded `limit` (10 instead of 57); searching partners by phone always failed (malformed domain); actions returning `None` (e.g. mark as sent) were reported as errors although they had succeeded.
 
 ### v1.10.0 — Quotation writing
 

@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
 """
-MCP server for Odoo API – v1.10.0 Quotation Writing
+MCP server for Odoo API – v1.11.0 Sales Analysis & Safer Writes
 ===============================================================================
 Author: Jason Cheng (Jason Tools)
 Created: 2025-07-14
-Updated: 2026-10-02
-Version: 1.10.0
+Updated: 2026-10-09
+Version: 1.11.0
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Tested: Odoo 13 Community Edition
 
 FastMCP-based Odoo integration with comprehensive business management capabilities.
+
+NEW in v1.11.0:
+- Read: get_sales_report (sale.report read_group by month/customer/product/...),
+  search_quotation_lines (past prices by description keywords), get_record_messages
+  (chatter notes, emails, tracked field changes, local time). search_quotations gains
+  invoice_status / client_order_ref; search_partners gains vat; search_products returns
+  company_id and quote_line_name.
+- Write: update_partner, post_note, change_quotation_state (draft / mark_sent; no cancel).
+  create_or_get_partner is now a write tool (it creates partners) and also matches by VAT.
+- ODOO_DEFAULT_{COMPANY_ID,TEAM_ID,SALESPERSON_ID,PRICELIST_ID,SALE_TAX_IDS}: site
+  defaults for new quotations/partners/contacts (Odoo's own pricelist default was USD).
+- Quotation line name check: a product line's description must start with the product's
+  exact zh_TW name (the PDF prints only the description). Currency and missing-PO
+  warnings, before/after diffs, dry_run on every write tool.
+- FIX count_only: counted the page after `limit`, so never more than 10 (57 real).
+- FIX search_partners(phone=...): domain was appended as a nested list (always failed).
+- FIX actions returning None (action_quotation_sent) were reported as failures.
 
 NEW in v1.10.0:
 - Quotation write tools, registered only with --enable-write (or ODOO_ENABLE_WRITE=1)
@@ -388,7 +405,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Version information
-__version__ = "1.10.0"
+__version__ = "1.11.0"
 __author__ = "Jason Cheng (Jason Tools)"
 
 # Configure logging
@@ -1337,7 +1354,9 @@ def odoo_raw_call(model: str, method: str, args: Optional[List] = None, kwargs: 
 @mcp.tool()
 def search_quotations(partner_name: Optional[str] = None, quotation_number: Optional[str] = None,
                      quotation_numbers: Optional[List[str]] = None,
-                     state: Optional[str] = None, date_from: Optional[str] = None,
+                     state: Optional[str] = None, invoice_status: Optional[str] = None,
+                     client_order_ref: Optional[str] = None,
+                     date_from: Optional[str] = None,
                      date_to: Optional[str] = None, product_name: Optional[str] = None,
                      product_keywords: Optional[List[str]] = None,
                      product_names: Optional[List[str]] = None,
@@ -1369,6 +1388,10 @@ def search_quotations(partner_name: Optional[str] = None, quotation_number: Opti
         quotation_number: Single quotation number (e.g., 'S00123')
         quotation_numbers: List of quotation numbers for bulk search
         state: Filter by state - draft/sent/sale/done/cancel
+        client_order_ref: Customer PO number (客戶採購單號), partial match
+        invoice_status: Invoicing state of confirmed orders - "to invoice" (未開發票),
+            "invoiced" (已開發票), "no" (nothing to invoice), "upselling".
+            Example: state="sale", invoice_status="to invoice" lists orders still to invoice.
         date_from: Start date filter (YYYY-MM-DD)
         date_to: End date filter (YYYY-MM-DD)
         product_name: Filter by single product/service name in lines (single keyword)
@@ -1431,6 +1454,10 @@ def search_quotations(partner_name: Optional[str] = None, quotation_number: Opti
             domain.append(['name', 'ilike', quotation_number])
         if state:
             domain.append(['state', '=', state])
+        if client_order_ref:
+            domain.append(['client_order_ref', 'ilike', client_order_ref])
+        if invoice_status:
+            domain.append(['invoice_status', '=', invoice_status.replace('_', ' ')])
         if date_from:
             domain.append(['date_order', '>=', date_from])
         if date_to:
@@ -1667,6 +1694,17 @@ def search_quotations(partner_name: Optional[str] = None, quotation_number: Opti
 
         # Log the final domain for debugging
         logger.info(f"Final search domain: {domain}")
+
+        # count_only used to count the page after `limit` was applied, so it never
+        # exceeded the limit (default 10): "how many orders to invoice" said 10 for 56.
+        # Count in the database unless a filter below runs in Python.
+        if count_only and not exclude_only_products:
+            total = odoo.execute_kw('sale.order', 'search_count', [domain])
+            return json.dumps({
+                "count": total,
+                "query_info": {"mode": "count_only", "domain": domain,
+                               "timestamp": datetime.now().isoformat()}
+            }, indent=2, ensure_ascii=False, cls=DateTimeEncoder)
 
         # Get quotations using version-compatible fields
         available_fields = odoo.get_version_compatible_fields('sale.order', 'standard')
@@ -3691,12 +3729,17 @@ def search_products(name: Optional[str] = None, category_name: Optional[str] = N
                     'list_price': product.get('list_price', 0),
                     'category': product.get('categ_id', [None, ''])[1] if product.get('categ_id') else '',
                     'qty_available': product.get('qty_available', 0),
+                    # Exactly what create_quotation / update_quotation_lines require as the
+                    # first line of a line description (zh_TW display_name, with [code]).
+                    'quote_line_name': product.get('display_name') or product.get('name'),
+                    'company_id': product['company_id'][0] if product.get('company_id') else None,
                     'odoo_url': _generate_product_url(product['id'])
                 }
                 enriched_products.append(enriched_product)
                 continue
 
             enriched_product = product.copy()
+            enriched_product['quote_line_name'] = product.get('display_name') or product.get('name')
             
             # v1.4.4: Use 'name' field instead of 'display_name' to avoid variant/copy text
             # Keep the clean product name
@@ -4153,7 +4196,8 @@ def get_product_stock(product_id: Optional[int] = None, product_name: Optional[s
 @mcp.tool()
 def search_partners(name: Optional[str] = None, is_customer: Optional[bool] = None,
                    is_supplier: Optional[bool] = None, email: Optional[str] = None,
-                   phone: Optional[str] = None, limit: int = 20, offset: int = 0,
+                   phone: Optional[str] = None, vat: Optional[str] = None,
+                   limit: int = 20, offset: int = 0,
                    compact: bool = False, count_only: bool = False) -> str:
     """Search Odoo contacts/customers/suppliers (res.partner).
 
@@ -4169,6 +4213,7 @@ def search_partners(name: Optional[str] = None, is_customer: Optional[bool] = No
         is_supplier: Filter suppliers only (True) or exclude (False), None=all
         email: Email address filter (partial match)
         phone: Phone/mobile number filter (partial match)
+        vat: Tax ID / 統一編號 (partial match), e.g. "24976339"
         limit: Max results (default: 20, use 0 for unlimited)
         offset: Skip first N results for pagination (default: 0)
         compact: Return minimal fields only (default: False)
@@ -4194,7 +4239,10 @@ def search_partners(name: Optional[str] = None, is_customer: Optional[bool] = No
         if email:
             domain.append(['email', 'ilike', email])
         if phone:
-            domain.append(['|', ['phone', 'ilike', phone], ['mobile', 'ilike', phone]])
+            # extend, not append: a nested ['|', a, b] is not a valid Odoo domain
+            domain.extend(['|', ['phone', 'ilike', phone], ['mobile', 'ilike', phone]])
+        if vat:
+            domain.append(['vat', 'ilike', vat.replace(' ', '')])
         
         # FIXED: Only filter by customer_rank/supplier_rank when explicitly requested
         if is_customer is True:
@@ -4957,113 +5005,6 @@ def get_invoice_stats(invoice_type: str = "customer",
         return json.dumps({"error": str(e)}, indent=2, ensure_ascii=False)
 
 
-@mcp.tool()
-def create_or_get_partner(partner_name: str, is_company: bool = True,
-                         is_customer: bool = True, is_supplier: bool = False,
-                         vat: Optional[str] = None, phone: Optional[str] = None,
-                         email: Optional[str] = None, street: Optional[str] = None,
-                         city: Optional[str] = None, country_code: Optional[str] = "TW") -> str:
-    """Create a new partner or retrieve existing one by exact name match.
-
-    Args:
-        partner_name: Partner/company name (required, exact match for lookup)
-        is_company: True for company, False for individual (default: True)
-        is_customer: Mark as customer (default: True)
-        is_supplier: Mark as supplier (default: False)
-        vat: VAT/Tax ID number - 統一編號 for Taiwan (optional)
-        phone: Phone number (optional)
-        email: Email address (optional)
-        street: Street address (optional)
-        city: City name (optional)
-        country_code: ISO country code (default: "TW" for Taiwan)
-
-    Returns:
-        JSON with: status ('existing' or 'created'), partner ID, name, and details
-    """
-    logger.info(f"Creating or getting partner: {partner_name}")
-    
-    try:
-        # First, search for existing partner with exact name
-        existing_partners = _cached_odoo_call(
-            'res.partner', 'search_read',
-            [[['name', '=', partner_name]]],
-            {'fields': ['id', 'name', 'is_company', 'customer_rank', 'supplier_rank'], 'limit': 1}
-        )
-        
-        if existing_partners:
-            # Partner already exists
-            partner = existing_partners[0]
-            logger.info(f"Found existing partner: {partner['id']} - {partner['name']}")
-            
-            return json.dumps({
-                "status": "existing",
-                "partner": {
-                    "id": partner['id'],
-                    "name": partner['name'],
-                    "is_company": partner.get('is_company', False),
-                    "is_customer": partner.get('customer_rank', 0) > 0,
-                    "is_supplier": partner.get('supplier_rank', 0) > 0
-                },
-                "message": f"Partner '{partner_name}' already exists"
-            }, indent=2, ensure_ascii=False)
-        
-        # Create new partner
-        partner_data = {
-            'name': partner_name,
-            'is_company': is_company,
-            'customer_rank': 1 if is_customer else 0,
-            'supplier_rank': 1 if is_supplier else 0,
-        }
-        
-        # Add optional fields
-        if vat:
-            partner_data['vat'] = vat
-        if phone:
-            partner_data['phone'] = phone
-        if email:
-            partner_data['email'] = email
-        if street:
-            partner_data['street'] = street
-        if city:
-            partner_data['city'] = city
-            
-        # Get country ID
-        if country_code:
-            countries = _cached_odoo_call(
-                'res.country', 'search_read',
-                [[['code', '=', country_code.upper()]]],
-                {'fields': ['id'], 'limit': 1}
-            )
-            if countries:
-                partner_data['country_id'] = countries[0]['id']
-        
-        # Create the partner
-        partner_id = odoo.execute_kw(
-            'res.partner', 'create', [partner_data]
-        )
-        
-        logger.info(f"Created new partner: {partner_id} - {partner_name}")
-        
-        # Clear cache to ensure fresh data
-        cache.clear()
-        
-        return json.dumps({
-            "status": "created",
-            "partner": {
-                "id": partner_id,
-                "name": partner_name,
-                "is_company": is_company,
-                "is_customer": is_customer,
-                "is_supplier": is_supplier,
-                "url": _generate_partner_url(partner_id)
-            },
-            "message": f"Successfully created new partner '{partner_name}'"
-        }, indent=2, ensure_ascii=False)
-        
-    except Exception as e:
-        logger.error(f"Error creating/getting partner: {e}")
-        return json.dumps({"error": str(e)}, indent=2, ensure_ascii=False)
-
 # @mcp.tool()  # Disabled - use create_or_get_partner instead
 def create_partner_with_contacts(company_name: str, contacts: List[Dict[str, str]], 
                                  is_customer: bool = True, is_supplier: bool = False,
@@ -5091,8 +5032,8 @@ def create_partner_with_contacts(company_name: str, contacts: List[Dict[str, str
         
     Example contacts parameter:
     [
-        {"name": "John Doe", "function": "CEO", "email": "john@company.com", "phone": "123456"},
-        {"name": "Jane Smith", "function": "Sales Manager", "email": "jane@company.com", "mobile": "098765"}
+        {"name": "John Doe", "function": "CEO", "email": "john@example.com", "phone": "123456"},
+        {"name": "Jane Smith", "function": "Sales Manager", "email": "jane@example.com", "mobile": "098765"}
     ]
     """
     logger.info(f"Creating company with contacts: {company_name}")
@@ -5222,6 +5163,308 @@ def create_partner_with_contacts(company_name: str, contacts: List[Dict[str, str
         logger.error(f"Error creating company with contacts: {e}")
         return json.dumps({"error": str(e)}, indent=2, ensure_ascii=False)
 
+# ───────────────────────── Sales Analysis & Chatter (v1.11.0) ─────────────────────────
+
+_SALES_GROUPS = {
+    'month': 'date:month',
+    'quarter': 'date:quarter',
+    'year': 'date:year',
+    'customer': 'partner_id',
+    'product': 'product_id',
+    'category': 'categ_id',
+    'salesperson': 'user_id',
+    'team': 'team_id',
+}
+
+
+@mcp.tool()
+def get_sales_report(group_by: str = "month", date_from: Optional[str] = None,
+                     date_to: Optional[str] = None, partner_name: Optional[str] = None,
+                     product_keyword: Optional[str] = None, company_id: Optional[int] = None,
+                     include_quotations: bool = False, top: int = 20) -> str:
+    """Sales revenue analysis from confirmed orders, grouped by month / customer / product etc.
+
+    WHEN TO USE:
+    - "今年營收", "各月業績", "2026 每月營業額" -> group_by="month"
+    - "哪個客戶買最多", "前十大客戶" -> group_by="customer"
+    - "哪個產品賣最好", "PVE 訂閱賣了多少" -> group_by="product", product_keyword="Proxmox"
+    - "各業務業績" -> group_by="salesperson"
+    Use search_quotations for individual orders; get_quotation_stats for quotation counts.
+
+    Amounts are untaxed and converted to the company currency (Odoo's sales analysis).
+    Only confirmed orders count unless include_quotations=True.
+
+    Args:
+        group_by: month, quarter, year, customer, product, category, salesperson, team
+        date_from: Order date from (YYYY-MM-DD). Default: 1 January this year.
+        date_to: Order date to (YYYY-MM-DD), inclusive. Default: today.
+        partner_name: Only this customer (partial match)
+        product_keyword: Only products whose name contains this (partial match)
+        company_id: Only this company. Default: all companies the user can see.
+        include_quotations: Also count draft/sent quotations (pipeline), reported separately per row
+        top: Max rows for customer/product/salesperson/category/team grouping (default 20)
+
+    Returns:
+        Rows with untaxed amount, quantity, number of orders and invoiced vs to-invoice
+        amounts, plus the grand total.
+    """
+    try:
+        gb = _SALES_GROUPS.get(group_by)
+        if not gb:
+            return json.dumps({"error": f"group_by must be one of {list(_SALES_GROUPS)}"}, ensure_ascii=False)
+        today = datetime.now()
+        date_from = date_from or f"{today.year}-01-01"
+        date_to = date_to or today.strftime('%Y-%m-%d')
+        states = ['sale', 'done'] + (['draft', 'sent'] if include_quotations else [])
+        domain = [['state', 'in', states], ['date', '>=', f"{date_from} 00:00:00"], ['date', '<=', f"{date_to} 23:59:59"]]
+        if partner_name:
+            domain.append(['partner_id', 'ilike', partner_name])
+        if product_keyword:
+            domain.append(['product_id', 'ilike', product_keyword])
+        if company_id:
+            domain.append(['company_id', '=', company_id])
+
+        measures = ['price_subtotal:sum', 'product_uom_qty:sum', 'untaxed_amount_invoiced:sum',
+                    'untaxed_amount_to_invoice:sum', 'order_reference:count_distinct']
+        groupby = [gb, 'state'] if include_quotations else [gb]
+        try:
+            rows = odoo.execute_kw('sale.report', 'read_group', [domain, measures, groupby],
+                                   {'lazy': False, 'context': {'lang': odoo.user_lang or 'zh_TW'}})
+        except Exception:
+            # order_reference is a Reference field on 17+; older versions use order_id
+            measures[-1] = 'order_id:count_distinct'
+            rows = odoo.execute_kw('sale.report', 'read_group', [domain, measures, groupby],
+                                   {'lazy': False, 'context': {'lang': odoo.user_lang or 'zh_TW'}})
+
+        def label(v):
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                return v[1]
+            return v if v not in (False, None) else "(none)"
+
+        merged: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            key = label(r.get(gb))
+            m = merged.setdefault(key, {group_by: key, 'amount_untaxed': 0.0, 'quantity': 0.0, 'orders': 0,
+                                        'invoiced': 0.0, 'to_invoice': 0.0})
+            amount = r.get('price_subtotal') or 0.0
+            if include_quotations and r.get('state') in ('draft', 'sent'):
+                m['quotations_amount'] = round(m.get('quotations_amount', 0.0) + amount, 2)
+                continue
+            m['amount_untaxed'] += amount
+            m['quantity'] += r.get('product_uom_qty') or 0.0
+            m['orders'] += r.get('order_reference') or r.get('order_id') or 0
+            m['invoiced'] += r.get('untaxed_amount_invoiced') or 0.0
+            m['to_invoice'] += r.get('untaxed_amount_to_invoice') or 0.0
+        data = list(merged.values())
+        for d in data:
+            for k in ('amount_untaxed', 'quantity', 'invoiced', 'to_invoice'):
+                d[k] = round(d[k], 2)
+        if group_by in ('month', 'quarter', 'year'):
+            pass  # read_group already returns these in date order
+        else:
+            data.sort(key=lambda d: d['amount_untaxed'], reverse=True)
+        total = {k: round(sum(d[k] for d in data), 2) for k in ('amount_untaxed', 'invoiced', 'to_invoice')}
+        total['orders_in_rows'] = sum(d['orders'] for d in data)
+        shown = data if group_by in ('month', 'quarter', 'year') else data[:max(1, top)]
+        out = {"period": {"from": date_from, "to": date_to}, "group_by": group_by,
+               "currency_note": "untaxed, company currency", "total": total, "rows": shown}
+        if len(shown) < len(data):
+            out["rows_omitted"] = len(data) - len(shown)
+        return json.dumps(out, ensure_ascii=False, indent=2, cls=DateTimeEncoder)
+    except Exception as e:
+        logger.error(f"Error in get_sales_report: {e}")
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+@mcp.tool()
+def search_quotation_lines(keywords: List[str], partner_name: Optional[str] = None,
+                           state: Optional[str] = None, date_from: Optional[str] = None,
+                           date_to: Optional[str] = None, product_id: Optional[int] = None,
+                           limit: int = 30) -> str:
+    """Search quotation / order LINES by description text, to see what was quoted before:
+    which order, customer, date, quantity and unit price.
+
+    WHEN TO USE:
+    - "V2V 移轉過去每台報多少" -> keywords=["V2V"]
+    - "以前教育訓練一天報價多少" -> keywords=["教育訓練"]
+    - "給這個客戶的 PBS 報過什麼價" -> keywords=["Backup Server"], partner_name="..."
+    Use the user's exact words; do not translate. All keywords must appear (AND) in the
+    line description; matching is case-insensitive.
+
+    Args:
+        keywords: Words that must all appear in the line description
+        partner_name: Only orders of this customer (partial match)
+        state: draft, sent, sale, cancel. Default: all except cancelled.
+        date_from / date_to: Order date range (YYYY-MM-DD)
+        product_id: Only lines of this product
+        limit: Max lines, newest first (default 30)
+
+    Returns:
+        Lines with order number, customer, date, state, first line of the description,
+        quantity, unit price, discount, subtotal and currency, plus price min/max/average
+        per currency.
+    """
+    try:
+        if not keywords:
+            return json.dumps({"error": "keywords is required"}, ensure_ascii=False)
+        domain = [['display_type', '=', False]]
+        for k in keywords:
+            domain.append(['name', 'ilike', k])
+        if partner_name:
+            domain.append(['order_id.partner_id', 'ilike', partner_name])
+        domain.append(['state', '=', state] if state else ['state', '!=', 'cancel'])
+        if date_from:
+            domain.append(['order_id.date_order', '>=', f"{date_from} 00:00:00"])
+        if date_to:
+            domain.append(['order_id.date_order', '<=', f"{date_to} 23:59:59"])
+        if product_id:
+            domain.append(['product_id', '=', product_id])
+        ctx = {'lang': odoo.user_lang or 'zh_TW'}
+        lines = odoo.execute_kw('sale.order.line', 'search_read', [domain],
+                                {'fields': ['order_id', 'order_partner_id', 'state', 'name', 'product_id',
+                                            'product_uom_qty', 'price_unit', 'discount', 'price_subtotal',
+                                            'currency_id', 'company_id'],
+                                 'order': 'id desc', 'limit': max(1, min(limit, 200)), 'context': ctx})
+        order_ids = sorted({l['order_id'][0] for l in lines if l.get('order_id')})
+        dates = {o['id']: o['date_order'] for o in odoo.execute_kw(
+            'sale.order', 'read', [order_ids], {'fields': ['date_order'], 'context': ctx})} if order_ids else {}
+        rows, stats = [], {}
+        for l in lines:
+            cur = l['currency_id'][1] if l.get('currency_id') else ''
+            rows.append({
+                "order": l['order_id'][1] if l.get('order_id') else None,
+                "order_id": l['order_id'][0] if l.get('order_id') else None,
+                "customer": l['order_partner_id'][1] if l.get('order_partner_id') else None,
+                "date": (dates.get(l['order_id'][0]) or '')[:10] if l.get('order_id') else None,
+                "state": l.get('state'),
+                "description": (l.get('name') or '').split('\n')[0],
+                "product_id": l['product_id'][0] if l.get('product_id') else None,
+                "qty": l.get('product_uom_qty'), "price_unit": l.get('price_unit'),
+                "discount": l.get('discount') or None, "subtotal": l.get('price_subtotal'), "currency": cur,
+            })
+            if l.get('price_unit'):
+                stats.setdefault(cur, []).append(l['price_unit'])
+        summary = {c: {"lines": len(v), "min": min(v), "max": max(v), "avg": round(sum(v) / len(v), 2)}
+                   for c, v in stats.items()}
+        return json.dumps({"keywords": keywords, "lines": rows, "count": len(rows), "price_unit_summary": summary},
+                          ensure_ascii=False, indent=2, cls=DateTimeEncoder)
+    except Exception as e:
+        logger.error(f"Error in search_quotation_lines: {e}")
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+_MESSAGE_MODELS = {
+    'quotation': 'sale.order', 'sale.order': 'sale.order',
+    'partner': 'res.partner', 'res.partner': 'res.partner',
+    'invoice': 'account.move', 'account.move': 'account.move',
+    'delivery': 'stock.picking', 'stock.picking': 'stock.picking',
+    'purchase': 'purchase.order', 'purchase.order': 'purchase.order',
+}
+
+
+def _html_to_text(html: Optional[str]) -> str:
+    if not html:
+        return ''
+    text = re.sub(r'(?i)<br\s*/?>|</p>|</div>|</li>', '\n', str(html))
+    text = re.sub(r'<[^>]+>', '', text)
+    for a, b in (('&nbsp;', ' '), ('&amp;', '&'), ('&lt;', '<'), ('&gt;', '>'), ('&quot;', '"'), ('&#39;', "'")):
+        text = text.replace(a, b)
+    return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
+def _utc_to_local(value: Optional[str]) -> Optional[str]:
+    """Odoo stores datetimes in UTC ('2026-10-02 10:36:09'); show them in local time."""
+    if not value:
+        return value
+    try:
+        from datetime import timezone as _tz
+        return datetime.strptime(str(value)[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=_tz.utc) \
+            .astimezone().isoformat(timespec='seconds')
+    except ValueError:
+        return value
+
+
+@mcp.tool()
+def get_record_messages(record_type: str, record_id: int, include_tracking: bool = True,
+                        include_system: bool = False, limit: int = 30) -> str:
+    """Chatter history of a record: internal notes, emails sent/received, and field changes
+    (who changed what, from which value to which).
+
+    WHEN TO USE:
+    - "這張報價單的備註/溝通紀錄", "誰改過這張單", "什麼時候寄給客戶的"
+    - "客戶資料改過什麼", "出貨單的紀錄"
+
+    Args:
+        record_type: quotation, partner, invoice, delivery or purchase
+        record_id: The record ID (e.g. quotation ID from search_quotations)
+        include_tracking: Show field changes (state, amount, customer ...) (default True)
+        include_system: Also show automatic notifications without text (default False)
+        limit: Max messages, newest first (default 30)
+
+    Returns:
+        Messages with date, author, kind (note / email / message / change), text and changes.
+    """
+    try:
+        model = _MESSAGE_MODELS.get(record_type)
+        if not model:
+            return json.dumps({"error": f"record_type must be one of quotation, partner, invoice, delivery, purchase"},
+                              ensure_ascii=False)
+        ctx = {'lang': odoo.user_lang or 'zh_TW'}
+        msgs = odoo.execute_kw('mail.message', 'search_read',
+                               [[['model', '=', model], ['res_id', '=', record_id]]],
+                               {'fields': ['date', 'author_id', 'email_from', 'message_type', 'subtype_id',
+                                           'subject', 'body', 'tracking_value_ids', 'partner_ids', 'attachment_ids'],
+                                'order': 'date desc, id desc', 'limit': max(1, min(limit, 200)), 'context': ctx})
+        tracking = {}
+        if include_tracking:
+            tids = [t for m in msgs for t in (m.get('tracking_value_ids') or [])]
+            if tids:
+                tv_fields = ['field_id', 'old_value_char', 'new_value_char', 'old_value_float', 'new_value_float',
+                             'old_value_integer', 'new_value_integer', 'old_value_datetime', 'new_value_datetime']
+                for t in odoo.execute_kw('mail.tracking.value', 'read', [tids], {'fields': tv_fields, 'context': ctx}):
+                    def pick(side):
+                        for k in (f'{side}_value_char', f'{side}_value_float', f'{side}_value_integer', f'{side}_value_datetime'):
+                            v = t.get(k)
+                            if v not in (False, None, '', 0, 0.0):
+                                return v
+                        return t.get(f'{side}_value_char') or None
+                    tracking[t['id']] = {"field": t['field_id'][1] if t.get('field_id') else '',
+                                         "from": pick('old'), "to": pick('new')}
+        out = []
+        for m in msgs:
+            changes = [tracking[t] for t in (m.get('tracking_value_ids') or []) if t in tracking]
+            text = _html_to_text(m.get('body'))
+            subtype = m['subtype_id'][1] if m.get('subtype_id') else ''
+            if m.get('message_type') == 'email' or m.get('message_type') == 'email_outgoing':
+                kind = 'email'
+            elif m.get('message_type') == 'comment':
+                kind = 'note' if subtype in ('Note', '備註', '內部備註') or 'note' in subtype.lower() else 'message'
+            else:
+                kind = 'change' if changes else 'system'
+            if kind == 'system' and not text and not include_system:
+                continue
+            entry = {"date": _utc_to_local(m.get('date')),
+                     "author": m['author_id'][1] if m.get('author_id') else m.get('email_from'),
+                     "kind": kind}
+            if m.get('subject'):
+                entry["subject"] = m['subject']
+            if text:
+                entry["text"] = text[:1500] + ('…' if len(text) > 1500 else '')
+            if changes:
+                entry["changes"] = changes
+            if m.get('attachment_ids'):
+                entry["attachments"] = len(m['attachment_ids'])
+            if kind in ('email', 'message') and m.get('partner_ids'):
+                entry["recipients"] = len(m['partner_ids'])
+            out.append(entry)
+        return json.dumps({"model": model, "record_id": record_id, "messages": out, "count": len(out),
+                           "url": _generate_record_url(record_id, model)},
+                          ensure_ascii=False, indent=2, cls=DateTimeEncoder)
+    except Exception as e:
+        logger.error(f"Error in get_record_messages: {e}")
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
 # ───────────────────────── Write Tools (v1.10.0) ─────────────────────────
 #
 # Registered only when the server starts with --enable-write (or ODOO_ENABLE_WRITE=1),
@@ -5264,7 +5507,14 @@ def _wcall(model: str, method: str, args: List, kwargs: Optional[Dict] = None, c
     """Uncached call with the write context."""
     kwargs = dict(kwargs or {})
     kwargs['context'] = {**_wctx(company_id), **kwargs.get('context', {})}
-    return odoo.execute_kw(model, method, args, kwargs)
+    try:
+        return odoo.execute_kw(model, method, args, kwargs)
+    except xmlrpc.client.Fault as fault:
+        # Action methods such as action_quotation_sent return None. Odoo commits the
+        # transaction, then fails to marshal the None reply; the change did happen.
+        if 'cannot marshal None' in str(fault.faultString):
+            return None
+        raise
 
 
 def _m2o(v):
@@ -5291,7 +5541,8 @@ def _client_info(ctx) -> Dict[str, str]:
     return info or {'client': 'stdio'}
 
 
-def _audit(ctx, action: str, model: str, res_id: Optional[int], changes: Any, record_name: str = '') -> None:
+def _audit(ctx, action: str, model: str, res_id: Optional[int], changes: Any, record_name: str = '',
+           post_chatter: bool = True) -> None:
     entry = {
         'time': datetime.now().isoformat(timespec='seconds'),
         'odoo_user': config.USERNAME,
@@ -5310,7 +5561,7 @@ def _audit(ctx, action: str, model: str, res_id: Optional[int], changes: Any, re
         logger.error(f"Audit log write failed: {e}")
     logger.info(f"AUDIT {action} {model}#{res_id} {record_name}")
 
-    if res_id and model in ('sale.order', 'res.partner'):
+    if post_chatter and res_id and model in ('sale.order', 'res.partner'):
         who = entry.get('client') or entry.get('user_agent') or ''
         where = entry.get('client_ip', '')
         body = f"[MCP] {action}" + (f" ({who} {where})".rstrip() if who or where else '')
@@ -5415,6 +5666,9 @@ def _check_products(product_ids: List[int], company_id: int) -> List[str]:
 
 def _line_vals(spec: Dict) -> Dict:
     """Validate one line spec and turn it into sale.order.line values."""
+    spec = dict(spec)
+    if 'qty' in spec and 'product_uom_qty' not in spec:
+        spec['product_uom_qty'] = spec.pop('qty')
     vals = {k: spec[k] for k in LINE_FIELDS if k in spec and spec[k] is not None}
     dt = vals.get('display_type')
     if dt not in (None, False, 'line_note', 'line_section'):
@@ -5484,45 +5738,124 @@ def _resolve_partner(partner_id: Optional[int], partner_name: Optional[str]) -> 
     return found[0]
 
 
+def _env_int(name: str) -> Optional[int]:
+    v = (os.getenv(name) or '').strip()
+    return int(v) if v.isdigit() else None
+
+
+# Site defaults for new quotations / partners (all optional; unset = Odoo's own default).
+# Set them on the deployment, not in code: the IDs are specific to one database.
+DEFAULT_COMPANY_ID = _env_int('ODOO_DEFAULT_COMPANY_ID')
+DEFAULT_TEAM_ID = _env_int('ODOO_DEFAULT_TEAM_ID')
+DEFAULT_SALESPERSON_ID = _env_int('ODOO_DEFAULT_SALESPERSON_ID')
+DEFAULT_PRICELIST_ID = _env_int('ODOO_DEFAULT_PRICELIST_ID')
+DEFAULT_SALE_TAX_IDS = [int(x) for x in (os.getenv('ODOO_DEFAULT_SALE_TAX_IDS') or '').split(',') if x.strip().isdigit()]
+
+
+def _user_company_id() -> int:
+    return _wcall('res.users', 'read', [[odoo.uid]], {'fields': ['company_id']})[0]['company_id'][0]
+
+
+def _check_line_names(items: List[Dict], company_id: Optional[int]) -> List[str]:
+    """The first line of a product line's description must be the product's zh_TW name.
+
+    The quotation PDF prints only the line description, so a first line that is
+    abbreviated or missing is what the customer sees as the product name.
+    items: [{'label', 'product_id', 'name'}] - only lines whose name is being set.
+    """
+    items = [i for i in items if i.get('product_id') and i.get('name')]
+    if not items:
+        return []
+    ids = sorted({i['product_id'] for i in items})
+    names = {p['id']: (p['display_name'] or '').strip()
+             for p in _wcall('product.product', 'read', [ids], {'fields': ['display_name']}, company_id=company_id)}
+    errors = []
+    for i in items:
+        first = str(i['name']).split('\n', 1)[0].strip()
+        expected = names.get(i['product_id'], '')
+        if first != expected:
+            errors.append(f"{i['label']}: name 第一行「{first}」必須逐字等於產品名稱「{expected}」"
+                          f"（年期、數量算式請寫在第二行以後，或用 note_after）")
+    return errors
+
+
+def _currency_warning(result: Dict, company_id: int) -> Optional[str]:
+    try:
+        cur = _wcall('res.company', 'read', [[company_id]], {'fields': ['currency_id']})[0]['currency_id']
+        if result.get('currency') and cur and result['currency'] != cur[1]:
+            return f"幣別為 {result['currency']}，不是公司幣別 {cur[1]}；確認客戶與價目表是否正確"
+    except Exception:
+        pass
+    return None
+
+
+def _diff(before: Dict, after: Dict, keys) -> Dict:
+    out = {}
+    for k in keys:
+        b, a = before.get(k), after.get(k)
+        b = b[1] if isinstance(b, list) and len(b) == 2 else b
+        a = a[1] if isinstance(a, list) and len(a) == 2 else a
+        if b != a:
+            out[k] = {'before': b, 'after': a}
+    return out
+
+
 from mcp.server.fastmcp import Context
 
 
-def create_quotation(partner_id: int, lines: List[Dict], company_id: Optional[int] = None,
-                     team_id: Optional[int] = None, user_id: Optional[int] = None,
-                     pricelist_id: Optional[int] = None, payment_term_id: Optional[int] = None,
-                     validity_date: Optional[str] = None, note: Optional[str] = None,
-                     client_order_ref: Optional[str] = None, ctx: Context = None) -> str:
+def create_quotation(partner_id: int, lines: List[Dict], note: Optional[str] = None,
+                     validity_date: Optional[str] = None, client_order_ref: Optional[str] = None,
+                     payment_term_id: Optional[int] = None, pricelist_id: Optional[int] = None,
+                     company_id: Optional[int] = None, team_id: Optional[int] = None,
+                     user_id: Optional[int] = None, dry_run: bool = False, ctx: Context = None) -> str:
     """Create a draft quotation (sale.order) with its lines.
 
     Args:
         partner_id: Customer ID
         lines: Line specs in display order. Product line:
-               {"product_id": 12, "product_uom_qty": 6, "price_unit": 1180, "name": "...(optional)",
-                "discount": 0, "tax_id": [1], "note_after": "(3Nodes x 2CPUs x 1Year) = 6"}
+               {"product_id": 12, "qty": 6, "price_unit": 1180,
+                "name": "<product name>\\n<years / formula ...>", "discount": 0, "tax_id": [23],
+                "note_after": "(3Nodes x 2CPUs x 1Year) = 6"}
+               If you give `name`, its FIRST LINE must be exactly the product's name
+               (zh_TW display_name, as get_product_details shows it); otherwise the call is
+               refused. Omit `name` to let Odoo fill it from the product.
                Note / section line: {"display_type": "line_note"|"line_section", "name": "text"}
-               `sequence` is optional (assigned 10, 20, ... in list order). `note_after` adds a
-               separate line_note directly below the product line.
-        company_id: Company (default: the Odoo user's current company)
-        team_id, user_id, pricelist_id, payment_term_id: Sales team, salesperson, pricelist, payment terms
-        validity_date: Expiry YYYY-MM-DD
+               `sequence` is optional (10, 20, ... in list order). `note_after` adds a separate
+               line_note directly below the product line.
         note: Terms and conditions (HTML allowed)
-        client_order_ref: Customer reference / PO number
+        validity_date: Expiry YYYY-MM-DD
+        client_order_ref: Customer PO number
+        payment_term_id: Payment terms
+        pricelist_id, company_id, team_id, user_id: Default to the site defaults
+            (ODOO_DEFAULT_* settings), else to Odoo's own defaults. Pass pricelist_id for
+            customers billed in another currency.
+        dry_run: Validate and show what would be created; nothing is written.
 
-    Products must belong to company_id or to no company. Explicit price_unit values are kept
-    even if the pricelist would compute something else.
+    Lines without tax_id get the site default sale tax. Explicit price_unit values are
+    kept even if the pricelist would compute something else. Products must belong to the
+    quotation's company or to no company.
 
     Returns:
-        The quotation as read back: untaxed / tax / total, currency, every line.
+        The quotation as read back (number, currency, untaxed / tax / total, every line),
+        plus `warnings` (e.g. currency other than the company's).
     """
     try:
         partner = _resolve_partner(partner_id, None)
-        if not company_id:
-            company_id = _wcall('res.users', 'read', [[odoo.uid]], {'fields': ['company_id']})[0]['company_id'][0]
+        company_id = company_id or DEFAULT_COMPANY_ID or _user_company_id()
+        team_id = team_id or DEFAULT_TEAM_ID
+        user_id = user_id or DEFAULT_SALESPERSON_ID
+        pricelist_id = pricelist_id or DEFAULT_PRICELIST_ID
         specs = _expand_lines(lines or [], 0)
         vals_lines = [_line_vals(s) for s in specs]
+        if DEFAULT_SALE_TAX_IDS and company_id == DEFAULT_COMPANY_ID:
+            for v in vals_lines:
+                if v.get('product_id') and 'tax_id' not in v:
+                    v['tax_id'] = [(6, 0, DEFAULT_SALE_TAX_IDS)]
         errors = _check_products([v.get('product_id') for v in vals_lines], company_id)
+        errors += _check_line_names([{'label': f"第 {n} 行", 'product_id': v.get('product_id'), 'name': v.get('name')}
+                                     for n, v in enumerate(vals_lines, 1) if not v.get('display_type')], company_id)
         if errors:
-            return _ok({'error': '產品檢查未通過，未建立報價單', 'details': errors})
+            return _ok({'error': '檢查未通過，未建立報價單', 'details': errors})
 
         vals = {'partner_id': partner['id'], 'company_id': company_id,
                 'order_line': [(0, 0, v) for v in vals_lines]}
@@ -5531,13 +5864,20 @@ def create_quotation(partner_id: int, lines: List[Dict], company_id: Optional[in
                      ('note', note), ('client_order_ref', client_order_ref)):
             if v is not None:
                 vals[k] = v
-        order_id = _wcall('sale.order', 'create', [vals], company_id=company_id)
+        header = {k: v for k, v in vals.items() if k != 'order_line'}
+        if dry_run:
+            return _ok({'status': 'dry_run', 'message': '檢查通過；未建立。拿掉 dry_run 即建立',
+                        'partner': partner['display_name'], 'header': header, 'lines': vals_lines})
 
+        order_id = _wcall('sale.order', 'create', [vals], company_id=company_id)
         warnings = _enforce_prices(order_id, vals_lines, company_id)
         cache.clear()
         result = _read_order(order_id)
+        cw = _currency_warning(result, company_id)
+        if cw:
+            warnings.append(cw)
         _audit(ctx, 'create_quotation', 'sale.order', order_id,
-               {'header': {k: v for k, v in vals.items() if k != 'order_line'}, 'lines': vals_lines}, result['name'])
+               {'header': header, 'lines': vals_lines, 'warnings': warnings}, result['name'])
         return _ok({'status': 'created', 'warnings': warnings, 'quotation': result})
     except Exception as e:
         return _err(e)
@@ -5564,124 +5904,162 @@ def _enforce_prices(order_id: int, vals_lines: List[Dict], company_id: Optional[
 
 def update_quotation(quotation_id: int, partner_id: Optional[int] = None,
                      client_order_ref: Optional[str] = None, note: Optional[str] = None,
-                     validity_date: Optional[str] = None, payment_term_id: Optional[int] = None,
-                     pricelist_id: Optional[int] = None, team_id: Optional[int] = None,
-                     user_id: Optional[int] = None, partner_invoice_id: Optional[int] = None,
-                     partner_shipping_id: Optional[int] = None,
-                     keep_prices: bool = True, ctx: Context = None) -> str:
-    """Update a draft/sent quotation's header. Only the arguments you pass are changed.
+                     validity_date: Optional[str] = None, date_order: Optional[str] = None,
+                     payment_term_id: Optional[int] = None, pricelist_id: Optional[int] = None,
+                     team_id: Optional[int] = None, user_id: Optional[int] = None,
+                     partner_invoice_id: Optional[int] = None, partner_shipping_id: Optional[int] = None,
+                     keep_prices: bool = True, dry_run: bool = False, ctx: Context = None) -> str:
+    """Update a quotation's header. Only the arguments you pass are changed.
+
+    Draft/sent quotations: every field. Confirmed orders (sale): only client_order_ref
+    (the customer's PO number often arrives after confirmation).
 
     Args:
         quotation_id: Quotation ID
-        partner_id: New customer
+        partner_id: New customer (contact person change, e.g. 承辦換人)
         client_order_ref: Customer PO number
         note: Terms and conditions (HTML)
         validity_date: Expiry YYYY-MM-DD
+        date_order: Quotation date YYYY-MM-DD (or "YYYY-MM-DD HH:MM:SS")
         payment_term_id, pricelist_id, team_id, user_id: Payment terms, pricelist, sales team, salesperson
         partner_invoice_id, partner_shipping_id: Invoice / delivery address
-        keep_prices: When the customer changes, Odoo recomputes the pricelist (a TWD order can
-                     become USD) and may rewrite unit prices. True (default) puts the original
-                     pricelist and unit prices back and lists what was undone in `warnings`.
-                     Has no effect on the pricelist if pricelist_id is passed explicitly.
+        keep_prices: Changing the customer can recompute the pricelist (a TWD order turned
+                     USD once) and unit prices. True (default) puts the original pricelist and
+                     every unit price back and lists what was undone in `warnings`.
+        dry_run: Show the before/after values without writing.
 
     Returns:
-        The quotation as read back, plus `warnings`.
+        `changes` (before -> after per field), `warnings`, and the quotation as read back.
     """
     try:
-        so = _editable_order(quotation_id)
+        so = _wcall('sale.order', 'read', [[quotation_id]], {'fields': ['name', 'state', 'company_id']})
+        if not so:
+            return _err(ValueError(f"找不到報價單 {quotation_id}"))
+        so = so[0]
         company_id = so['company_id'][0]
-        vals = {}
-        for k, v in (('partner_id', partner_id), ('client_order_ref', client_order_ref), ('note', note),
-                     ('validity_date', validity_date), ('payment_term_id', payment_term_id),
-                     ('pricelist_id', pricelist_id), ('team_id', team_id), ('user_id', user_id),
-                     ('partner_invoice_id', partner_invoice_id), ('partner_shipping_id', partner_shipping_id)):
-            if v is not None:
-                vals[k] = v
+        vals = {k: v for k, v in (('partner_id', partner_id), ('client_order_ref', client_order_ref), ('note', note),
+                                  ('validity_date', validity_date), ('date_order', date_order),
+                                  ('payment_term_id', payment_term_id), ('pricelist_id', pricelist_id),
+                                  ('team_id', team_id), ('user_id', user_id),
+                                  ('partner_invoice_id', partner_invoice_id),
+                                  ('partner_shipping_id', partner_shipping_id)) if v is not None}
         if not vals:
             return _err(ValueError('沒有要修改的欄位'))
+        if vals.get('date_order') and len(vals['date_order']) == 10:
+            vals['date_order'] += ' 00:00:00'
+        if so['state'] not in EDITABLE_STATES:
+            if so['state'] == 'sale' and set(vals) == {'client_order_ref'}:
+                pass
+            else:
+                return _err(ValueError(f"{so['name']} 狀態為 {so['state']}；已確認的訂單只能改 client_order_ref，"
+                                       f"其他欄位限 draft／sent"))
+        before = _wcall('sale.order', 'read', [[quotation_id]], {'fields': list(vals)})[0]
+        if dry_run:
+            planned = _diff(before, vals, vals)
+            return _ok({'status': 'dry_run', 'quotation': so['name'], 'changes': planned,
+                        'note': '換客戶時 Odoo 可能重算價目表與單價；實際執行會自動改回並列在 warnings'
+                        if partner_id else None})
 
-        before = _price_snapshot(quotation_id) if partner_id else None
+        snap = _price_snapshot(quotation_id) if partner_id else None
         _wcall('sale.order', 'write', [[quotation_id], vals], company_id=company_id)
         warnings = []
-        if before:
+        if snap:
             if keep_prices:
-                warnings = _restore_prices(quotation_id, before, keep_pricelist=pricelist_id is None,
-                                           company_id=company_id)
+                warnings = _restore_prices(quotation_id, snap, keep_pricelist=pricelist_id is None, company_id=company_id)
             else:
-                after = _price_snapshot(quotation_id)
-                if after['currency'] != before['currency']:
-                    warnings.append(f"幣別由 {before['currency']} 變成 {after['currency']}（keep_prices=False，未改回）")
+                after_snap = _price_snapshot(quotation_id)
+                if after_snap['currency'] != snap['currency']:
+                    warnings.append(f"幣別由 {snap['currency']} 變成 {after_snap['currency']}（keep_prices=False，未改回）")
+        after = _wcall('sale.order', 'read', [[quotation_id]], {'fields': list(vals)})[0]
+        changes = _diff(before, after, vals)
         cache.clear()
         result = _read_order(quotation_id)
-        _audit(ctx, 'update_quotation', 'sale.order', quotation_id,
-               {'fields': vals, 'warnings': warnings}, result['name'])
-        return _ok({'status': 'updated', 'fields': list(vals), 'warnings': warnings, 'quotation': result})
+        cw = _currency_warning(result, company_id)
+        if cw and cw not in warnings:
+            warnings.append(cw)
+        _audit(ctx, 'update_quotation', 'sale.order', quotation_id, {'changes': changes, 'warnings': warnings},
+               result['name'])
+        return _ok({'status': 'updated', 'changes': changes, 'warnings': warnings, 'quotation': result})
     except Exception as e:
         return _err(e, quotation_id=quotation_id)
 
 
-def update_quotation_lines(quotation_id: int, line_updates: List[Dict], ctx: Context = None) -> str:
+def update_quotation_lines(quotation_id: int, line_updates: List[Dict], dry_run: bool = False,
+                           ctx: Context = None) -> str:
     """Add, change or delete lines of a draft/sent quotation.
 
     Args:
         quotation_id: Quotation ID
         line_updates: Operations, applied in order:
-            {"action": "create", "product_id": 12, "product_uom_qty": 6, "price_unit": 1180,
-             "sequence": 25, "note_after": "(3Nodes x 2CPUs x 1Year) = 6"}
-            {"action": "create", "display_type": "line_note", "name": "text", "sequence": 26}
-            {"action": "update", "line_id": 345, "product_uom_qty": 4, "price_unit": 900, "name": "..."}
+            {"action": "add", "product_id": 12, "qty": 6, "price_unit": 1180,
+             "name": "<product name>\\n<years ...>", "sequence": 25,
+             "note_after": "(3Nodes x 2CPUs x 1Year) = 6"}
+            {"action": "add", "display_type": "line_note", "name": "text", "sequence": 26}
+            {"action": "update", "line_id": 345, "qty": 4, "price_unit": 900, "name": "..."}
             {"action": "delete", "line_id": 346}
-            Fields: product_id, name, product_uom_qty, price_unit, discount, tax_id (list of IDs),
-            sequence, display_type (line_note / line_section). New lines without a sequence go
-            to the bottom.
+            ("create" is accepted for "add".) Fields: product_id, name, qty / product_uom_qty,
+            price_unit, discount, tax_id (list of IDs), sequence, display_type
+            (line_note / line_section). New lines without a sequence go to the bottom.
+        dry_run: Validate and list the operations without writing.
 
-    Products must belong to the quotation's company or to no company; nothing is written if
-    any product fails that check. Explicit price_unit values are kept, and an update that
-    changes the quantity but not the product or price keeps the line's current price
-    (Odoo would otherwise reprice it from the pricelist). Changing product_id without a
-    price_unit lets the pricelist price the new product.
+    A product line's `name` must start with the product's exact zh_TW name (first line),
+    like create_quotation. Products must belong to the quotation's company or to no
+    company. Nothing is written if any check fails. Explicit price_unit values are kept,
+    and a quantity-only change keeps the line's current price (Odoo would otherwise
+    reprice it from the pricelist).
 
     Returns:
-        Per-operation results and the quotation as read back.
+        Per-operation results and the quotation as read back (totals).
     """
     try:
         so = _editable_order(quotation_id)
         company_id = so['company_id'][0]
         existing = _wcall('sale.order.line', 'search_read', [[['order_id', '=', quotation_id]]],
-                          {'fields': ['sequence']})
-        existing_ids = {l['id'] for l in existing}
+                          {'fields': ['sequence', 'product_id', 'display_type']})
+        by_id = {l['id']: l for l in existing}
         max_seq = max([l['sequence'] for l in existing] or [0])
 
-        # Validate everything before writing anything
-        ops = []
-        for op in line_updates:
+        ops, name_checks = [], []
+        for n, op in enumerate(line_updates, 1):
             op = dict(op)
             action = op.pop('action', None)
-            if action not in ('create', 'update', 'delete'):
-                return _err(ValueError(f"未知的 action {action!r}，只能是 create／update／delete"))
-            if action in ('update', 'delete') and op.get('line_id') not in existing_ids:
-                return _err(ValueError(f"明細 {op.get('line_id')} 不屬於報價單 {so['name']}"))
-            if action == 'create':
+            action = {'create': 'add'}.get(action, action)
+            if action not in ('add', 'update', 'delete'):
+                return _err(ValueError(f"第 {n} 個操作：未知的 action {action!r}，只能是 add／update／delete"))
+            if action in ('update', 'delete') and op.get('line_id') not in by_id:
+                return _err(ValueError(f"第 {n} 個操作：明細 {op.get('line_id')} 不屬於報價單 {so['name']}"))
+            if action == 'add':
                 for spec in _expand_lines([op], max_seq):
                     max_seq = max(max_seq, spec['sequence'])
-                    ops.append(('create', None, _line_vals(spec)))
+                    v = _line_vals(spec)
+                    ops.append(('add', None, v))
+                    if not v.get('display_type'):
+                        name_checks.append({'label': f"第 {n} 個操作", 'product_id': v.get('product_id'), 'name': v.get('name')})
             elif action == 'update':
                 line_id = op.pop('line_id')
                 vals = _line_vals(op)
                 if not vals:
                     return _err(ValueError(f"明細 {line_id} 沒有要修改的欄位"))
                 ops.append(('update', line_id, vals))
+                line = by_id[line_id]
+                if 'name' in vals and not line.get('display_type'):
+                    pid = vals.get('product_id') or (line['product_id'][0] if line.get('product_id') else None)
+                    name_checks.append({'label': f"第 {n} 個操作（明細 {line_id}）", 'product_id': pid, 'name': vals['name']})
             else:
                 ops.append(('delete', op['line_id'], None))
         errors = _check_products([v.get('product_id') for _, _, v in ops if v], company_id)
+        errors += _check_line_names(name_checks, company_id)
         if errors:
-            return _ok({'error': '產品檢查未通過，未做任何修改', 'details': errors})
+            return _ok({'error': '檢查未通過，未做任何修改', 'details': errors})
+        if dry_run:
+            return _ok({'status': 'dry_run', 'quotation': so['name'], 'message': '檢查通過；未寫入',
+                        'operations': [{'action': a, 'line_id': i, 'fields': v} for a, i, v in ops]})
 
         results, warnings = [], []
         for action, line_id, vals in ops:
-            if action == 'create':
+            if action == 'add':
                 new_id = _wcall('sale.order.line', 'create', [{**vals, 'order_id': quotation_id}], company_id=company_id)
-                results.append({'action': 'created', 'line_id': new_id, 'fields': vals})
+                results.append({'action': 'added', 'line_id': new_id, 'fields': vals})
                 line_id = new_id
             elif action == 'update':
                 # Changing qty alone makes Odoo recompute price_unit from the pricelist
@@ -5820,28 +6198,39 @@ def copy_quotation(source_quotation_id: int, new_partner_id: Optional[int] = Non
 
 
 def confirm_quotation(quotation_id: int, confirm: bool = False, ctx: Context = None) -> str:
-    """Confirm a quotation into a sales order (draft/sent -> sale).
+    """Confirm a quotation into a sales order (draft/sent -> sale), once the customer's PO
+    or verbal approval is in.
 
-    Without confirm=True this only shows the quotation as it would be confirmed.
-    Confirming may create delivery orders and cannot be undone from here.
+    Without confirm=True this only shows a preview (number, customer, amount, PO number)
+    with warnings - e.g. a missing client_order_ref, which most customers need on the
+    invoice. Confirming may create delivery orders and cannot be undone from here.
 
     Args:
         quotation_id: Quotation ID
         confirm: Must be True to confirm
 
     Returns:
-        The order as read back.
+        The order as read back, plus `warnings`.
     """
     try:
         so = _editable_order(quotation_id)
+        result = _read_order(quotation_id)
+        warnings = []
+        if not result.get('client_order_ref'):
+            warnings.append('client_order_ref（客戶採購單號）是空的；多數客戶要求發票註明採購單號，'
+                            '有 PO 請先用 update_quotation 填入')
+        cw = _currency_warning(result, so['company_id'][0])
+        if cw:
+            warnings.append(cw)
         if not confirm:
             return _ok({'status': 'preview', 'message': '確認無誤後以 confirm=True 執行',
-                        'quotation': _read_order(quotation_id)})
+                        'warnings': warnings, 'quotation': result})
         _wcall('sale.order', 'action_confirm', [[quotation_id]], company_id=so['company_id'][0])
         cache.clear()
         result = _read_order(quotation_id)
-        _audit(ctx, 'confirm_quotation', 'sale.order', quotation_id, {'state': result['state']}, result['name'])
-        return _ok({'status': 'confirmed', 'quotation': result})
+        _audit(ctx, 'confirm_quotation', 'sale.order', quotation_id,
+               {'state': result['state'], 'client_order_ref': result.get('client_order_ref')}, result['name'])
+        return _ok({'status': 'confirmed', 'warnings': warnings, 'quotation': result})
     except Exception as e:
         return _err(e, quotation_id=quotation_id)
 
@@ -5892,8 +6281,13 @@ def update_partner_terms(partner_id: int, pricelist_id: Optional[int] = None,
 def add_contact_to_partner(parent_partner_id: int, contact_name: str,
                            function: Optional[str] = None, email: Optional[str] = None,
                            phone: Optional[str] = None, mobile: Optional[str] = None,
-                           contact_type: str = 'contact', ctx: Context = None) -> str:
+                           contact_type: str = 'contact', pricelist_id: Optional[int] = None,
+                           dry_run: bool = False, ctx: Context = None) -> str:
     """Add a contact person under a company.
+
+    The contact gets the company's pricelist (quotations take the pricelist from the
+    contact you pick, and Odoo's own default is not the company's), unless pricelist_id
+    is given.
 
     Args:
         parent_partner_id: Company ID
@@ -5901,12 +6295,16 @@ def add_contact_to_partner(parent_partner_id: int, contact_name: str,
         function: Job position
         email, phone, mobile: Contact details
         contact_type: contact / invoice / delivery / other (default: contact)
+        pricelist_id: Pricelist for this contact (default: the company's)
+        dry_run: Show what would be created without writing
 
     Returns:
         The new contact, or the existing one if a contact with the same name is already there.
     """
     try:
-        parent = _wcall('res.partner', 'read', [[parent_partner_id]], {'fields': ['display_name', 'is_company']})
+        company_id = DEFAULT_COMPANY_ID or _user_company_id()
+        parent = _wcall('res.partner', 'read', [[parent_partner_id]],
+                        {'fields': ['display_name', 'is_company', 'property_product_pricelist']}, company_id=company_id)
         if not parent:
             return _err(ValueError(f"公司 {parent_partner_id} 不存在"))
         parent = parent[0]
@@ -5914,21 +6312,33 @@ def add_contact_to_partner(parent_partner_id: int, contact_name: str,
             return _err(ValueError(f"{parent['display_name']} 不是公司，不能在它底下新增聯絡人"))
         dup = _wcall('res.partner', 'search_read',
                      [[['parent_id', '=', parent_partner_id], ['name', '=', contact_name]]],
-                     {'fields': ['display_name', 'email', 'phone'], 'limit': 1})
+                     {'fields': ['display_name', 'email', 'phone', 'function'], 'limit': 1})
         if dup:
-            return _ok({'status': 'existing', 'contact': dup[0]})
+            return _ok({'status': 'existing', 'contact': dup[0],
+                        'note': '已有同名聯絡人；要改電話、職稱、Email 請用 update_partner'})
         if contact_type not in ('contact', 'invoice', 'delivery', 'other'):
-            return _err(ValueError(f"contact_type 只能是 contact／invoice／delivery／other"))
+            return _err(ValueError("contact_type 只能是 contact／invoice／delivery／other"))
         vals = {'parent_id': parent_partner_id, 'name': contact_name, 'type': contact_type, 'is_company': False}
         for k, v in (('function', function), ('email', email), ('phone', phone), ('mobile', mobile)):
             if v:
                 vals[k] = v
-        new_id = _wcall('res.partner', 'create', [vals])
+        pl = pricelist_id or (parent['property_product_pricelist'][0] if parent.get('property_product_pricelist') else None) \
+            or DEFAULT_PRICELIST_ID
+        if pl:
+            vals['property_product_pricelist'] = pl
+        note = None
+        if not pricelist_id and DEFAULT_PRICELIST_ID and pl != DEFAULT_PRICELIST_ID:
+            note = (f"聯絡人沿用公司的價目表 {parent['property_product_pricelist'][1]}，不是預設價目表；"
+                    f"海外客戶沒問題，否則請改公司的價目表或傳入 pricelist_id")
+        if dry_run:
+            return _ok({'status': 'dry_run', 'company': parent['display_name'], 'would_create': vals, 'note': note})
+        new_id = _wcall('res.partner', 'create', [vals], company_id=company_id)
         contact = _wcall('res.partner', 'read', [[new_id]],
-                         {'fields': ['display_name', 'function', 'email', 'phone', 'mobile', 'type']})[0]
+                         {'fields': ['display_name', 'function', 'email', 'phone', 'mobile', 'type',
+                                     'property_product_pricelist']}, company_id=company_id)[0]
         cache.clear()
         _audit(ctx, 'add_contact_to_partner', 'res.partner', parent_partner_id, vals, parent['display_name'])
-        return _ok({'status': 'created', 'contact': contact, 'url': _generate_partner_url(new_id)})
+        return _ok({'status': 'created', 'contact': contact, 'note': note, 'url': _generate_partner_url(new_id)})
     except Exception as e:
         return _err(e, parent_partner_id=parent_partner_id)
 
@@ -6000,6 +6410,238 @@ def download_quotation_pdf(quotation_id: int, report: str = 'quotation', ctx: Co
         return _err(e, quotation_id=quotation_id)
 
 
+_PARTNER_EDITABLE = ('name', 'vat', 'email', 'phone', 'mobile', 'street', 'street2', 'city', 'zip',
+                     'website', 'function', 'lang', 'comment', 'ref')
+
+
+def update_partner(partner_id: int, name: Optional[str] = None, vat: Optional[str] = None,
+                   email: Optional[str] = None, phone: Optional[str] = None, mobile: Optional[str] = None,
+                   street: Optional[str] = None, street2: Optional[str] = None, city: Optional[str] = None,
+                   zip: Optional[str] = None, country_code: Optional[str] = None,
+                   website: Optional[str] = None, function: Optional[str] = None,
+                   lang: Optional[str] = None, comment: Optional[str] = None, ref: Optional[str] = None,
+                   is_company: Optional[bool] = None, pricelist_id: Optional[int] = None,
+                   dry_run: bool = False, ctx: Context = None) -> str:
+    """Update a customer / contact master record. Only the arguments you pass are changed.
+
+    Args:
+        partner_id: Partner ID (from search_partners)
+        name: Company or contact name
+        vat: Tax ID / 統一編號
+        email, phone, mobile, website: Contact details
+        street, street2, city, zip: Address
+        country_code: ISO country code, e.g. "TW", "MY", "VN"
+        function: Job position (contacts)
+        lang: Language for documents sent to them, e.g. "zh_TW", "en_US"
+        comment: Internal notes on the partner (replaces the existing notes)
+        ref: Internal reference / customer code
+        is_company: True = company, False = individual
+        pricelist_id: Default pricelist for new quotations (e.g. TWD vs USD). Per company
+            in Odoo; set for the default company.
+        dry_run: Show before/after without writing
+
+    Returns:
+        The values before and after for every changed field.
+    """
+    try:
+        given = {k: v for k, v in locals().items() if k in _PARTNER_EDITABLE and v is not None}
+        vals = dict(given)
+        if is_company is not None:
+            vals['is_company'] = is_company
+        if pricelist_id is not None:
+            vals['property_product_pricelist'] = pricelist_id
+        if country_code:
+            cid = _wcall('res.country', 'search', [[['code', '=', country_code.upper()]]], {'limit': 1})
+            if not cid:
+                return _err(ValueError(f"找不到國家代碼 {country_code}"))
+            vals['country_id'] = cid[0]
+        if not vals:
+            return _err(ValueError('沒有要修改的欄位'))
+        if 'vat' in vals:
+            vals['vat'] = vals['vat'].replace(' ', '')
+        company_id = DEFAULT_COMPANY_ID or _user_company_id()
+        fields = list(vals) + ['display_name']
+        before = _wcall('res.partner', 'read', [[partner_id]], {'fields': fields}, company_id=company_id)
+        if not before:
+            return _err(ValueError(f"客戶 {partner_id} 不存在"))
+        before = before[0]
+        if dry_run:
+            return _ok({'status': 'dry_run', 'partner': before['display_name'], 'changes': _diff(before, vals, vals)})
+        _wcall('res.partner', 'write', [[partner_id], vals], company_id=company_id)
+        after = _wcall('res.partner', 'read', [[partner_id]], {'fields': fields}, company_id=company_id)[0]
+        changes = _diff(before, after, vals)
+        cache.clear()
+        _audit(ctx, 'update_partner', 'res.partner', partner_id, changes, after['display_name'])
+        return _ok({'status': 'updated' if changes else 'unchanged', 'partner': {'id': partner_id, 'name': after['display_name']},
+                    'changes': changes, 'url': _generate_partner_url(partner_id)})
+    except Exception as e:
+        return _err(e, partner_id=partner_id)
+
+
+_NOTE_MODELS = {'quotation': 'sale.order', 'partner': 'res.partner', 'invoice': 'account.move',
+                'delivery': 'stock.picking', 'purchase': 'purchase.order'}
+
+
+def post_note(record_type: str, record_id: int, note: str, dry_run: bool = False, ctx: Context = None) -> str:
+    """Add an internal note to a record's chatter (visible to staff only; no email is sent
+    to the customer or to followers).
+
+    WHEN TO USE: record a phone call, a customer request, a decision, a reminder on a
+    quotation / customer / invoice / delivery.
+
+    Args:
+        record_type: quotation, partner, invoice, delivery or purchase
+        record_id: Record ID
+        note: Note text (plain text; line breaks are kept)
+        dry_run: Check the record exists without posting
+
+    Returns:
+        The posted message ID and the record link.
+    """
+    try:
+        model = _NOTE_MODELS.get(record_type)
+        if not model:
+            return _err(ValueError('record_type 只能是 quotation／partner／invoice／delivery／purchase'))
+        if not note or not note.strip():
+            return _err(ValueError('note 不能是空的'))
+        rec = _wcall(model, 'read', [[record_id]], {'fields': ['display_name']})
+        if not rec:
+            return _err(ValueError(f"{model} {record_id} 不存在"))
+        if dry_run:
+            return _ok({'status': 'dry_run', 'record': rec[0]['display_name'], 'note': note.strip()})
+        msg_id = _wcall(model, 'message_post', [[record_id]],
+                        {'body': note.strip(), 'message_type': 'comment', 'subtype_xmlid': 'mail.mt_note'})
+        if isinstance(msg_id, list):
+            msg_id = msg_id[0] if msg_id else None
+        # Log file only: the note itself is already the chatter record
+        _audit(ctx, 'post_note', model, record_id, {'note': note.strip()[:500]}, rec[0]['display_name'],
+               post_chatter=False)
+        return _ok({'status': 'posted', 'message_id': msg_id, 'record': rec[0]['display_name'],
+                    'url': _generate_record_url(record_id, model)})
+    except Exception as e:
+        return _err(e, record_id=record_id)
+
+
+_STATE_ACTIONS = {
+    'draft': ('action_draft', ('cancel', 'sent'), '設回草稿'),
+    'mark_sent': ('action_quotation_sent', ('draft',), '標記為已寄出'),
+}
+
+
+def change_quotation_state(quotation_id: int, action: str, confirm: bool = False, ctx: Context = None) -> str:
+    """Set a sent or cancelled quotation back to draft, or mark a draft as sent (without
+    emailing anything). Cancelling is deliberately not offered.
+
+    Without confirm=True only shows what would happen.
+
+    Args:
+        quotation_id: Quotation ID
+        action: draft or mark_sent
+        confirm: Must be True to apply
+
+    Returns:
+        The quotation as read back.
+    """
+    try:
+        if action not in _STATE_ACTIONS:
+            return _err(ValueError('action 只能是 draft／mark_sent（不提供取消）'))
+        method, allowed, label = _STATE_ACTIONS[action]
+        so = _wcall('sale.order', 'read', [[quotation_id]], {'fields': ['name', 'state', 'company_id']})
+        if not so:
+            return _err(ValueError(f"找不到報價單 {quotation_id}"))
+        so = so[0]
+        if so['state'] not in allowed:
+            return _err(ValueError(f"{so['name']} 狀態為 {so['state']}，不能{label}（允許的狀態：{'/'.join(allowed)}）"))
+        if not confirm:
+            return _ok({'status': 'preview', 'message': f"確認後以 confirm=True 將 {so['name']} {label}",
+                        'quotation': _read_order(quotation_id)})
+        _wcall('sale.order', method, [[quotation_id]], company_id=so['company_id'][0])
+        cache.clear()
+        result = _read_order(quotation_id)
+        _audit(ctx, f'change_quotation_state:{action}', 'sale.order', quotation_id,
+               {'from': so['state'], 'to': result['state']}, result['name'])
+        return _ok({'status': 'changed', 'from': so['state'], 'to': result['state'], 'quotation': result})
+    except Exception as e:
+        return _err(e, quotation_id=quotation_id)
+
+
+def create_or_get_partner(partner_name: str, is_company: bool = True,
+                          is_customer: bool = True, is_supplier: bool = False,
+                          vat: Optional[str] = None, phone: Optional[str] = None,
+                          email: Optional[str] = None, street: Optional[str] = None,
+                          city: Optional[str] = None, country_code: Optional[str] = "TW",
+                          pricelist_id: Optional[int] = None, lang: Optional[str] = None,
+                          dry_run: bool = False, ctx: Context = None) -> str:
+    """Create a partner (company or individual), or return the existing one with the same
+    exact name or the same tax ID (統一編號).
+
+    New partners get the site default pricelist (ODOO_DEFAULT_PRICELIST_ID, e.g. TWD):
+    Odoo's own default was USD, which left new customers' quotations in the wrong
+    currency. Pass pricelist_id for customers billed in another currency.
+
+    To change an existing partner use update_partner; to add a contact under a company
+    use add_contact_to_partner.
+
+    Args:
+        partner_name: Partner name (exact match for the existing-partner lookup)
+        is_company: True for a company (default), False for an individual
+        is_customer / is_supplier: Customer / supplier flags
+        vat: Tax ID / 統一編號 - also used to find an existing partner
+        phone, email, street, city: Details
+        country_code: ISO country code (default "TW")
+        pricelist_id: Pricelist (default: site default)
+        lang: Document language, e.g. "zh_TW", "en_US"
+        dry_run: Show what would be created without writing
+
+    Returns:
+        status 'existing' or 'created', with the partner's ID, name, tax ID and pricelist.
+    """
+    try:
+        company_id = DEFAULT_COMPANY_ID or _user_company_id()
+        fields = ['display_name', 'is_company', 'vat', 'customer_rank', 'supplier_rank', 'property_product_pricelist']
+        found = _wcall('res.partner', 'search_read', [[['name', '=', partner_name]]],
+                       {'fields': fields, 'limit': 1}, company_id=company_id)
+        clean_vat = vat.replace(' ', '') if vat else None
+        if not found and clean_vat:
+            found = _wcall('res.partner', 'search_read', [[['vat', '=', clean_vat], ['parent_id', '=', False]]],
+                           {'fields': fields, 'limit': 1}, company_id=company_id)
+        if found:
+            p = found[0]
+            out = {'status': 'existing', 'partner': {'id': p['id'], 'name': p['display_name'], 'vat': p['vat'] or None,
+                                                     'pricelist': _m2o(p['property_product_pricelist'])},
+                   'url': _generate_partner_url(p['id'])}
+            want = pricelist_id or DEFAULT_PRICELIST_ID
+            if want and p['property_product_pricelist'] and p['property_product_pricelist'][0] != want:
+                out['note'] = (f"既有客戶的價目表是 {p['property_product_pricelist'][1]}；"
+                               f"若要改用預設價目表，用 update_partner(partner_id={p['id']}, pricelist_id={want})")
+            return _ok(out)
+
+        vals = {'name': partner_name, 'is_company': is_company,
+                'customer_rank': 1 if is_customer else 0, 'supplier_rank': 1 if is_supplier else 0}
+        for k, v in (('vat', clean_vat), ('phone', phone), ('email', email), ('street', street),
+                     ('city', city), ('lang', lang)):
+            if v:
+                vals[k] = v
+        if country_code:
+            cid = _wcall('res.country', 'search', [[['code', '=', country_code.upper()]]], {'limit': 1})
+            if cid:
+                vals['country_id'] = cid[0]
+        pl = pricelist_id or DEFAULT_PRICELIST_ID
+        if pl:
+            vals['property_product_pricelist'] = pl
+        if dry_run:
+            return _ok({'status': 'dry_run', 'would_create': vals})
+        new_id = _wcall('res.partner', 'create', [vals], company_id=company_id)
+        p = _wcall('res.partner', 'read', [[new_id]], {'fields': fields}, company_id=company_id)[0]
+        cache.clear()
+        _audit(ctx, 'create_partner', 'res.partner', new_id, vals, p['display_name'])
+        return _ok({'status': 'created', 'partner': {'id': new_id, 'name': p['display_name'], 'vat': p['vat'] or None,
+                                                     'pricelist': _m2o(p['property_product_pricelist'])},
+                    'url': _generate_partner_url(new_id)})
+    except Exception as e:
+        return _err(e)
+
+
 async def _serve_pdf(request):
     from starlette.responses import Response, PlainTextResponse
     item = _pdf_store.get(request.path_params['token'])
@@ -6013,6 +6655,7 @@ WRITE_TOOLS = [
     create_quotation, update_quotation, update_quotation_lines,
     preview_quotation_copy, copy_quotation, confirm_quotation,
     update_partner_terms, add_contact_to_partner, download_quotation_pdf,
+    update_partner, post_note, change_quotation_state, create_or_get_partner,
 ]
 
 
