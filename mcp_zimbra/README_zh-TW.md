@@ -1,10 +1,10 @@
 # Zimbra MCP Server
 
-以 FastMCP 為基礎的 Zimbra Collaboration Suite 整合工具，讓 LLM 可透過自然語言查詢與管理 Zimbra 郵件系統。提供 53 個 MCP 工具，涵蓋帳號、網域、郵件佇列、權限稽核、信件內容、行事曆與工作項目。
+以 FastMCP 為基礎的 Zimbra Collaboration Suite 整合工具，讓 LLM 可透過自然語言查詢與管理 Zimbra 郵件系統。提供 58 個 MCP 工具，涵蓋帳號、網域、郵件佇列、權限稽核、信件內容、行事曆與工作項目。
 
 - 作者：Jason Cheng（與 Claude Code 共同建置）
 - 授權：MIT
-- 版本：v1.11.1（2026-10-06）
+- 版本：v1.12.0（2026-10-09）
 - 語言：[English](README.md) · [繁體中文](README_zh-TW.md)
 
 ---
@@ -44,7 +44,7 @@ export ZIMBRA_ADMIN_USER="admin"
 export ZIMBRA_ADMIN_PASS="CHANGE_ME"
 ```
 
-可用工具：44 個基本工具 + 9 個信件讀取工具。
+可用工具：44 個基本工具 + 14 個信件讀取工具。
 
 ### 使用者模式
 
@@ -55,11 +55,11 @@ export ZIMBRA_USER_EMAIL="user@example.com"
 export ZIMBRA_USER_PASS="CHANGE_ME"
 ```
 
-可用工具：13 個基本工具 + 9 個信件讀取工具。管理類工具不會註冊。
+可用工具：13 個基本工具 + 14 個信件讀取工具。管理類工具不會註冊。
 
 ### 信件讀取開關
 
-信件、行事曆、工作項目這 9 個工具**預設關閉**，要明確開啟：
+信件、附件、行事曆、工作項目這 14 個工具**預設關閉**，要明確開啟：
 
 ```bash
 export ZIMBRA_ENABLE_MAIL_READ="true"
@@ -195,19 +195,22 @@ SSE 與 streamable-http 模式支援 `--api-key`，未帶正確的 `Authorizatio
 | `getInactiveAccounts` | 列出閒置超過 N 天的帳號 |
 | `searchByAttribute` | 以任意 LDAP 屬性搜尋 |
 
-### 信件讀寫（7 個）†
+### 信件讀寫（10 個）†
 
 | 工具 | 說明 |
 |------|------|
-| `searchMail` | 依主旨／寄件者／收件者／內文／日期搜尋信箱（資料夾支援模糊比對） |
-| `getMailDetail` | 取單封信全文、標頭與附件清單 |
-| `getConversation` | 取整串對話 |
-| `getMailAttachment` | 下載附件到本機（`~/Downloads`） |
+| `searchMail` | 依主旨（單一字詞可比對到較長字串中間）、寄件者、收件者、內文、日期、`since`（精確到秒）、附件檔名搜尋；資料夾可含子資料夾；每封附資料夾路徑與摘要 |
+| `getMailDetail` | 單封信：標頭、純文字內文（HTML 自動轉文字）、去除引用的 `body_latest`、可選 HTML、附件清單 |
+| `getMailDetails` | 一次讀多封（最多 50 封） |
+| `getConversation` | 整串對話，附 `reply_state`：誰最後回、是否在等我回覆（別名算自己） |
+| `getMailAttachment` | 附件：HTTP 模式回傳一次性下載連結（10 分鐘，用 curl 抓）、base64（10 MB 內）或存檔；可用檔名樣式（例如 `*-A4.pdf`）選附件、指定存檔名 |
+| `getAttachmentText` | 擷取附件文字：PDF 文字層，掃描檔自動 OCR（繁中＋英文）；圖片 OCR；文字檔 |
+| `waitForMail` | 等待指定寄件者／主旨的新信進來（輪詢，最長 10 分鐘） |
 | `listFolders` | 列出信箱資料夾，可用關鍵字篩選 |
-| `saveDraft` | 新信或回覆／轉寄存成草稿供人工確認後送出 |
+| `saveDraft` | 新信或回覆／轉寄存成草稿供人工確認後送出（不會寄出）；可附加 base64 檔案或其他信件的附件 |
 | `searchContacts` | 搜尋個人通訊錄 |
 
-### 行事曆與工作（4 個）†
+### 行事曆與工作（6 個）†
 
 | 工具 | 說明 |
 |------|------|
@@ -215,6 +218,12 @@ SSE 與 streamable-http 模式支援 `--api-key`，未帶正確的 `Authorizatio
 | `getAppointment` | 取單一約會完整內容：描述、參與者與答覆狀態、重複規則、附件 |
 | `searchTasks` | 查詢工作項目，可依資料夾、狀態、到期日篩選 |
 | `createAppointment` | 建立個人約會：主旨、起迄時間、地點、備註、所屬行事曆、全天、提醒 |
+| `updateAppointment` | 修改個人約會的主旨、時間、地點、備註、提醒；支援 `dry_run` |
+| `deleteAppointment` | 刪除個人約會（`confirm=true` 才執行，否則只預覽） |
+
+行事曆寫入預設只動主要的 `Calendar`；修改或刪除其他行事曆（共用、家人的）要明確帶 `allow_other_calendar=true`。有參與者的約會一律拒絕，因為修改會寄通知給參與者。行事曆與草稿的寫入都會記錄在 `ZIMBRA_AUDIT_LOG`（預設 `~/.local/state/mcp_zimbra/audit.jsonl`）。
+
+`getAttachmentText` 需要伺服器上有 `pdftotext`／`pdfinfo`（poppler-utils），OCR 需要 `tesseract` 和 `chi_tra` 語言檔（`apt install poppler-utils tesseract-ocr tesseract-ocr-chi-tra`）。
 
 約會與工作屬於行事曆項目而非郵件，`searchMail` 永遠找不到它們。行事曆與工作的工具改用 `types="appointment"` 與 `types="task"`，走的是同一套管理員委派的郵件 API，同樣受 `ZIMBRA_ENABLE_MAIL_READ` 控制。
 

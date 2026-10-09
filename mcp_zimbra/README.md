@@ -1,9 +1,9 @@
 # Zimbra MCP Server
 
-**Version:** 1.11.1
+**Version:** 1.12.0
 **Author:** Jason Cheng (co-created with Claude Code)
 **License:** MIT
-**Last Updated:** 2026-10-06
+**Last Updated:** 2026-10-09
 **Repository:** [github.com/jasoncheng7115/jasontools-mcp](https://github.com/jasoncheng7115/jasontools-mcp)
 **Language:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -78,7 +78,7 @@ export ZIMBRA_ENABLE_MAIL_READ="true"   # Optional: enable mail read tools
 
 ### Feature Toggle: Mail Read
 
-`ZIMBRA_ENABLE_MAIL_READ` controls 5 mail reading tools (default: `false`):
+`ZIMBRA_ENABLE_MAIL_READ` controls the mailbox tools - mail, attachments, calendar and tasks (default: `false`). The core ones:
 
 | Tool | Description |
 |------|-------------|
@@ -86,7 +86,7 @@ export ZIMBRA_ENABLE_MAIL_READ="true"   # Optional: enable mail read tools
 | `getMailDetail` | Get full message content, headers, attachment list |
 | `getConversation` | Get all messages in a conversation thread |
 | `listFolders` | List mailbox folders |
-| `getMailAttachment` | Download email attachment to local file |
+| `getMailAttachment` | Attachment as a one-time download link (HTTP), base64, or saved file; pick by part ID or file-name pattern |
 
 **User Mode Tools (always available):**
 | Category | Tools |
@@ -383,19 +383,22 @@ Endpoint: `http://<host>:<port>/mcp` (stateless — no session is kept between r
 | `getInactiveAccounts` | List accounts inactive for N+ days |
 | `searchByAttribute` | Generic LDAP filter search for any attribute |
 
-### Mail Search (7 tools)
+### Mail Search (10 tools)
 
 | Tool | Description |
 |------|-------------|
-| `searchMail` | Search mailbox by subject/sender/recipient/body/date (fuzzy folder match) |
-| `getMailDetail` | Get full message with body, headers, attachment list |
-| `getConversation` | Get all messages in a conversation thread |
-| `getMailAttachment` | Download attachment to local file (~/Downloads) |
+| `searchMail` | Search by subject (one word also matches inside longer tokens) / sender / recipient / body / date / `since` (to the second) / attachment file name; folder with optional subfolders; each result has folder_path and snippet |
+| `getMailDetail` | Full message: headers, plain-text body (HTML converted), `body_latest` without quoted history, optional HTML, attachment list |
+| `getMailDetails` | **⚡ NEW** - Up to 50 messages in one call |
+| `getConversation` | All messages in a thread, plus `reply_state`: who wrote last, and whether it is waiting for my reply (aliases count as me) |
+| `getMailAttachment` | **⚡ UPDATED** - Attachment as a one-time download link (HTTP transports, 10 min, fetch with curl), base64 (≤10 MB) or saved file; `filename_pattern` (e.g. `*-A4.pdf`) instead of a part ID; `filename` to rename |
+| `getAttachmentText` | **⚡ NEW** - Text of a PDF (text layer, or OCR `chi_tra+eng` for scans), image (OCR) or text attachment |
+| `waitForMail` | **⚡ NEW** - Wait until a mail from a sender / with a subject arrives (polls, up to 10 min) |
 | `listFolders` | List mailbox folders with optional keyword filter |
-| `saveDraft` | Save new email or reply/forward as draft for review |
+| `saveDraft` | Save new email or reply/forward as draft for review (nothing is sent); attachments as base64 or taken from another message |
 | `searchContacts` | Search user's personal address book / contacts |
 
-### Calendar & Tasks (4 tools)
+### Calendar & Tasks (6 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -403,6 +406,18 @@ Endpoint: `http://<host>:<port>/mcp` (stateless — no session is kept between r
 | `getAppointment` | **⚡ NEW** - One appointment in full: description, attendees with reply status, recurrence, attachments |
 | `searchTasks` | **⚡ NEW** - Zimbra Tasks filtered by folder, status and due date |
 | `createAppointment` | **⚡ NEW** - Create a personal appointment: subject, start/end, location, notes, calendar, all-day, reminder |
+| `updateAppointment` | **⚡ NEW** - Change subject, time, location, notes or reminder of a personal appointment; `dry_run` |
+| `deleteAppointment` | **⚡ NEW** - Delete a personal appointment (`confirm=true`; otherwise a preview) |
+
+Calendar writes default to the main `Calendar`. Changing or deleting an appointment in any
+other calendar (a shared or family calendar) needs `allow_other_calendar=true`, and
+appointments with attendees are refused, because changing them would email the attendees.
+Calendar and draft writes are recorded in `ZIMBRA_AUDIT_LOG`
+(default `~/.local/state/mcp_zimbra/audit.jsonl`).
+
+`getAttachmentText` needs `pdftotext` / `pdfinfo` (poppler-utils) on the server, and
+`tesseract` with the `chi_tra` language for OCR (`apt install poppler-utils tesseract-ocr
+tesseract-ocr-chi-tra`).
 
 Appointments and tasks are calendar items, not messages, so `searchMail` can never
 return them. The calendar and task tools use `types="appointment"` / `types="task"` against the
@@ -578,7 +593,26 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 
 ## 📜 Version History
 
-### v1.11.1 (2026-10-06) - Current
+### v1.12.0 (2026-10-09) - Current
+
+**FEATURE — attachments, text extraction, search, reading, calendar edits**
+
+- Attachments: one-time download links on HTTP transports (files saved on the server
+  ended up in the service's private /tmp, out of the client's reach), base64, rename,
+  pick by file-name pattern. `getAttachmentText` reads PDF text or OCRs scans.
+- `searchMail`: `include_subfolders`, `attachment_name`, `since`, `include_attachment_names`,
+  `folder_path` and `snippet` per result; one-word subjects match inside longer tokens
+  (`DC2026167` did not find `採購單-DC2026167-02`).
+- `getMailDetail` reads the HTML body: HTML-only mail used to come back with an empty body.
+  New `body_text`, `body_latest` (quoted history removed), `include_html`; `message_id` is
+  accepted for `msg_id`. New `getMailDetails` (batch) and `waitForMail`.
+- `getConversation` reports who wrote last (`reply_state`).
+- `updateAppointment`, `deleteAppointment`, with the calendar guard above.
+- `saveDraft` attachments. Fix: replies quoted an empty original because the quote was
+  built from a field `getMailDetail` did not return.
+- Tool results are plain JSON text, not `{"result": "<json string>"}`.
+
+### v1.11.1 (2026-10-06)
 
 **FIX — active accounts reported as locked**
 

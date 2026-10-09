@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MCP server for Zimbra Collaboration Suite - v1.11.1
+MCP server for Zimbra Collaboration Suite - v1.12.0
 ===============================================================================
 Author: Jason Cheng (co-created with Claude Code)
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Created: 2025-01-27
-Updated: 2026-10-06
+Updated: 2026-10-09
 
 Reference:
 This implementation follows design patterns from mcp_wazuh_sample.py
@@ -16,6 +16,29 @@ FastMCP-based Zimbra integration providing comprehensive email system monitoring
 and analysis capabilities through natural language interactions.
 
 Version History:
+- v1.12.0 (2026-10-09): FEATURE - attachments, text extraction, search, reading, calendar edits
+  - getMailAttachment: one-time download link over HTTP (/dl/<token>, 10 min), base64
+    (<=10 MB) or saved file; filename override; filename_pattern picks attachments
+    without a part_id. Files saved on the server landed in the unit's PrivateTmp,
+    which clients could not reach.
+  - getAttachmentText: PDF text layer (pdftotext), OCR chi_tra+eng (tesseract) when a
+    PDF is a scan, OCR for images, text files.
+  - searchMail: include_subfolders (under:), attachment_name (filename:), since
+    (to the second), include_attachment_names, folder_path + snippet per message;
+    a one-word subject also matches inside longer tokens (subject:*X*).
+  - getMailDetail: reads the HTML body (html=1); body_text is plain text converted from
+    HTML when there is no text part (HTML-only mail used to return an empty body),
+    body_latest drops quoted history, include_html; "message_id" accepted for msg_id.
+  - getMailDetails (batch, <=50), waitForMail (async poll until a matching mail arrives).
+  - getConversation: reply_state (last_from_self / last_from_other / awaiting_my_reply,
+    aliases count as self), body_latest per message.
+  - updateAppointment / deleteAppointment (confirm); calendars other than 'Calendar'
+    need allow_other_calendar=true; appointments with attendees are refused.
+  - saveDraft: attachments (base64 or another message's part), list recipients.
+    FIX: reply quoting read getMailDetail's missing "body_text" field and quoted nothing.
+  - Tools return plain JSON text (structured_output off): clients no longer receive
+    {"result": "<json string>"} that had to be decoded twice.
+  - Write audit log (ZIMBRA_AUDIT_LOG, default ~/.local/state/mcp_zimbra/audit.jsonl).
 - v1.11.1 (2026-10-06): FIX - models reported active accounts as locked
   - zimbraPasswordLocked=TRUE (user may not change their own password) was read as an
     account lock; a user's model concluded "帳號目前已被鎖定" for an active account
@@ -320,11 +343,12 @@ import hashlib
 import re
 import inspect
 import urllib3
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
+import asyncio
 import xml.etree.ElementTree as ET
 
 import requests
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -696,11 +720,16 @@ mcp_server = FastMCP(
     stateless_http=True,
 )
 
+_tool = lambda: mcp_server.tool(structured_output=False)  # noqa: E731
+# Tools return a JSON string. With structured output on, clients received it wrapped as
+# {"result": "<json string>"} and had to decode twice.
+
+
 def admin_only_tool():
     """Decorator factory: registers tool only in admin mode, skips in user mode."""
     def decorator(func):
         if zimbra_config.auth_mode == "admin":
-            return mcp_server.tool()(func)
+            return _tool()(func)
         return func  # user mode: don't register
     return decorator
 
@@ -708,7 +737,7 @@ def mail_read_tool():
     """Decorator factory: registers tool only when ZIMBRA_ENABLE_MAIL_READ is true."""
     def decorator(func):
         if zimbra_config.enable_mail_read:
-            return mcp_server.tool()(func)
+            return _tool()(func)
         return func  # mail read disabled: don't register
     return decorator
 
@@ -3233,7 +3262,7 @@ def getQuotaUsage(domain: Optional[str] = None,
 
 # ------------------- Mail Tracing (jt_zmmsgtrace) -------------------
 
-@mcp_server.tool()
+@_tool()
 def jt_zmmsgtrace_search_by_sender(sender: str,
                                     limit: int = 100,
                                     offset: int = 0) -> str:
@@ -3263,7 +3292,7 @@ def jt_zmmsgtrace_search_by_sender(sender: str,
             "message": f"Failed to search by sender: {str(e)}"
         })
 
-@mcp_server.tool()
+@_tool()
 def jt_zmmsgtrace_search_by_recipient(recipient: str,
                                        limit: int = 100,
                                        offset: int = 0) -> str:
@@ -3293,7 +3322,7 @@ def jt_zmmsgtrace_search_by_recipient(recipient: str,
             "message": f"Failed to search by recipient: {str(e)}"
         })
 
-@mcp_server.tool()
+@_tool()
 def jt_zmmsgtrace_search_by_message_id(message_id: str,
                                         limit: int = 100,
                                         offset: int = 0) -> str:
@@ -3323,7 +3352,7 @@ def jt_zmmsgtrace_search_by_message_id(message_id: str,
             "message": f"Failed to search by message ID: {str(e)}"
         })
 
-@mcp_server.tool()
+@_tool()
 def jt_zmmsgtrace_search_by_host(srchost: Optional[str] = None,
                                   desthost: Optional[str] = None,
                                   limit: int = 100,
@@ -3362,7 +3391,7 @@ def jt_zmmsgtrace_search_by_host(srchost: Optional[str] = None,
             "message": f"Failed to search by host: {str(e)}"
         })
 
-@mcp_server.tool()
+@_tool()
 def jt_zmmsgtrace_search_by_time(time_range: str,
                                   sender: Optional[str] = None,
                                   recipient: Optional[str] = None,
@@ -3398,7 +3427,7 @@ def jt_zmmsgtrace_search_by_time(time_range: str,
             "message": f"Failed to search by time: {str(e)}"
         })
 
-@mcp_server.tool()
+@_tool()
 def jt_zmmsgtrace_search(sender: Optional[str] = None,
                           recipient: Optional[str] = None,
                           message_id: Optional[str] = None,
@@ -3491,7 +3520,7 @@ def _health_check_user_mode() -> str:
             }
         }, cls=DateTimeJSONEncoder)
 
-@mcp_server.tool()
+@_tool()
 def health_check() -> str:
     """Perform comprehensive health check on Zimbra infrastructure including API connectivity and all services."""
     logger.info("Executing comprehensive health check")
@@ -3629,7 +3658,7 @@ def health_check() -> str:
             }
         }, cls=DateTimeJSONEncoder)
 
-@mcp_server.tool()
+@_tool()
 def clear_cache() -> str:
     """Clear all cached API responses to force fresh data retrieval."""
     logger.info("Clearing cache")
@@ -3639,7 +3668,7 @@ def clear_cache() -> str:
         "message": "Cache cleared successfully"
     })
 
-@mcp_server.tool()
+@_tool()
 def cache_stats() -> str:
     """Get cache performance statistics including entry counts and TTL configuration."""
     logger.info("Retrieving cache statistics")
@@ -4565,13 +4594,17 @@ def searchMail(account: str,
                date_to: Optional[str] = None,
                has_attachment: bool = False,
                limit: int = 50,
-               offset: int = 0) -> str:
+               offset: int = 0,
+               include_subfolders: bool = False,
+               attachment_name: Optional[str] = None,
+               since: Optional[str] = None,
+               include_attachment_names: bool = False) -> str:
     """Search an account's mailbox by subject, sender, recipient, body content, date range, and more.
 
     Args:
         account: Target account email. Example: "user@example.com".
         query: Raw Zimbra search query (advanced). Example: "subject:meeting from:boss". Combined (AND) with any other filters given.
-        subject: Search in subject line. Example: "meeting invitation".
+        subject: Search in subject line; a single word also matches inside longer tokens (e.g. "DC2026167" finds "採購單-DC2026167-02"). Example: "meeting invitation".
         sender: Search by sender email (From). Example: "boss@example.com".
         recipient: Search by recipient email (To). Example: "team@example.com".
         cc: Search by CC recipient email. Example: "manager@example.com".
@@ -4582,6 +4615,12 @@ def searchMail(account: str,
         has_attachment: Only messages with attachments. Default: false.
         limit: Max results. Default: 50. Range: 1-500.
         offset: Starting position for pagination. Default: 0.
+        include_subfolders: With folder, also search all its subfolders (e.g. folder="inbox" + include_subfolders covers "Inbox/Proxmox 交易/<customer>"). Default: false.
+        attachment_name: Attachment file name text. Example: "S01439" or "報價單".
+        since: Only mail received at or after this time, "YYYY-MM-DDTHH:MM:SS" (local). Finer than date_from.
+        include_attachment_names: Also list attachment file names per message (one extra request per message with attachments, max 30). Default: false.
+
+    Every message carries folder_path and a plain-text snippet.
     """
     logger.info(f"Searching mail for account={account}, subject={subject}, sender={sender}, limit={limit}")
 
@@ -4589,7 +4628,12 @@ def searchMail(account: str,
         # Build search query: raw query AND structured filters
         parts = [f'({query.strip()})'] if query and query.strip() else []
         if subject:
-            parts.append(f'subject:("{subject}")')
+            subj = subject.strip()
+            if re.fullmatch(r'[^\s"()]+', subj):
+                # Zimbra matches whole tokens: "DC2026167" misses "採購單-DC2026167-02".
+                parts.append(f'(subject:"{subj}" OR subject:*{subj}*)')
+            else:
+                parts.append(f'subject:("{subj}")')
         if sender:
             parts.append(f'from:({sender})')
         if recipient:
@@ -4598,7 +4642,17 @@ def searchMail(account: str,
             parts.append(f'cc:({cc})')
         if content:
             parts.append(f'content:("{content}")')
-        if folder:
+        if attachment_name:
+            parts.append(f'filename:"{attachment_name.strip()}"')
+        if folder and include_subfolders:
+            try:
+                matched = _fuzzy_match_folders(_get_account_folders(account), folder)
+            except Exception:
+                matched = []
+            paths = [m["path"] for m in matched] or [folder]
+            clause = ' OR '.join(f'under:"{p}"' for p in paths)
+            parts.append(f'({clause})' if len(paths) > 1 else clause)
+        elif folder:
             # Check if it's an exact system folder name
             system_folders = ('inbox', 'sent', 'drafts', 'junk', 'trash')
             if folder.lower() in system_folders:
@@ -4639,6 +4693,15 @@ def searchMail(account: str,
                                f"Accepted: YYYY-MM-DD, YYYY/MM/DD, MM/DD/YYYY."
                 })
             parts.append(f'before:{(dt + timedelta(days=1)).strftime("%Y/%m/%d")}')
+        since_ms = None
+        if since:
+            try:
+                since_dt = datetime.strptime(since.replace('T', ' ')[:19], '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                return tool_response({"status": "error",
+                                      "message": f"Invalid since '{since}'. Use YYYY-MM-DDTHH:MM:SS."})
+            since_ms = int(since_dt.timestamp() * 1000)
+            parts.append(f'after:{(since_dt - timedelta(days=1)).strftime("%Y/%m/%d")}')
         if has_attachment:
             parts.append('has:attachment')
         search_query = ' '.join(parts) if parts else 'in:inbox'
@@ -4659,7 +4722,10 @@ def searchMail(account: str,
         ns_mail = 'urn:zimbraMail'
 
         messages = []
+        folder_paths = _folder_paths(account)
         for msg_elem in root.findall(f'.//{{{ns_mail}}}m'):
+            if since_ms and int(msg_elem.get('d') or 0) < since_ms:
+                continue
             msg_id = msg_elem.get('id', '')
             size = msg_elem.get('s', '0')
             date_ms = msg_elem.get('d', '')
@@ -4712,9 +4778,18 @@ def searchMail(account: str,
                 "unread": 'u' in flags,
                 "flagged": 'f' in flags,
                 "has_attachment": 'a' in flags,
+                "folder_path": folder_paths.get(_folder_num(msg_elem.get('l', '')), ''),
+                "snippet": (fragment or '')[:200],
                 "replied": 'r' in flags,
                 "forwarded": 'w' in flags
             })
+
+        if include_attachment_names:
+            for m in [m for m in messages if m["has_attachment"]][:30]:
+                try:
+                    m["attachment_names"] = [p["filename"] for p in _message_parts(account, m["id"])]
+                except Exception as att_err:
+                    m["attachment_names_error"] = str(att_err)[:100]
 
         # Parse pagination from SearchResponse
         search_response = root.find(f'.//{{{ns_mail}}}SearchResponse')
@@ -4751,13 +4826,20 @@ def searchMail(account: str,
 
 @mail_read_tool()
 def getMailDetail(account: str,
-                  msg_id: str) -> str:
+                  msg_id: Optional[str] = None,
+                  include_html: bool = False,
+                  message_id: Optional[str] = None) -> str:
     """Get full detail of a specific email message including complete headers, body text, and attachment list.
 
     Args:
         account: Account email address. Example: "user@example.com".
-        msg_id: Message ID from searchMail "id" field. Must be non-empty. Example: "894727" or "4ef3bd6d-e227-4986-8993-98443101a169:894727".
+        msg_id: Message ID from searchMail "id" field. Must be non-empty. Example: "894727" or "4ef3bd6d-e227-4986-8993-98443101a169:894727". ("message_id" is accepted too.)
+        include_html: Also return the HTML body (body_html). Default false.
+
+    Returns body_text (HTML converted to plain text when the mail has no text part) and
+    body_latest (only the newly written part of a reply, quoted history removed).
     """
+    msg_id = msg_id or message_id
     logger.info(f"Getting mail detail for account={account}, msg_id={msg_id}")
 
     if not msg_id or not str(msg_id).strip():
@@ -4769,7 +4851,7 @@ def getMailDetail(account: str,
     try:
         soap_body = f"""
         <GetMsgRequest xmlns="urn:zimbraMail">
-            <m id="{msg_id}" html="0" needExp="1"/>
+            <m id="{msg_id}" html="1" needExp="1"/>
         </GetMsgRequest>
         """
 
@@ -4854,14 +4936,16 @@ def getMailDetail(account: str,
 
         parse_mime_parts(msg_elem)
 
-        # If no text/plain, try text/html
-        if not body_text:
-            for mp_elem in msg_elem.findall(f'.//{{{ns_mail}}}mp'):
-                if mp_elem.get('ct') == 'text/html':
-                    content_elem = mp_elem.find(f'{{{ns_mail}}}content')
-                    if content_elem is not None and content_elem.text:
-                        body_text = f"[HTML content]\n{content_elem.text[:2000]}"
-                        break
+        # html="1" returns the HTML alternative when there is one; keep it and derive text.
+        body_html = ''
+        for mp_elem in msg_elem.findall(f'.//{{{ns_mail}}}mp'):
+            if mp_elem.get('ct') == 'text/html' and not mp_elem.get('filename'):
+                content_elem = mp_elem.find(f'{{{ns_mail}}}content')
+                if content_elem is not None and content_elem.text:
+                    body_html = content_elem.text
+                    break
+        if not body_text and body_html:
+            body_text = _html_to_text(body_html)
 
         # Convert date
         date_str = ''
@@ -4898,6 +4982,9 @@ def getMailDetail(account: str,
                 "flagged": 'f' in flags,
                 "has_attachment": 'a' in flags,
                 "body": body_text[:5000] if body_text else '',
+                "body_text": body_text[:20000] if body_text else '',
+                "body_latest": _latest_reply(body_text)[:5000] if body_text else '',
+                "body_html": (body_html[:60000] if include_html else None),
                 "attachments": attachments if attachments else None,
                 "headers": headers if headers else None,
                 "fragment": fragment
@@ -4921,6 +5008,9 @@ def getConversation(account: str,
     Args:
         account: Account email. Example: "user@example.com".
         conversation_id: Conversation ID from searchMail "conversation_id" field. Must be non-empty. Example: "-12345".
+
+    reply_state tells who wrote last (last_from_self / last_from_other / last_sender_is_self /
+    awaiting_my_reply), counting the account's aliases as "self".
         limit: Max messages to return (keeps newest). Default: 25.
     """
     logger.info(f"Getting conversation: account={account}, conv_id={conversation_id}")
@@ -4934,7 +5024,7 @@ def getConversation(account: str,
     try:
         soap_body = f"""
         <GetConvRequest xmlns="urn:zimbraMail">
-            <c id="{conversation_id}" fetch="all" html="0"/>
+            <c id="{conversation_id}" fetch="all" html="1"/>
         </GetConvRequest>
         """
 
@@ -4974,21 +5064,18 @@ def getConversation(account: str,
             fragment = fr_elem.text if fr_elem is not None and fr_elem.text else ''
 
             # Body text from mime parts
-            body_text = ''
-            for mp_elem in msg_elem.findall(f'.//{{{ns_mail}}}mp'):
-                if mp_elem.get('ct') == 'text/plain':
-                    content_elem = mp_elem.find(f'{{{ns_mail}}}content')
-                    if content_elem is not None and content_elem.text:
-                        body_text = content_elem.text
-                        break
+            body_text, _html_unused, _atts = _parse_msg_body(msg_elem, ns_mail)
 
             # Email addresses
             from_addrs = []
             to_addrs = []
             cc_addrs = []
+            from_email = ''
             for e_elem in msg_elem.findall(f'{{{ns_mail}}}e'):
                 addr_type = e_elem.get('t', '')
                 addr = e_elem.get('a', '')
+                if addr_type == 'f' and not from_email:
+                    from_email = addr.lower()
                 display = e_elem.get('p') or e_elem.get('d', '')
                 entry = f"{display} <{addr}>" if display else addr
                 if addr_type == 'f':
@@ -5015,6 +5102,8 @@ def getConversation(account: str,
                 "cc": cc_addrs if cc_addrs else None,
                 "date": date_str,
                 "body": body_text[:3000] if body_text else fragment,
+                "body_latest": _latest_reply(body_text)[:2000] if body_text else fragment,
+                "_from_email": from_email,
                 "size_bytes": int(size) if size else 0,
                 "folder_id": folder_id,
                 "unread": 'u' in flags,
@@ -5023,6 +5112,20 @@ def getConversation(account: str,
 
         # Sort by date ascending (oldest first = conversation order)
         messages.sort(key=lambda x: x["date"])
+
+        # Who wrote last: "self" is the account or one of its aliases
+        own = _account_addresses(account)
+        last_self = next((m for m in reversed(messages) if m["_from_email"] in own), None)
+        last_other = next((m for m in reversed(messages) if m["_from_email"] and m["_from_email"] not in own), None)
+        for m in messages:
+            m["from_self"] = m.pop("_from_email") in own
+        reply_state = {
+            "last_from_self": {"id": last_self["id"], "date": last_self["date"]} if last_self else None,
+            "last_from_other": {"id": last_other["id"], "date": last_other["date"],
+                                "from": last_other["from"]} if last_other else None,
+            "last_sender_is_self": bool(messages) and messages[-1]["from_self"],
+        }
+        reply_state["awaiting_my_reply"] = bool(last_other) and (not last_self or last_other["date"] > last_self["date"])
 
         total_in_thread = len(messages)
         truncated = False
@@ -5036,6 +5139,7 @@ def getConversation(account: str,
             "conversation_id": conversation_id,
             "subject": conv_subject,
             "message_count": int(num_messages) if num_messages else total_in_thread,
+            "reply_state": reply_state,
             "messages": messages,
             "display_message": f"Conversation '{conv_subject}' - {len(messages)} messages"
         }
@@ -5052,156 +5156,6 @@ def getConversation(account: str,
             "message": f"Failed to get conversation: {str(e)}"
         })
 
-
-@mail_read_tool()
-def getMailAttachment(account: str,
-                      msg_id: str,
-                      part_id: str,
-                      save_dir: str = "~/Downloads") -> str:
-    """Download an email attachment to a local file. Use getMailDetail first to find part_id values.
-
-    Args:
-        account: Account email. Example: "user@example.com".
-        msg_id: Message ID from searchMail "id" field. Must be non-empty. Example: "894727" or "4ef3bd6d-e227-4986-8993-98443101a169:894727".
-        part_id: Attachment part ID from getMailDetail results. Must be non-empty. Example: "2", "1.2".
-        save_dir: Directory to save the file. Default: "~/Downloads".
-    """
-    logger.info(f"Downloading attachment: account={account}, msg_id={msg_id}, part={part_id}")
-
-    if not msg_id or not str(msg_id).strip():
-        return tool_response({
-            "status": "error",
-            "message": "msg_id is required and cannot be empty. Use the 'id' field from searchMail results."
-        })
-    if not part_id or not str(part_id).strip():
-        return tool_response({
-            "status": "error",
-            "message": "part_id is required and cannot be empty. Use getMailDetail first to find attachment part_id values."
-        })
-
-    try:
-        if zimbra_config.auth_mode == "user":
-            # User mode: use user auth token directly, no DelegateAuth
-            if account.lower() != zimbra_config.user_email.lower():
-                raise Exception(
-                    f"User mode: cannot access attachments of '{account}'. "
-                    f"Only '{zimbra_config.user_email}' is accessible."
-                )
-            delegate_token = get_user_auth_token()
-            base_url = zimbra_config.mail_url.rstrip('/')
-        else:
-            # === ADMIN MODE: DelegateAuth flow ===
-            delegate_soap = f"""
-            <DelegateAuthRequest xmlns="urn:zimbraAdmin">
-                <account by="name">{account}</account>
-            </DelegateAuthRequest>
-            """
-            root = query_zimbra_api(delegate_soap, enable_cache=False)
-            parse_zimbra_response(root)
-
-            ns = {'zimbra': 'urn:zimbraAdmin'}
-            token_elem = root.find('.//zimbra:authToken', ns)
-            if token_elem is None or not token_elem.text:
-                raise Exception(f"Failed to get delegated auth token for {account}")
-            delegate_token = token_elem.text
-
-            base_url = get_mail_base_url()
-
-        download_url = (
-            f"{base_url}/service/home/~/"
-            f"?auth=qp&zauthtoken={delegate_token}"
-            f"&id={msg_id}&part={part_id}"
-        )
-
-        # Step 3: Download attachment via streaming
-        response = http_session.get(
-            download_url,
-            timeout=zimbra_config.request_timeout * 3,
-            stream=True
-        )
-        response.raise_for_status()
-
-        # Step 4: Determine filename
-        filename = None
-        content_disp = response.headers.get('Content-Disposition', '')
-
-        # Try RFC 5987 encoded filename (filename*=UTF-8''...)
-        match = re.search(r"filename\*=(?:UTF-8|utf-8)''(.+?)(?:;|$)", content_disp)
-        if match:
-            filename = unquote(match.group(1).strip())
-
-        # Try regular filename
-        if not filename:
-            match = re.search(r'filename="?([^";\n]+)"?', content_disp)
-            if match:
-                filename = match.group(1).strip()
-
-        # Fallback with extension from content type
-        if not filename:
-            content_type = response.headers.get('Content-Type', '')
-            ext_map = {
-                'application/pdf': '.pdf', 'image/png': '.png',
-                'image/jpeg': '.jpg', 'image/gif': '.gif',
-                'application/zip': '.zip', 'application/x-zip-compressed': '.zip',
-                'text/plain': '.txt', 'text/html': '.html', 'text/csv': '.csv',
-                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
-                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
-                'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
-                'application/vnd.ms-excel': '.xls', 'application/msword': '.doc',
-                'message/rfc822': '.eml',
-            }
-            ext = ext_map.get(content_type.split(';')[0].strip(), '')
-            filename = f"attachment_{msg_id}_{part_id}{ext}"
-
-        # Sanitize filename to prevent path traversal
-        filename = os.path.basename(filename)
-
-        # Step 5: Save to file (expand ~ to home directory)
-        save_dir = os.path.expanduser(save_dir)
-        os.makedirs(save_dir, exist_ok=True)
-        filepath = os.path.join(save_dir, filename)
-
-        total_size = 0
-        with open(filepath, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-                total_size += len(chunk)
-
-        content_type = response.headers.get('Content-Type', 'unknown').split(';')[0].strip()
-
-        logger.info(f"Saved attachment: {filepath} ({total_size} bytes)")
-
-        return tool_response({
-            "status": "success",
-            "account": account,
-            "msg_id": msg_id,
-            "part_id": part_id,
-            "filename": filename,
-            "filepath": filepath,
-            "size_bytes": total_size,
-            "content_type": content_type,
-            "display_message": f"Saved '{filename}' ({total_size:,} bytes) to {filepath}"
-        })
-
-    except Exception as e:
-        logger.error(f"Failed to download attachment: {e}")
-        return tool_response({
-            "status": "error",
-            "message": f"Failed to download attachment: {str(e)}"
-        })
-
-
-
-# ======================= Calendar & Tasks =======================
-#
-# Zimbra represents appointments and tasks as calendar items, not messages, so
-# searchMail (types="message") can never see them.  These tools use
-# types="appointment" / types="task" against the same admin-delegated mail API.
-#
-# Note on date filtering: unlike searchMail, date_from/date_to here are NOT part
-# of the search query string - they become calExpandInstStart/calExpandInstEnd
-# SOAP attributes.  That means a caller-supplied `query` and the date range are
-# applied together; neither silently overrides the other.
 
 _PTST_MAP = {
     "AC": "accepted", "DE": "declined", "TE": "tentative", "NE": "needs-action",
@@ -5760,7 +5714,8 @@ def createAppointment(account: str,
         if ':' in str(folder["id"]) and ':' not in appt_id:
             appt_id = f'{str(folder["id"]).split(":")[0]}:{appt_id}'
         readback = json.loads(getAppointment(account, appt_id))
-        logger.info(f"AUDIT createAppointment {account} id={appt_id} '{subject}' {s_attr}-{e_attr} folder={folder['path']}")
+        _audit_write("createAppointment", account, {"appt_id": appt_id, "subject": subject, "start": s_attr,
+                                                    "end": e_attr, "calendar": folder["path"]})
         return tool_response({
             "status": "success",
             "account": account,
@@ -5773,6 +5728,622 @@ def createAppointment(account: str,
     except Exception as e:
         logger.error(f"Failed to create appointment: {e}")
         return tool_response({"status": "error", "message": f"Failed to create appointment: {str(e)}"})
+
+
+# ======================= v1.12.0: attachments, text, reading helpers =======================
+
+import base64 as _b64
+import fnmatch as _fnmatch
+import html as _html
+import secrets as _secrets
+import shutil as _shutil
+import subprocess as _subprocess
+import tempfile as _tempfile
+
+_HTTP_MODE = False          # set in main: attachments are served as one-time links over HTTP
+_FILE_STORE: dict = {}      # token -> {data, filename, content_type, expires}
+_FILE_TTL = 600
+_BASE64_MAX = 10 * 1024 * 1024
+_AUDIT_LOG = os.path.expanduser(os.getenv('ZIMBRA_AUDIT_LOG', '~/.local/state/mcp_zimbra/audit.jsonl'))
+
+
+def _audit_write(action: str, account: str, details: dict) -> None:
+    """Append one JSON line per write (calendar, draft) to the audit log."""
+    entry = {"time": datetime.now().isoformat(timespec='seconds'), "action": action, "account": account, **details}
+    try:
+        os.makedirs(os.path.dirname(_AUDIT_LOG), exist_ok=True)
+        with open(_AUDIT_LOG, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + '\n')
+    except Exception as e:
+        logger.error(f"Audit log write failed: {e}")
+    logger.info(f"AUDIT {action} {account} {json.dumps(details, ensure_ascii=False, default=str)[:300]}")
+
+
+def _delegate_token_and_base(account: str):
+    """Auth token for the mailbox REST endpoints, and the mail server base URL."""
+    if zimbra_config.auth_mode == "user":
+        if account.lower() != zimbra_config.user_email.lower():
+            raise Exception(f"User mode: only '{zimbra_config.user_email}' is accessible, not '{account}'.")
+        return get_user_auth_token(), zimbra_config.mail_url.rstrip('/')
+    root = query_zimbra_api(f"""
+        <DelegateAuthRequest xmlns="urn:zimbraAdmin">
+            <account by="name">{account}</account>
+        </DelegateAuthRequest>""", enable_cache=False)
+    parse_zimbra_response(root)
+    token_elem = root.find('.//{urn:zimbraAdmin}authToken')
+    if token_elem is None or not token_elem.text:
+        raise Exception(f"Failed to get delegated auth token for {account}")
+    return token_elem.text, get_mail_base_url()
+
+
+def _message_parts(account: str, msg_id: str) -> list:
+    """Attachment parts of a message: [{part_id, filename, content_type, size_bytes}]."""
+    root = query_zimbra_mail_api(f'<GetMsgRequest xmlns="urn:zimbraMail"><m id="{msg_id}" html="0"/></GetMsgRequest>', account)
+    parse_zimbra_response(root, namespace="urn:zimbraMail")
+    parts = []
+    for mp in root.iter('{urn:zimbraMail}mp'):
+        if mp.get('filename'):
+            parts.append({"part_id": mp.get('part', ''), "filename": mp.get('filename'),
+                          "content_type": mp.get('ct', ''), "size_bytes": int(mp.get('s') or 0)})
+    return parts
+
+
+def _download_part(account: str, msg_id: str, part_id: str):
+    """(bytes, filename, content_type) of one MIME part."""
+    token, base_url = _delegate_token_and_base(account)
+    resp = http_session.get(f"{base_url}/service/home/~/?auth=qp&zauthtoken={token}&id={msg_id}&part={part_id}",
+                            timeout=zimbra_config.request_timeout * 3)
+    resp.raise_for_status()
+    cd = resp.headers.get('Content-Disposition', '')
+    m = re.search(r"filename\*=(?:UTF-8|utf-8)''(.+?)(?:;|$)", cd) or re.search(r'filename="?([^";\n]+)"?', cd)
+    name = unquote(m.group(1).strip()) if m else f"attachment_{msg_id.split(':')[-1]}_{part_id}"
+    return resp.content, os.path.basename(name), resp.headers.get('Content-Type', '').split(';')[0].strip()
+
+
+def _html_to_text(html_src: str) -> str:
+    """HTML mail body -> readable plain text, keeping line structure."""
+    if not html_src:
+        return ''
+    t = re.sub(r'(?is)<(script|style|head)[^>]*>.*?</\1>', '', html_src)
+    t = re.sub(r'(?i)<br\s*/?>', '\n', t)
+    t = re.sub(r'(?i)</(p|div|tr|li|h[1-6]|blockquote|table)>', '\n', t)
+    t = re.sub(r'(?i)<li[^>]*>', '- ', t)
+    t = re.sub(r'(?i)</t[dh]>', '\t', t)
+    t = re.sub(r'<[^>]+>', '', t)
+    t = _html.unescape(t).replace('\xa0', ' ')
+    t = re.sub(r'[ \t]+\n', '\n', t)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+
+# Lines that start the quoted part of a reply, in the clients this mailbox sees.
+_QUOTE_MARKERS = [
+    r'^-{2,}\s*Original Message\s*-{2,}', r'^-{2,}\s*原始郵件\s*-{2,}', r'^-{2,}\s*Forwarded message',
+    r'^On .{5,200}wrote:\s*$', r'^於 .{5,200}寫道[:：]\s*$', r'^在 .{5,200}寫道[:：]\s*$',
+    r'^(From|寄件者|寄件人)\s*[:：]\s*.+', r'^_{10,}\s*$',
+]
+
+
+def _latest_reply(text: str) -> str:
+    """Only the newly written part of a reply: cut at the first quote header or '>' block."""
+    if not text:
+        return ''
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if i > 0 and any(re.match(p, s, re.I) for p in _QUOTE_MARKERS):
+            return '\n'.join(lines[:i]).strip()
+        if s.startswith('>') and i > 0 and all(l.strip().startswith('>') or not l.strip() for l in lines[i:i + 3]):
+            return '\n'.join(lines[:i]).strip()
+    return text.strip()
+
+
+def _folder_paths(account: str) -> dict:
+    """folder number -> path, for labelling search results."""
+    try:
+        return {_folder_num(f["id"]): f["path"] for f in _get_account_folders(account)}
+    except Exception:
+        return {}
+
+
+def _account_addresses(account: str) -> set:
+    """The account's own address and aliases, lowercase."""
+    addrs = {account.lower()}
+    try:
+        if zimbra_config.auth_mode == "admin":
+            root = query_zimbra_api(f'<GetAccountRequest xmlns="urn:zimbraAdmin" attrs="zimbraMailAlias">'
+                                    f'<account by="name">{account}</account></GetAccountRequest>')
+            for a in root.iter('{urn:zimbraAdmin}a'):
+                if a.get('n') == 'zimbraMailAlias' and a.text:
+                    addrs.add(a.text.lower())
+    except Exception as e:
+        logger.debug(f"alias lookup failed for {account}: {e}")
+    return addrs
+
+
+def _deliver_file(data: bytes, filename: str, content_type: str, return_mode: str, save_dir: str, request_base: str = ''):
+    """Hand a file to the caller: one-time URL (HTTP), base64, or a saved file (stdio)."""
+    info = {"filename": filename, "content_type": content_type, "size_bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest()}
+    mode = return_mode or ("url" if _HTTP_MODE else "file")
+    if mode == "base64":
+        if len(data) > _BASE64_MAX:
+            raise ValueError(f"{filename} is {len(data)} bytes, over the base64 limit of {_BASE64_MAX}; use return_mode='url'")
+        info["content_base64"] = _b64.b64encode(data).decode()
+    elif mode == "url":
+        if not _HTTP_MODE:
+            raise ValueError("return_mode='url' needs the server to run over HTTP (sse / streamable-http)")
+        now = time.time()
+        for k in [k for k, v in _FILE_STORE.items() if v["expires"] < now]:
+            _FILE_STORE.pop(k, None)
+        token = _secrets.token_urlsafe(24)
+        _FILE_STORE[token] = {"data": data, "filename": filename, "content_type": content_type or 'application/octet-stream',
+                              "expires": now + _FILE_TTL}
+        safe = quote(filename)
+        info.update({"url": f"{request_base}/dl/{token}/{safe}", "expires_in_seconds": _FILE_TTL,
+                     "how_to_save": f"curl -fsSo '{filename}' '<url>'"})
+    else:
+        d = os.path.expanduser(save_dir or "~/Downloads")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, filename)
+        with open(path, 'wb') as f:
+            f.write(data)
+        info["filepath"] = path
+    return info
+
+
+async def _serve_download(request):
+    from starlette.responses import Response, PlainTextResponse
+    item = _FILE_STORE.get(request.path_params['token'])
+    if not item or item["expires"] < time.time():
+        return PlainTextResponse('Link expired or not found', status_code=404)
+    disp = "attachment; filename*=UTF-8''" + quote(item["filename"])
+    return Response(item["data"], media_type=item["content_type"], headers={'Content-Disposition': disp})
+
+
+def _download_route():
+    from starlette.routing import Route
+    return Route("/dl/{token}/{filename:path}", endpoint=_serve_download)
+
+
+def _request_base(ctx) -> str:
+    try:
+        return str(ctx.request_context.request.base_url).rstrip('/')
+    except Exception:
+        return ''
+
+
+@mail_read_tool()
+def getMailAttachment(account: str,
+                      msg_id: Optional[str] = None,
+                      part_id: Optional[str] = None,
+                      filename_pattern: Optional[str] = None,
+                      filename: Optional[str] = None,
+                      return_mode: Optional[str] = None,
+                      save_dir: str = "~/Downloads",
+                      message_id: Optional[str] = None,
+                      ctx: Context = None) -> str:
+    """Get email attachment(s): as a download link, base64 content, or a saved file.
+
+    Pick the attachment by part_id (from getMailDetail) or by filename_pattern - no need to
+    call getMailDetail first. A pattern can match several attachments; all are returned.
+
+    Args:
+        account: Account email. Example: "user@example.com".
+        msg_id: Message ID from searchMail "id". ("message_id" is accepted too.)
+        part_id: Attachment part ID, e.g. "2". Optional when filename_pattern is given.
+        filename_pattern: Shell pattern on the attachment name, case-insensitive. Example: "*-A4.pdf", "*.pdf".
+        filename: Name to give the file (single attachment only). Example: "FS36743277-A4-Company.pdf".
+        return_mode: "url" (one-time link, 10 min, default on HTTP servers; fetch with curl),
+                     "base64" (content in the response, up to 10 MB), or "file" (save on the server, default for stdio).
+        save_dir: Directory for return_mode="file". Default "~/Downloads".
+    """
+    msg_id = msg_id or message_id
+    logger.info(f"Getting attachment: account={account}, msg_id={msg_id}, part={part_id}, pattern={filename_pattern}")
+    if not msg_id:
+        return tool_response({"status": "error", "message": "msg_id is required (the 'id' from searchMail)."})
+    if not part_id and not filename_pattern:
+        return tool_response({"status": "error", "message": "Give part_id, or filename_pattern such as '*.pdf'."})
+    try:
+        if part_id:
+            targets = [{"part_id": part_id, "filename": None}]
+        else:
+            parts = _message_parts(account, msg_id)
+            targets = [p for p in parts if _fnmatch.fnmatch(p["filename"].lower(), filename_pattern.lower())]
+            if not targets:
+                return tool_response({"status": "error", "message": f"No attachment matches '{filename_pattern}'.",
+                                      "attachments": [p["filename"] for p in parts]})
+        if filename and len(targets) > 1:
+            return tool_response({"status": "error", "message": f"filename can only be used for one attachment; "
+                                  f"pattern matched {len(targets)}: {[t['filename'] for t in targets]}"})
+        base = _request_base(ctx)
+        files = []
+        for t in targets:
+            data, name, ctype = _download_part(account, msg_id, t["part_id"])
+            name = os.path.basename(filename) if filename else (t["filename"] or name)
+            files.append({"part_id": t["part_id"], **_deliver_file(data, name, ctype, return_mode, save_dir, base)})
+        return tool_response({"status": "success", "account": account, "msg_id": msg_id,
+                              "files": files, "count": len(files)})
+    except Exception as e:
+        logger.error(f"Failed to get attachment: {e}")
+        return tool_response({"status": "error", "message": f"Failed to get attachment: {e}"})
+
+
+def _pdf_text(data: bytes, ocr: str) -> dict:
+    """Text of a PDF: text layer via pdftotext, OCR (tesseract chi_tra+eng) when there is none."""
+    with _tempfile.TemporaryDirectory() as d:
+        pdf = os.path.join(d, "in.pdf")
+        with open(pdf, 'wb') as f:
+            f.write(data)
+        pages = 0
+        try:
+            info = _subprocess.run(["pdfinfo", pdf], capture_output=True, text=True, timeout=30).stdout
+            m = re.search(r'^Pages:\s+(\d+)', info, re.M)
+            pages = int(m.group(1)) if m else 0
+        except Exception:
+            pass
+        text = _subprocess.run(["pdftotext", "-layout", pdf, "-"], capture_output=True, text=True, timeout=60).stdout
+        need_ocr = ocr == "always" or (ocr == "auto" and len(re.sub(r'\s', '', text)) < 30 * max(pages, 1))
+        if not need_ocr:
+            return {"text": text, "pages": pages, "ocr_used": False}
+        if not _shutil.which("tesseract"):
+            return {"text": text, "pages": pages, "ocr_used": False,
+                    "note": "No text layer and tesseract is not installed on the server; OCR unavailable."}
+        _subprocess.run(["pdftoppm", "-r", "200", "-png", pdf, os.path.join(d, "p")], check=True, timeout=180)
+        out = []
+        for png in sorted(p for p in os.listdir(d) if p.startswith("p") and p.endswith(".png")):
+            out.append(_subprocess.run(["tesseract", os.path.join(d, png), "-", "-l", "chi_tra+eng"],
+                                       capture_output=True, text=True, timeout=180).stdout)
+        return {"text": "\n\f".join(out), "pages": pages or len(out), "ocr_used": True}
+
+
+@mail_read_tool()
+def getAttachmentText(account: str,
+                      msg_id: Optional[str] = None,
+                      part_id: Optional[str] = None,
+                      filename_pattern: Optional[str] = None,
+                      ocr: str = "auto",
+                      max_chars: int = 30000,
+                      message_id: Optional[str] = None) -> str:
+    """Extract the text of an attachment - PDF (text layer, or OCR when it is a scan), images (OCR), text files.
+    Use for purchase orders, invoices and quotes sent as PDF.
+
+    Args:
+        account: Account email.
+        msg_id: Message ID from searchMail "id". ("message_id" is accepted too.)
+        part_id: Attachment part ID; or use filename_pattern.
+        filename_pattern: Shell pattern on the attachment name, e.g. "*.pdf". First match is used.
+        ocr: "auto" (only when a PDF has no text layer), "always", or "never". OCR language: Traditional Chinese + English.
+        max_chars: Truncate the text to this many characters. Default 30000.
+    """
+    msg_id = msg_id or message_id
+    if not msg_id or (not part_id and not filename_pattern):
+        return tool_response({"status": "error", "message": "Give msg_id and part_id (or filename_pattern)."})
+    try:
+        if not part_id:
+            parts = [p for p in _message_parts(account, msg_id)
+                     if _fnmatch.fnmatch(p["filename"].lower(), filename_pattern.lower())]
+            if not parts:
+                return tool_response({"status": "error", "message": f"No attachment matches '{filename_pattern}'."})
+            part_id = parts[0]["part_id"]
+        data, name, ctype = _download_part(account, msg_id, part_id)
+        lname = name.lower()
+        if ctype == 'application/pdf' or lname.endswith('.pdf'):
+            res = _pdf_text(data, ocr)
+        elif ctype.startswith('image/') or lname.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff')):
+            if not _shutil.which("tesseract"):
+                return tool_response({"status": "error", "message": "Image attachment and tesseract is not installed on the server."})
+            with _tempfile.NamedTemporaryFile(suffix=os.path.splitext(lname)[1] or '.png') as f:
+                f.write(data); f.flush()
+                text = _subprocess.run(["tesseract", f.name, "-", "-l", "chi_tra+eng"], capture_output=True, text=True,
+                                       timeout=180).stdout
+            res = {"text": text, "pages": 1, "ocr_used": True}
+        elif ctype.startswith('text/') or lname.endswith(('.txt', '.csv', '.eml')):
+            res = {"text": data.decode('utf-8', errors='replace'), "pages": 1, "ocr_used": False}
+        elif ctype == 'text/html' or lname.endswith(('.htm', '.html')):
+            res = {"text": _html_to_text(data.decode('utf-8', errors='replace')), "pages": 1, "ocr_used": False}
+        else:
+            return tool_response({"status": "error", "message": f"Unsupported attachment type {ctype} ({name}). "
+                                  f"Use getMailAttachment to download it."})
+        text = res["text"]
+        out = {"status": "success", "filename": name, "content_type": ctype, "pages": res["pages"],
+               "ocr_used": res["ocr_used"], "chars": len(text), "text": text[:max(1, max_chars)]}
+        if len(text) > max_chars:
+            out["truncated"] = True
+        if res.get("note"):
+            out["note"] = res["note"]
+        return tool_response(out)
+    except Exception as e:
+        logger.error(f"Failed to extract attachment text: {e}")
+        return tool_response({"status": "error", "message": f"Failed to extract attachment text: {e}"})
+
+
+def _parse_msg_body(msg_elem, ns_mail: str):
+    """(body_text, body_html, attachments) from a GetMsg <m> fetched with html=1."""
+    text, html_body, attachments = '', '', []
+    for mp in msg_elem.iter(f'{{{ns_mail}}}mp'):
+        ct = mp.get('ct', '')
+        content = mp.find(f'{{{ns_mail}}}content')
+        if mp.get('filename'):
+            attachments.append({"filename": mp.get('filename'), "content_type": ct,
+                                "size_bytes": int(mp.get('s') or 0), "part_id": mp.get('part', '')})
+            continue
+        if content is not None and content.text:
+            if ct == 'text/html' and not html_body:
+                html_body = content.text
+            elif ct == 'text/plain' and not text:
+                text = content.text
+    if not text and html_body:
+        text = _html_to_text(html_body)
+    return text, html_body, attachments
+
+
+@mail_read_tool()
+def getMailDetails(account: str, msg_ids: List[str], include_html: bool = False, max_body_chars: int = 3000) -> str:
+    """Read several messages in one call (up to 50): headers, plain-text body, the latest reply
+    without quoted history, and attachment list. Use instead of calling getMailDetail in a loop.
+
+    Args:
+        account: Account email.
+        msg_ids: Message IDs from searchMail "id" (max 50).
+        include_html: Also return the HTML body. Default false.
+        max_body_chars: Truncate each body to this many characters. Default 3000.
+    """
+    if not msg_ids:
+        return tool_response({"status": "error", "message": "msg_ids is required."})
+    if len(msg_ids) > 50:
+        return tool_response({"status": "error", "message": f"At most 50 messages per call, got {len(msg_ids)}."})
+    ns_mail = 'urn:zimbraMail'
+    paths = _folder_paths(account)
+    out, errors = [], []
+    for mid in msg_ids:
+        try:
+            root = query_zimbra_mail_api(f'<GetMsgRequest xmlns="urn:zimbraMail"><m id="{mid}" html="1" needExp="1"/></GetMsgRequest>', account)
+            parse_zimbra_response(root, namespace=ns_mail)
+            m = root.find(f'.//{{{ns_mail}}}m')
+            if m is None:
+                errors.append({"id": mid, "error": "not found"}); continue
+            text, html_body, atts = _parse_msg_body(m, ns_mail)
+            addrs = {"from": [], "to": [], "cc": []}
+            for e in m.findall(f'{{{ns_mail}}}e'):
+                key = {'f': 'from', 't': 'to', 'c': 'cc'}.get(e.get('t'))
+                if key:
+                    addrs[key].append(f"{e.get('p') or e.get('d', '')} <{e.get('a', '')}>".strip())
+            su = m.find(f'{{{ns_mail}}}su')
+            item = {"id": m.get('id'), "conversation_id": m.get('cid'), "folder": paths.get(_folder_num(m.get('l', '')), ''),
+                    "date": _ms_to_iso(m.get('d')), "subject": su.text if su is not None else '', **addrs,
+                    "body_text": text[:max_body_chars], "body_latest": _latest_reply(text)[:max_body_chars],
+                    "attachments": atts or None}
+            if include_html:
+                item["body_html"] = html_body[:max_body_chars * 3]
+            out.append(item)
+        except Exception as e:
+            errors.append({"id": mid, "error": str(e)[:200]})
+    return tool_response({"status": "success", "account": account, "messages": out, "count": len(out),
+                          "errors": errors or None})
+
+
+async def _poll_search(account: str, args: dict) -> dict:
+    return json.loads(await asyncio.to_thread(searchMail, account, **args))
+
+
+@mail_read_tool()
+async def waitForMail(account: str,
+                      sender: Optional[str] = None,
+                      subject: Optional[str] = None,
+                      since: Optional[str] = None,
+                      timeout_sec: int = 300,
+                      poll_sec: int = 15,
+                      folder: Optional[str] = None) -> str:
+    """Wait until a new message matching sender / subject arrives, then return it.
+    Use after triggering something that sends mail (e.g. issuing an e-invoice) instead of a sleep-and-search loop.
+
+    Args:
+        account: Account email.
+        sender: Sender address or domain (partial). Example: "einvoice@example.com".
+        subject: Subject text (partial).
+        since: Only mail received at or after this time, "YYYY-MM-DDTHH:MM:SS" local time. Default: now.
+        timeout_sec: Give up after this many seconds (max 600). Default 300. Returns an empty result on timeout.
+        poll_sec: Seconds between checks (min 5). Default 15.
+        folder: Limit to a folder. Default: all folders.
+    """
+    if not sender and not subject:
+        return tool_response({"status": "error", "message": "Give sender and/or subject to wait for."})
+    start = datetime.now()
+    since = since or start.strftime('%Y-%m-%dT%H:%M:%S')
+    deadline = time.time() + max(5, min(int(timeout_sec), 600))
+    args = {"sender": sender, "subject": subject, "since": since, "folder": folder, "limit": 10}
+    args = {k: v for k, v in args.items() if v is not None}
+    checks = 0
+    while True:
+        checks += 1
+        res = await _poll_search(account, args)
+        if res.get("status") == "error":
+            return tool_response(res)
+        if res.get("messages"):
+            return tool_response({"status": "found", "waited_seconds": int((datetime.now() - start).total_seconds()),
+                                  "checks": checks, "messages": res["messages"]})
+        if time.time() >= deadline:
+            return tool_response({"status": "timeout", "waited_seconds": int((datetime.now() - start).total_seconds()),
+                                  "checks": checks, "messages": [],
+                                  "message": "No matching mail arrived before the timeout."})
+        await asyncio.sleep(max(5, int(poll_sec)))
+
+
+def _get_appt(account: str, appt_id: str):
+    ns = 'urn:zimbraMail'
+    root = query_zimbra_mail_api(f'<GetAppointmentRequest xmlns="urn:zimbraMail" id="{appt_id}"/>', account)
+    parse_zimbra_response(root, namespace=ns)
+    appt = root.find(f'.//{{{ns}}}appt')
+    if appt is None:
+        raise ValueError(f"Appointment '{appt_id}' not found.")
+    inv = appt.find(f'{{{ns}}}inv')
+    comp = appt.find(f'.//{{{ns}}}comp')
+    if inv is None or comp is None:
+        raise ValueError(f"Appointment '{appt_id}' has no invite data.")
+    return appt, inv, comp
+
+
+def _appt_folder_guard(account: str, appt, allow_other_calendar: bool):
+    """Writes default to the main 'Calendar'; other calendars (shared/family) need an explicit opt-in."""
+    path = _folder_paths(account).get(_folder_num(appt.get('l', '')), '')
+    if path.strip('/').lower() != 'calendar' and not allow_other_calendar:
+        raise ValueError(f"This appointment is in calendar '{path}', not the main 'Calendar'. "
+                         f"Pass allow_other_calendar=true if you really mean to change it.")
+    return path
+
+
+@mail_read_tool()
+def updateAppointment(account: str,
+                      appt_id: str,
+                      subject: Optional[str] = None,
+                      start: Optional[str] = None,
+                      end: Optional[str] = None,
+                      location: Optional[str] = None,
+                      notes: Optional[str] = None,
+                      reminder_minutes: Optional[int] = None,
+                      timezone: str = "Asia/Taipei",
+                      allow_other_calendar: bool = False,
+                      dry_run: bool = False) -> str:
+    """Change a personal appointment (no attendees). Only the arguments you pass change.
+
+    Appointments outside the main 'Calendar' (e.g. a family calendar) are refused unless
+    allow_other_calendar=true. Appointments with attendees are refused (changing them sends updates).
+
+    Args:
+        account: Calendar owner email.
+        appt_id: Appointment id from searchCalendar / createAppointment.
+        subject, location, notes: New values.
+        start, end: "YYYY-MM-DD HH:MM" local time in `timezone` (dates only for all-day events).
+        reminder_minutes: New pop-up reminder (minutes before start); 0 keeps a reminder at start.
+        timezone: IANA time zone. Default "Asia/Taipei".
+        allow_other_calendar: Allow changing an appointment in a calendar other than 'Calendar'.
+        dry_run: Show the change without writing.
+    """
+    try:
+        appt, inv, comp = _get_appt(account, appt_id)
+        cal = _appt_folder_guard(account, appt, allow_other_calendar)
+        ns = 'urn:zimbraMail'
+        if comp.findall(f'{{{ns}}}at'):
+            return tool_response({"status": "error", "message": "This appointment has attendees; changing it would send "
+                                  "updates to them. Change it in the Zimbra web client."})
+        all_day = comp.get('allDay') == '1'
+        s_el, e_el = comp.find(f'{{{ns}}}s'), comp.find(f'{{{ns}}}e')
+        new_s = _parse_appt_time(start, all_day) if start else None
+        new_e = _parse_appt_time(end, all_day) if end else None
+        if (start and not new_s) or (end and not new_e):
+            return tool_response({"status": "error", "message": "Invalid start/end; use 'YYYY-MM-DD HH:MM'."})
+        fmt = "%Y%m%d" if all_day else "%Y%m%dT%H%M%S"
+        s_attr = new_s.strftime(fmt) if new_s else s_el.get('d')
+        e_attr = new_e.strftime(fmt) if new_e else (e_el.get('d') if e_el is not None else s_attr)
+        tz = '' if all_day else f' tz="{_xml_text(timezone if (new_s or new_e) else (s_el.get("tz") or timezone))}"'
+        name = subject if subject is not None else comp.get('name', '')
+        loc = location if location is not None else comp.get('loc', '')
+        desc_el = comp.find(f'{{{ns}}}desc')
+        desc = notes if notes is not None else (desc_el.text if desc_el is not None and desc_el.text else '')
+        changes = {k: v for k, v in (("subject", subject), ("start", start), ("end", end), ("location", location),
+                                     ("notes", notes), ("reminder_minutes", reminder_minutes)) if v is not None}
+        if not changes:
+            return tool_response({"status": "error", "message": "Nothing to change."})
+        if dry_run:
+            return tool_response({"status": "dry_run", "appointment": appt_id, "calendar": cal, "changes": changes})
+        alarm = ''
+        if reminder_minutes is not None:
+            alarm = (f'<alarm action="DISPLAY"><trigger><rel m="{int(reminder_minutes)}" related="START" neg="1"/>'
+                     f'</trigger></alarm>')
+        else:
+            old_alarm = comp.find(f'{{{ns}}}alarm/{{{ns}}}trigger/{{{ns}}}rel')
+            if old_alarm is not None:
+                alarm = (f'<alarm action="DISPLAY"><trigger><rel m="{old_alarm.get("m", "15")}" related="START" neg="1"/>'
+                         f'</trigger></alarm>')
+        inv_id = f"{appt.get('id')}-{inv.get('id')}"
+        soap = f"""
+        <ModifyAppointmentRequest xmlns="urn:zimbraMail" id="{inv_id}" comp="0">
+            <m>
+                <inv>
+                    <comp name="{_xml_text(name)}" loc="{_xml_text(loc)}" allDay="{1 if all_day else 0}"
+                          fb="{comp.get('fb', 'B')}" fba="{comp.get('fba', 'B')}" transp="{comp.get('transp', 'O')}"
+                          class="{comp.get('class', 'PUB')}" status="{comp.get('status', 'CONF')}">
+                        <s d="{s_attr}"{tz}/>
+                        <e d="{e_attr}"{tz}/>
+                        <or a="{_xml_text(account)}"/>
+                        {f'<desc>{_xml_text(desc)}</desc>' if desc else ''}
+                        {alarm}
+                    </comp>
+                </inv>
+                <su>{_xml_text(name)}</su>
+                <mp ct="text/plain"><content>{_xml_text(desc)}</content></mp>
+            </m>
+        </ModifyAppointmentRequest>"""
+        root = query_zimbra_mail_api(soap, account)
+        parse_zimbra_response(root, namespace=ns)
+        _audit_write("updateAppointment", account, {"appt_id": appt_id, "calendar": cal, "changes": changes})
+        readback = json.loads(getAppointment(account, appt_id))
+        return tool_response({"status": "success", "calendar": cal, "changes": changes,
+                              "appointment": readback.get("appointment")})
+    except Exception as e:
+        logger.error(f"Failed to update appointment: {e}")
+        return tool_response({"status": "error", "message": f"Failed to update appointment: {e}"})
+
+
+@mail_read_tool()
+def deleteAppointment(account: str, appt_id: str, confirm: bool = False, allow_other_calendar: bool = False) -> str:
+    """Delete a personal appointment (no attendees). Without confirm=true only shows what would be deleted.
+
+    Appointments outside the main 'Calendar' are refused unless allow_other_calendar=true;
+    appointments with attendees are refused (deleting them would send cancellations).
+
+    Args:
+        account: Calendar owner email.
+        appt_id: Appointment id from searchCalendar / createAppointment.
+        confirm: Must be true to delete.
+        allow_other_calendar: Allow deleting from a calendar other than 'Calendar'.
+    """
+    try:
+        appt, inv, comp = _get_appt(account, appt_id)
+        cal = _appt_folder_guard(account, appt, allow_other_calendar)
+        ns = 'urn:zimbraMail'
+        if comp.findall(f'{{{ns}}}at'):
+            return tool_response({"status": "error", "message": "This appointment has attendees; deleting it would send "
+                                  "cancellations. Delete it in the Zimbra web client."})
+        summary = json.loads(getAppointment(account, appt_id)).get("appointment", {})
+        brief = {k: summary.get(k) for k in ("id", "subject", "start", "end", "location")}
+        if not confirm:
+            return tool_response({"status": "preview", "message": "Pass confirm=true to delete.", "calendar": cal,
+                                  "appointment": brief})
+        inv_id = f"{appt.get('id')}-{inv.get('id')}"
+        root = query_zimbra_mail_api(f'<CancelAppointmentRequest xmlns="urn:zimbraMail" id="{inv_id}" comp="0"/>', account)
+        parse_zimbra_response(root, namespace=ns)
+        _audit_write("deleteAppointment", account, {"calendar": cal, **brief})
+        return tool_response({"status": "deleted", "calendar": cal, "appointment": brief})
+    except Exception as e:
+        logger.error(f"Failed to delete appointment: {e}")
+        return tool_response({"status": "error", "message": f"Failed to delete appointment: {e}"})
+
+
+def _upload_attachment(account: str, data: bytes, filename: str, content_type: str) -> str:
+    """Upload a file to the mailbox upload servlet; returns the upload id (aid) for a draft."""
+    # The draft is saved with the admin token acting on the account (name=<account>;
+    # aname=<admin>), and Zimbra looks the upload up under the *authenticated* account:
+    # an upload made with the delegated token failed with "mismatched accountId for
+    # upload". So in admin mode upload through the admin port with the admin token.
+    if zimbra_config.auth_mode == "user":
+        token, base_url = _delegate_token_and_base(account)
+        cookies = {"ZM_AUTH_TOKEN": token}
+    else:
+        u = urlparse(zimbra_config.admin_url)
+        base_url = f"{u.scheme}://{u.netloc}"
+        cookies = {"ZM_ADMIN_AUTH_TOKEN": get_auth_token()}
+    # Raw upload (file as the request body); the multipart form got "204,'null'" back.
+    resp = http_session.post(f"{base_url}/service/upload?fmt=raw,extended", cookies=cookies,
+                             data=data, timeout=zimbra_config.request_timeout * 3,
+                             headers={"Content-Type": content_type or 'application/octet-stream',
+                                      "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"})
+    resp.raise_for_status()
+    m = re.search(r'"aid"\s*:\s*"([^"]+)"', resp.text) or re.search(r"'([0-9a-f-]+:[0-9a-f-]+)'", resp.text)
+    if not m:
+        raise Exception(f"Upload failed: {resp.text[:200]}")
+    return m.group(1)
 
 
 @mail_read_tool()
@@ -5920,15 +6491,16 @@ def searchTasks(account: str,
         return tool_response({"status": "error", "message": f"Failed to search tasks: {str(e)}"})
 
 
-@mcp_server.tool()
+@_tool()
 def saveDraft(account: str,
-              to: str,
+              to: Any,
               subject: str,
               body: str,
-              cc: Optional[str] = None,
-              bcc: Optional[str] = None,
+              cc: Optional[Any] = None,
+              bcc: Optional[Any] = None,
               reply_to_msg_id: Optional[str] = None,
-              is_forward: bool = False) -> str:
+              is_forward: bool = False,
+              attachments: Optional[List[Dict[str, str]]] = None) -> str:
     """Save a new email or a reply/forward as draft. When replying, original message is auto-quoted.
 
     Args:
@@ -5940,8 +6512,20 @@ def saveDraft(account: str,
         bcc: BCC recipient(s), comma-separated. Example: "archive@example.com". Default: none.
         reply_to_msg_id: Original message ID to reply to (from searchMail "id" field). Original message auto-quoted. Example: "894727". Default: none (new email).
         is_forward: Set true if forwarding instead of replying. Only used with reply_to_msg_id. Default: false.
+        attachments: Files to attach. Each item is either {"filename": "x.pdf", "content_base64": "..."}
+            or {"msg_id": "...", "part_id": "2"} to attach a file from another message. Default: none.
+
+    Nothing is sent: the draft appears in Drafts for a person to check and send. `to`, `cc`
+    and `bcc` accept a comma-separated string or a list.
     """
     logger.info(f"Saving draft: account={account}, to={to}, subject={subject}, reply_to={reply_to_msg_id}")
+
+    def _addr_list(v):
+        if not v:
+            return []
+        items = v if isinstance(v, (list, tuple)) else str(v).split(',')
+        return [str(x).strip() for x in items if str(x).strip()]
+    to, cc, bcc = ','.join(_addr_list(to)), ','.join(_addr_list(cc)), ','.join(_addr_list(bcc))
 
     try:
         # Build recipient elements
@@ -6017,6 +6601,24 @@ def saveDraft(account: str,
         subject_escaped = (subject.replace('&', '&amp;').replace('<', '&lt;')
                                   .replace('>', '&gt;'))
 
+        attach_xml = ''
+        attached = []
+        if attachments:
+            aids, mps = [], []
+            for att in attachments:
+                if att.get('content_base64'):
+                    data = base64.b64decode(att['content_base64'])
+                    fname = os.path.basename(att.get('filename') or 'attachment.bin')
+                    aids.append(_upload_attachment(account, data, fname, att.get('content_type', '')))
+                    attached.append(fname)
+                elif att.get('msg_id') and att.get('part_id'):
+                    mps.append(f'<mp mid="{att["msg_id"]}" part="{att["part_id"]}"/>')
+                    attached.append(f'{att["msg_id"]}#{att["part_id"]}')
+                else:
+                    return tool_response({"status": "error", "message":
+                                          "Each attachment needs filename+content_base64, or msg_id+part_id."})
+            attach_xml = f'<attach{" aid=" + chr(34) + ",".join(aids) + chr(34) if aids else ""}>{"".join(mps)}</attach>'
+
         soap_body = f"""
         <SaveDraftRequest xmlns="urn:zimbraMail">
             <m {msg_attrs}>
@@ -6025,6 +6627,7 @@ def saveDraft(account: str,
                 <mp ct="text/plain">
                     <content>{body_escaped}</content>
                 </mp>
+                {attach_xml}
             </m>
         </SaveDraftRequest>
         """
@@ -6036,6 +6639,8 @@ def saveDraft(account: str,
         msg_elem = root.find(f'.//{{{ns_mail}}}m')
 
         draft_id = msg_elem.get('id', '') if msg_elem is not None else ''
+        _audit_write("saveDraft", account, {"draft_id": draft_id, "to": to, "cc": cc or None, "subject": subject,
+                                            "reply_to_msg_id": reply_to_msg_id, "attachments": attached or None})
 
         draft_type = "reply draft" if reply_to_msg_id and not is_forward else \
                      "forward draft" if reply_to_msg_id and is_forward else \
@@ -6045,6 +6650,7 @@ def saveDraft(account: str,
             "status": "success",
             "account": account,
             "draft_id": draft_id,
+            "attachments": attached or None,
             "draft_type": draft_type,
             "to": to,
             "cc": cc,
@@ -6131,7 +6737,7 @@ def _searchGal_user_mode(query: str, search_type: str, limit: int) -> str:
         "display_message": display_msg
     })
 
-@mcp_server.tool()
+@_tool()
 def searchGal(query: str,
               domain: Optional[str] = None,
               search_type: str = "accounts",
@@ -6262,7 +6868,7 @@ def searchGal(query: str,
             "message": f"Failed to search GAL: {str(e)}"
         })
 
-@mcp_server.tool()
+@_tool()
 def searchContacts(account: str,
                    query: str = "",
                    folder: str = "Contacts",
@@ -6497,7 +7103,7 @@ def getDLMembership(email: str) -> str:
 
 # ------------------- System Information -------------------
 
-@mcp_server.tool()
+@_tool()
 def getVersionInfo() -> str:
     """Get Zimbra server version, build, and release information."""
     logger.info("Getting Zimbra version information")
@@ -6656,18 +7262,20 @@ if __name__ == "__main__":
     setup_http_session()
 
     logger.info("=" * 80)
-    logger.info("Zimbra Collaboration MCP Server v1.11.1")
+    logger.info("Zimbra Collaboration MCP Server v1.12.0")
     logger.info("=" * 80)
 
     # Calculate tool count based on feature toggles
-    mail_read_count = 9 if zimbra_config.enable_mail_read else 0
+    mail_read_count = 14 if zimbra_config.enable_mail_read else 0
     if zimbra_config.auth_mode == "user":
         tool_count = 13 + mail_read_count  # 13 base + 5 mail_read
         logger.info(f"Available Tools ({tool_count} total, user mode: {zimbra_config.user_email}):")
         if zimbra_config.enable_mail_read:
             logger.info("  Mail Read: searchMail, getMailDetail, getConversation,")
             logger.info("             getMailAttachment, listFolders")
-            logger.info("  Calendar: searchCalendar, getAppointment, createAppointment, searchTasks")
+            logger.info("  Mail+: getMailDetails, getAttachmentText, waitForMail")
+            logger.info("  Calendar: searchCalendar, getAppointment, createAppointment, updateAppointment,")
+            logger.info("            deleteAppointment, searchTasks")
         else:
             logger.info("  Mail Read: DISABLED (set ZIMBRA_ENABLE_MAIL_READ=true to enable)")
         logger.info("  Mail Write: saveDraft, searchContacts")
@@ -6693,7 +7301,9 @@ if __name__ == "__main__":
         if zimbra_config.enable_mail_read:
             logger.info("  Mail Read: searchMail, getMailDetail, getConversation,")
             logger.info("             getMailAttachment, listFolders")
-            logger.info("  Calendar: searchCalendar, getAppointment, createAppointment, searchTasks")
+            logger.info("  Mail+: getMailDetails, getAttachmentText, waitForMail")
+            logger.info("  Calendar: searchCalendar, getAppointment, createAppointment, updateAppointment,")
+            logger.info("            deleteAppointment, searchTasks")
         else:
             logger.info("  Mail Read: DISABLED (set ZIMBRA_ENABLE_MAIL_READ=true to enable)")
         logger.info("  Mail Write: saveDraft, searchContacts")
@@ -6727,6 +7337,7 @@ if __name__ == "__main__":
         from starlette.applications import Starlette
         from starlette.responses import JSONResponse
 
+        _HTTP_MODE = True  # attachments are handed out as one-time /dl/ links
         if transport_mode == 'sse':
             # Legacy SSE (/sse + /messages/) for existing clients, plus Streamable HTTP
             # (/mcp) on the same port. SSE clients that auto-reconnect after a drop get a
@@ -6734,10 +7345,11 @@ if __name__ == "__main__":
             # -32602; clients that can should use /mcp instead.
             sse = mcp_server.sse_app()
             http = mcp_server.streamable_http_app()
-            app = Starlette(routes=list(sse.routes) + list(http.routes),
+            app = Starlette(routes=list(sse.routes) + list(http.routes) + [_download_route()],
                             lifespan=http.router.lifespan_context)
         else:
             app = mcp_server.streamable_http_app()
+            app.router.routes.append(_download_route())
 
         if api_key:
             # Plain ASGI middleware: BaseHTTPMiddleware breaks on streaming responses and
@@ -6747,7 +7359,8 @@ if __name__ == "__main__":
                     self.inner = inner
 
                 async def __call__(self, scope, receive, send):
-                    if scope["type"] == "http":
+                    # /dl/<token>/... links: the random token is the credential
+                    if scope["type"] == "http" and not scope["path"].startswith("/dl/"):
                         auth_header = dict(scope["headers"]).get(b"authorization", b"").decode("latin-1")
                         token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
                         if not hmac.compare_digest(token.encode(), api_key.encode()):
