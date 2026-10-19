@@ -4,12 +4,19 @@ Proxmox VE MCP Server - Enhanced Edition with Batch Operations and Pagination
 Provides comprehensive Proxmox VE management functionality including batch data collection
 
 Author: Jason Cheng (jason@jason.tools)
-Version: 1.5.7
-Last Updated: 2026-09-29
+Version: 1.5.8
+Last Updated: 2026-10-19
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 
 Changelog:
+v1.5.8 (2026-10-19) - Feature: read task logs; find failed backups and why
+         - get_task_log(node, upid, errors_only): status and output of one task. Backup jobs
+           only reported "job errors" before; the guest that failed and the reason were in
+           the task log, which no tool could read.
+         - get_backup_failures(node?, days, limit): failed vzdump jobs across nodes, with the
+           failing VMID / name, a one-line reason taken from the log lines before the ERROR,
+           and a per-guest count.
 v1.5.7 (2026-09-29) - Fix: SSE clients stuck on an uninitialized session
          - SSE mode now also serves Streamable HTTP at /mcp on the same port.
            SSE clients that auto-reconnect after a dropped connection (laptop sleep) get a
@@ -123,6 +130,7 @@ import sys
 import ssl
 import struct
 import io
+import re
 import time
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import quote, urlencode
@@ -141,7 +149,7 @@ from pydantic import AnyUrl
 import mcp.types as types
 
 # Version information
-__version__ = "1.5.7"
+__version__ = "1.5.8"
 __last_updated__ = "2026-07-01"
 __author__ = "Jason Cheng"
 __email__ = "jason@jason.tools"
@@ -779,7 +787,35 @@ async def handle_list_tools() -> List[Tool]:
                 "additionalProperties": False
             }
         ),
-        
+        Tool(
+            name="get_task_log",
+            description="Read the output log of one task (backup, migration, start, ...) by its UPID, from get_node_tasks or get_all_operation_logs. Returns the task status and the log lines; errors_only keeps just the lines that explain a failure.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Node that ran the task (the second field of the UPID)"},
+                    "upid": {"type": "string", "description": "Task UPID, e.g. UPID:host-114:00063461:10C259C9:6AD51030:vzdump::root@pam:"},
+                    "errors_only": {"type": "boolean", "description": "Only lines mentioning errors/failures plus the guest they belong to (default: false)", "default": False},
+                    "limit": {"type": "integer", "description": "Max log lines to read (default: 2000)", "default": 2000, "minimum": 1}
+                },
+                "required": ["node", "upid"],
+                "additionalProperties": False
+            }
+        ),
+        Tool(
+            name="get_backup_failures",
+            description="List recent failed backup (vzdump) jobs and, for each, which guests failed and why - read from the task logs. Use this when a backup job reports 'job errors' and you need the failing VM/CT and the error.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "node": {"type": "string", "description": "Only this node (default: all online nodes)"},
+                    "days": {"type": "integer", "description": "Look back this many days (default: 3)", "default": 3, "minimum": 1},
+                    "limit": {"type": "integer", "description": "Max failed jobs per node to inspect (default: 10)", "default": 10, "minimum": 1}
+                },
+                "additionalProperties": False
+            }
+        ),
+
         # Virtual Machine Management
         Tool(
             name="list_vms",
@@ -1736,6 +1772,65 @@ async def resolve_vm_identity(client, arguments: dict, tool_name: str) -> dict:
             f"node={r.get('node', '')} type={r.get('type', '')} status={r.get('status', '')}"
         )
     raise ProxmoxVEError("\n".join(lines))
+
+
+_TASK_ERROR_HINT = ("error", "fail", "unable", "cannot", "can't", "timeout", "timed out", "denied", "abort")
+
+
+def _fmt_epoch(ts) -> Optional[str]:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _task_error_lines(lines: List[str]) -> List[str]:
+    """Lines that explain a failure, each preceded by the guest header it belongs to."""
+    out, current, shown = [], None, None
+    for line in lines:
+        low = line.lower()
+        if "starting backup of vm" in low or "starting migration of" in low:
+            current = line
+        elif "finished backup of vm" in low:
+            current = None
+        if any(h in low for h in _TASK_ERROR_HINT):
+            if "backup job finished with errors" in low or low.startswith("task error"):
+                current = None
+            if current and current is not shown:
+                out.append(current)
+                shown = current
+            out.append(line)
+    return out
+
+
+def _vzdump_failures(lines: List[str]) -> List[dict]:
+    """Failed guests in a vzdump log: vmid, the ERROR line and the INFO lines that lead up to it."""
+    failures, vmid, recent = [], None, []
+    for line in lines:
+        m = re.search(r"Starting Backup of VM (\d+)", line)
+        if m:
+            vmid, recent = m.group(1), []
+            continue
+        m = re.search(r"ERROR: Backup of VM (\d+) failed - (.*)", line)
+        if m:
+            error = m.group(2)
+            # "command '<long argv>' failed: exit code N" -> "proxmox-backup-client failed: exit code N"
+            c = re.match(r"command '(.*?)' failed: (.*)", error)
+            if c:
+                prog = next((w.rsplit("/", 1)[-1] for w in c.group(1).split()
+                             if "/" in w and not w.startswith("-")), c.group(1).split()[0])
+                error = f"{prog} failed: {c.group(2)}"
+            context = [l.strip()[:200] for l in recent[-6:]]
+            hints = [l for l in context if any(h in l.lower() for h in _TASK_ERROR_HINT)]
+            failures.append({"vmid": m.group(1), "reason": (hints[-1] if hints else error)[:300],
+                             "error": error[:300], "context": context})
+            recent = []
+            continue
+        if vmid:
+            recent.append(line)
+        if line.startswith("ERROR:") and "Backup of VM" not in line:
+            failures.append({"vmid": None, "reason": line[:300], "error": line[:300], "context": []})
+    return failures
 
 
 async def _resolve_type_with_fallback(client, node, vmid, resolved_type, path_suffix, method="get", **kwargs):
@@ -2994,7 +3089,77 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
             node = arguments["node"]
             limit = arguments.get("limit", 50)
             return await client.get(f"/nodes/{node}/tasks", {"limit": limit})
-        
+
+        elif name == "get_task_log":
+            node = arguments["node"]
+            upid = arguments["upid"].strip()
+            limit = max(1, min(int(arguments.get("limit", 2000) or 2000), 20000))
+            path = f"/nodes/{node}/tasks/{quote(upid, safe='')}"
+            status = (await client.get(f"{path}/status")).get("data") or {}
+            lines = [row.get("t", "") for row in (await client.get(f"{path}/log", {"limit": limit})).get("data") or []]
+            result = {
+                "node": node, "upid": upid, "type": status.get("type"), "id": status.get("id"),
+                "user": status.get("user"), "status": status.get("status"),
+                "exitstatus": status.get("exitstatus"),
+                "starttime": _fmt_epoch(status.get("starttime")),
+                "line_count": len(lines),
+            }
+            if arguments.get("errors_only"):
+                result["lines"] = _task_error_lines(lines)
+            else:
+                result["lines"] = lines
+            return result
+
+        elif name == "get_backup_failures":
+            days = max(1, int(arguments.get("days", 3) or 3))
+            per_node = max(1, min(int(arguments.get("limit", 10) or 10), 100))
+            since = int(time.time()) - days * 86400
+            if arguments.get("node"):
+                nodes = [arguments["node"]]
+            else:
+                nodes = [n["node"] for n in ((await client.get("/nodes")).get("data") or [])
+                         if n.get("status") == "online"]
+            names = {}
+            try:
+                for r in (await client.get("/cluster/resources", {"type": "vm"})).get("data") or []:
+                    names[str(r.get("vmid"))] = r.get("name")
+            except Exception:
+                pass
+            jobs, node_errors = [], {}
+            for node in nodes:
+                try:
+                    tasks = (await client.get(f"/nodes/{node}/tasks", {
+                        "typefilter": "vzdump", "errors": 1, "since": since, "limit": per_node})).get("data") or []
+                except Exception as e:
+                    node_errors[node] = str(e)[:200]
+                    continue
+                for t in tasks:
+                    upid = t.get("upid", "")
+                    try:
+                        log = (await client.get(f"/nodes/{node}/tasks/{quote(upid, safe='')}/log",
+                                                {"limit": 20000})).get("data") or []
+                        failed = _vzdump_failures([row.get("t", "") for row in log])
+                    except Exception as e:
+                        failed = [{"vmid": None, "error": f"could not read task log: {str(e)[:150]}"}]
+                    for f in failed:
+                        if f.get("vmid"):
+                            f["name"] = names.get(f["vmid"])
+                    jobs.append({"node": node, "upid": upid, "starttime": _fmt_epoch(t.get("starttime")),
+                                 "status": t.get("status"), "failed_guests": failed})
+            jobs.sort(key=lambda j: j["starttime"] or "", reverse=True)
+            by_guest = {}
+            for j in jobs:
+                for f in j["failed_guests"]:
+                    key = f.get("vmid") or "?"
+                    g = by_guest.setdefault(key, {"vmid": f.get("vmid"), "name": f.get("name"),
+                                                  "failures": 0, "last_reason": f.get("reason")})
+                    g["failures"] += 1
+            return {
+                "days": days, "nodes_checked": nodes, "failed_jobs": len(jobs),
+                "guests": sorted(by_guest.values(), key=lambda g: -g["failures"]),
+                "jobs": jobs, **({"node_errors": node_errors} if node_errors else {}),
+            }
+
         # Virtual Machine Management
         elif name == "list_vms":
             # Enhanced in v1.3.1 (2025-11-29):

@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **P
 
 - **Author:** Jason Cheng (jason@jason.tools)
 - **License:** MIT
-- **Version:** 1.5.7
+- **Version:** 1.5.8
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -156,7 +156,7 @@ Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in prod
 
 ---
 
-## Tools (57)
+## Tools (59)
 
 ### Cluster & nodes
 
@@ -168,6 +168,8 @@ Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in prod
 | `get_node_status` | CPU / memory / system status of a node |
 | `get_node_resources` | Node resource usage (VMs, CTs, storage) from cluster resources |
 | `get_node_tasks` | Node task execution status and history |
+| `get_task_log` | Status and output log of one task by UPID; `errors_only` keeps just the lines that explain a failure |
+| `get_backup_failures` | Recent failed backup (vzdump) jobs across nodes: which VM/CT failed, a one-line reason from the log, and a per-guest count |
 
 ### VMs & containers — query
 
@@ -278,6 +280,7 @@ Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in prod
 
 ## Changelog (recent)
 
+- **v1.5.8** — New `get_task_log` and `get_backup_failures`. A backup job only reported `job errors`; the guest that failed and the reason were in the task log, which no tool could read.
 - **v1.5.7** — SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 - **v1.5.6** — Fix inaccurate VM memory usage (`memory_used_mb` could exceed total); balloon-derived in-guest usage + clamp; merged IP/memory lookups into one concurrent wave.
 - **v1.5.5** — Removed `include_details` from `get_ceph_status` to prevent token overflow.
