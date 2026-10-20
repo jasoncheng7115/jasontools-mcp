@@ -4,7 +4,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **P
 
 - **Author:** Jason Cheng (jason@jason.tools)
 - **License:** MIT
-- **Version:** 1.5.8
+- **Version:** 1.6.0
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -61,6 +61,7 @@ Settings are resolved in this order: **CLI args > environment variables > defaul
 | `MCP_HTTP_HOST` | `--http-host` | `0.0.0.0` | HTTP bind address |
 | `MCP_HTTP_PORT` | `--http-port` | `8000` | HTTP port |
 | `MCP_API_KEY` | `--api-key` | — | Bearer token to protect the HTTP/SSE endpoint |
+| `MCP_PVE_COMPACT` | — | off | `1` shortens tool and parameter descriptions for small-context models |
 
 Use **API token** auth where possible; the server falls back to ticket + CSRF when only username/password are supplied.
 
@@ -156,7 +157,7 @@ Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in prod
 
 ---
 
-## Tools (59)
+## Tools (70)
 
 ### Cluster & nodes
 
@@ -170,6 +171,26 @@ Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in prod
 | `get_node_tasks` | Node task execution status and history |
 | `get_task_log` | Status and output log of one task by UPID; `errors_only` keeps just the lines that explain a failure |
 | `get_backup_failures` | Recent failed backup (vzdump) jobs across nodes: which VM/CT failed, a one-line reason from the log, and a per-guest count |
+
+### Operations checks (read-only)
+
+These answer "is this safe?" and "what is wrong?" instead of returning raw API data.
+
+| Tool | Description |
+|---|---|
+| `migration_preflight` | Before a migration: CPU vendor/model of both nodes, guest CPU type, local disks, mounted ISO, passthrough devices, target memory headroom, HA. Verdict `ok` / `warning` / `blocked` and the recommended mode (`online` / `offline` / `restart`) |
+| `verify_guest` | After a migration, reboot or restore: samples status and checks that uptime, CPU and network counters move, the guest agent answers and TCP ports answer from the MCP server. `healthy` / `suspect` / `down` with reasons |
+| `get_capacity_report` | Per node: RAM used vs memory allocated to running VMs, container limits vs real use, CPU vendor. Suggests which VMs to move where, preferring same-vendor targets |
+| `find_guest` | Which VM/container owns an IP, MAC, name fragment or VMID (config, guest agent, container interfaces) |
+| `check_ip_conflicts` | IPs used by more than one guest (active, or latent: a stopped guest would clash when started) and duplicate MACs; Docker/bridge addresses inside guests are ignored |
+| `get_backup_coverage` | Running guests without a backup, guests in no backup job, guests whose last backup is too old, with storage and verify state |
+| `get_notification_health` | Configured notification endpoints and matchers, endpoints no matcher uses, and delivery failures found in backup task logs |
+| `get_node_updates` | Pending updates per node (by origin), running vs newest installed kernel (reboot needed), pve-manager version |
+| `get_stale_snapshots` | Snapshots older than N days across the cluster |
+| `audit_container_features` | Privileged containers, nesting/keyctl against the OS type, running containers that will not start on boot |
+| `find_oom_events` | OOM kills from the nodes' kernel logs mapped to the guest and service; tells a guest hitting its own memory limit apart from the host running out of memory |
+
+`migrate` now runs `migration_preflight` first and refuses a live migration it rates unsafe (for example across CPU vendors, where the migration can finish "successfully" and leave the guest frozen); `force=true` overrides. Containers are moved in restart mode.
 
 ### VMs & containers — query
 
@@ -280,6 +301,7 @@ Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in prod
 
 ## Changelog (recent)
 
+- **v1.6.0** — Eleven read-only operations checks: `migration_preflight`, `verify_guest`, `get_capacity_report`, `find_guest`, `check_ip_conflicts`, `get_backup_coverage`, `get_notification_health`, `get_node_updates`, `get_stale_snapshots`, `audit_container_features`, `find_oom_events`. `migrate` runs the preflight and refuses unsafe live migrations. `get_all_operation_logs` fills `vmid` from the UPID; `get_all_snapshots` adds `age_days`; `MCP_PVE_COMPACT=1` for short descriptions.
 - **v1.5.8** — New `get_task_log` and `get_backup_failures`. A backup job only reported `job errors`; the guest that failed and the reason were in the task log, which no tool could read.
 - **v1.5.7** — SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 - **v1.5.6** — Fix inaccurate VM memory usage (`memory_used_mb` could exceed total); balloon-derived in-guest usage + clamp; merged IP/memory lookups into one concurrent wave.

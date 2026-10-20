@@ -4,12 +4,32 @@ Proxmox VE MCP Server - Enhanced Edition with Batch Operations and Pagination
 Provides comprehensive Proxmox VE management functionality including batch data collection
 
 Author: Jason Cheng (jason@jason.tools)
-Version: 1.5.8
-Last Updated: 2026-10-19
+Version: 1.6.0
+Last Updated: 2026-10-21
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 
 Changelog:
+v1.6.0 (2026-10-21) - Feature: operations checks ("is this safe?", "what is wrong?")
+         - migration_preflight: CPU vendor/model of source and target, CPU type, local disks, ISO,
+           passthrough, target memory headroom, HA -> verdict and recommended mode. A live
+           migration from an AMD to an Intel node completed "successfully" and froze the guest.
+         - migrate runs the preflight and refuses a live migration it rates unsafe (force=true
+           overrides); containers are moved in restart mode.
+         - verify_guest: samples status and checks that uptime, CPU and network move, the guest
+           agent answers and TCP ports answer from the MCP server.
+         - get_capacity_report: RAM used vs allocated per node and move suggestions that prefer
+           same-vendor targets.
+         - find_guest (IP / MAC / name / VMID) and check_ip_conflicts (active and latent,
+           ignoring Docker/bridge addresses inside guests).
+         - get_backup_coverage: running guests without backup, guests in no job, stale backups.
+         - get_notification_health: configured endpoints, matchers and delivery failures from
+           backup task logs (e.g. a webhook answering 401).
+         - get_node_updates: pending updates by origin, running vs newest installed kernel.
+         - get_stale_snapshots, audit_container_features, find_oom_events (tells a guest hitting
+           its own memory limit apart from the host running out of memory).
+         - get_all_operation_logs fills vmid from the UPID; get_all_snapshots adds age_days;
+           MCP_PVE_COMPACT=1 shortens tool descriptions.
 v1.5.8 (2026-10-19) - Feature: read task logs; find failed backups and why
          - get_task_log(node, upid, errors_only): status and output of one task. Backup jobs
            only reported "job errors" before; the guest that failed and the reason were in
@@ -149,7 +169,7 @@ from pydantic import AnyUrl
 import mcp.types as types
 
 # Version information
-__version__ = "1.5.8"
+__version__ = "1.6.0"
 __last_updated__ = "2026-07-01"
 __author__ = "Jason Cheng"
 __email__ = "jason@jason.tools"
@@ -209,12 +229,16 @@ class ProxmoxVEError(Exception):
 
 # Tools that support auto-resolution of VM/container identity
 # (vmid-only → auto-detect node, vmname → search by name)
+# Short tool descriptions for small-context models (MCP_PVE_COMPACT=1)
+COMPACT_DESCRIPTIONS = os.getenv("MCP_PVE_COMPACT", "").lower() in ("1", "true", "yes")
+
 TOOLS_WITH_VM_IDENTITY = {
     "get_status", "get_config", "get_snapshots",
     "start", "shutdown", "stop", "reboot", "reset",
     "migrate", "backup", "snapshot",
     "clone", "update_config", "delete",
     "get_performance", "get_firewall_rules",
+    "migration_preflight", "verify_guest",
 }
 
 # ============================================================================
@@ -1210,7 +1234,7 @@ async def handle_list_tools() -> List[Tool]:
         ),
         Tool(
             name="migrate",
-            description="Migrate VM or container to another node. Provide node+vmid, or just vmid, or vmname. Set confirm=true.",
+            description="Migrate VM or container to another node. Runs migration_preflight first and refuses a live migration it rates unsafe (e.g. different CPU vendor). Provide node+vmid, or just vmid, or vmname. Set confirm=true.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1219,6 +1243,7 @@ async def handle_list_tools() -> List[Tool]:
                     "vmname": {"type": "string", "description": "VM/container name (partial match, alternative to vmid)"},
                     "target": {"type": "string", "description": "Target node name"},
                     "online": {"type": "boolean", "description": "Online/live migration", "default": True},
+                    "force": {"type": "boolean", "description": "Live-migrate even when migration_preflight recommends offline (e.g. CPU vendor differs)", "default": False},
                     "confirm": {"type": "boolean", "description": "Confirmation flag - must be true to execute", "default": False}
                 },
                 "required": ["target"],
@@ -1556,6 +1581,8 @@ async def handle_list_tools() -> List[Tool]:
         )
     ]
 
+    all_tools = all_tools + OPS_TOOLS
+
     # Filter tools based on feature toggles
     # Added in v1.3.2 (2025-11-29): Enforce feature toggles for dangerous operations
     enabled_tools = []
@@ -1570,7 +1597,20 @@ async def handle_list_tools() -> List[Tool]:
             # Always include tools not in permission map (read-only operations)
             enabled_tools.append(tool)
 
+    if COMPACT_DESCRIPTIONS:
+        enabled_tools = [_compact_tool(t) for t in enabled_tools]
     return enabled_tools
+
+
+def _compact_tool(tool: Tool) -> Tool:
+    """Short descriptions for small-context models: first sentence of the tool, parameter
+    descriptions cut to 60 characters."""
+    desc = re.split(r"(?<=[.!?])\s", tool.description or "", maxsplit=1)[0]
+    schema = json.loads(json.dumps(tool.inputSchema))
+    for prop in (schema.get("properties") or {}).values():
+        if isinstance(prop, dict) and len(prop.get("description", "")) > 60:
+            prop["description"] = prop["description"][:57] + "..."
+    return Tool(name=tool.name, description=desc, inputSchema=schema)
 
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict) -> List[Union[types.TextContent, types.ImageContent]]:
@@ -1917,6 +1957,9 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
         resolved_type = arguments.pop("_resolved_type", None)
         resolved_name = arguments.pop("_resolved_name", None)
 
+        if name in OPS_IMPL:
+            return await OPS_IMPL[name](client, arguments, resolved_type)
+
         # Unified permission check (needs _resolved_type from resolver)
         if name in unified_permissions:
             perm_map = unified_permissions[name]
@@ -1990,11 +2033,26 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
             vmid = arguments["vmid"]
             target = arguments["target"]
             online = arguments.get("online", True)
+            preflight = await op_migration_preflight(
+                client, {"node": node, "vmid": vmid, "target": target, "online": online}, resolved_type)
+            if preflight["verdict"] == "blocked":
+                return {"status": "refused", "reason": "migration_preflight blocked this move", "preflight": preflight}
+            if online and preflight["recommended_mode"] == "offline" and not arguments.get("force"):
+                return {"status": "refused",
+                        "reason": "live migration is unsafe for this guest/target (see risks); shut the guest down "
+                                  "and migrate offline, or pass force=true to override",
+                        "preflight": preflight}
+            if resolved_type == "lxc":
+                online = False
             migrate_data = {
                 "target": target,
                 "online": 1 if online else 0
             }
-            return await _resolve_type_with_fallback(client, node, vmid, resolved_type, "/migrate", method="post", data=migrate_data)
+            if resolved_type == "lxc" and preflight["guest"]["status"] == "running":
+                migrate_data["restart"] = 1
+            result = await _resolve_type_with_fallback(client, node, vmid, resolved_type, "/migrate", method="post", data=migrate_data)
+            return {"result": result, "preflight": preflight,
+                    "next_step": "when the task finishes, run verify_guest on this guest"}
 
         elif name == "backup":
             node = arguments["node"]
@@ -2318,7 +2376,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                                     "source_type": "node",
                                     "source_name": node,
                                     "node": node,
-                                    "vmid": task.get("id"),
+                                    "vmid": task.get("id") or _upid_id(task.get("upid", "")) or None,
                                     "operation": task.get("type", ""),
                                     "status": task.get("status", "unknown"),
                                     "starttime": task.get("starttime"),
@@ -2446,7 +2504,8 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                                     snap_data = {
                                         "name": snapshot.get("name", ""),
                                         "description": snapshot.get("description", ""),
-                                        "snaptime": snapshot.get("snaptime")
+                                        "snaptime": snapshot.get("snaptime"),
+                                        "age_days": _age_days(snapshot.get("snaptime"))
                                     }
                                     
                                     if include_details:
@@ -2489,7 +2548,8 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                                         snap_data = {
                                             "name": snapshot.get("name", ""),
                                             "description": snapshot.get("description", ""),
-                                            "snaptime": snapshot.get("snaptime")
+                                            "snaptime": snapshot.get("snaptime"),
+                                            "age_days": _age_days(snapshot.get("snaptime"))
                                         }
                                         
                                         if include_details:
@@ -4765,6 +4825,792 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
 
 
 # Dead code block removed in v1.5.0 (was unreachable duplicate of execute_tool)
+
+# ===================== v1.6.0: operations checks (read-only) =====================
+# Tools that answer "is this safe?" and "what is wrong?" instead of returning raw API data.
+# All of them only read; migrate is the only write path that uses them (preflight).
+
+_SHARED_STORAGE_TYPES = {"rbd", "cephfs", "nfs", "cifs", "iscsi", "iscsidirect", "glusterfs", "pbs", "zfs over iscsi"}
+_DISK_KEY_RE = re.compile(r"^(scsi|virtio|sata|ide|efidisk|tpmstate|unused)\d+$|^(rootfs|mp\d+)$")
+_OPS_CONCURRENCY = 8
+
+
+def _cpu_vendor(model: str) -> str:
+    m = (model or "").lower()
+    if "amd" in m or "epyc" in m or "ryzen" in m:
+        return "AMD"
+    if "intel" in m or "xeon" in m:
+        return "Intel"
+    return "unknown"
+
+
+def _age_days(ts) -> Optional[float]:
+    try:
+        return round((time.time() - int(ts)) / 86400, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _upid_id(upid: str) -> str:
+    # UPID:node:pid:pstart:starttime:type:id:user:
+    parts = (upid or "").split(":")
+    return parts[6] if len(parts) > 7 else ""
+
+
+async def _gather_limited(coros, limit: int = _OPS_CONCURRENCY):
+    sem = asyncio.Semaphore(limit)
+
+    async def run(c):
+        async with sem:
+            try:
+                return await c
+            except Exception as e:  # one guest failing must not sink the report
+                return e
+    return await asyncio.gather(*(run(c) for c in coros))
+
+
+async def _resources(client, kind: str = "vm") -> List[dict]:
+    return (await client.get("/cluster/resources", {"type": kind})).get("data", []) or []
+
+
+async def _node_info(client, node: str) -> dict:
+    st = (await client.get(f"/nodes/{node}/status")).get("data", {}) or {}
+    cpu = st.get("cpuinfo", {}) or {}
+    mem = st.get("memory", {}) or {}
+    return {"node": node, "cpu_model": cpu.get("model", ""), "cpu_vendor": _cpu_vendor(cpu.get("model", "")),
+            "cpus": cpu.get("cpus"), "mem_total": mem.get("total", 0), "mem_used": mem.get("used", 0),
+            "mem_free": mem.get("free", 0), "kversion": st.get("kversion", ""), "cpu_usage": st.get("cpu")}
+
+
+async def _guest_config(client, node: str, vmid: int, gtype: str) -> dict:
+    return (await client.get(f"/nodes/{node}/{gtype}/{vmid}/config")).get("data", {}) or {}
+
+
+async def _storage_types(client) -> Dict[str, dict]:
+    out = {}
+    for s in (await client.get("/storage")).get("data", []) or []:
+        out[s.get("storage")] = {"type": s.get("type"), "shared": bool(s.get("shared")) or s.get("type") in _SHARED_STORAGE_TYPES}
+    return out
+
+
+def _disk_storages(cfg: dict) -> List[dict]:
+    disks = []
+    for k, v in cfg.items():
+        if not _DISK_KEY_RE.match(k) or not isinstance(v, str):
+            continue
+        if "media=cdrom" in v:
+            vol = v.split(",")[0]
+            if vol not in ("none", "cdrom"):
+                disks.append({"key": k, "storage": vol.split(":")[0], "cdrom": True})
+            continue
+        vol = v.split(",")[0]
+        if ":" in vol:
+            disks.append({"key": k, "storage": vol.split(":")[0], "cdrom": False})
+    return disks
+
+
+async def _ha_sids(client) -> Dict[str, dict]:
+    try:
+        return {r.get("sid"): r for r in (await client.get("/cluster/ha/resources")).get("data", []) or []}
+    except Exception:
+        return {}
+
+
+async def op_migration_preflight(client, args: dict, gtype: str) -> dict:
+    node, vmid, target = args["node"], int(args["vmid"]), args["target"]
+    gtype = gtype or "qemu"
+    want_online = args.get("online")
+    if node == target:
+        return {"verdict": "blocked", "blockers": [f"guest is already on {target}"]}
+    cfg, src, dst, storages, ha = await asyncio.gather(
+        _guest_config(client, node, vmid, gtype), _node_info(client, node), _node_info(client, target),
+        _storage_types(client), _ha_sids(client))
+    status = ((await client.get(f"/nodes/{node}/{gtype}/{vmid}/status/current")).get("data") or {}).get("status")
+    running = status == "running"
+    blockers, risks, notes = [], [], []
+
+    same_vendor = src["cpu_vendor"] == dst["cpu_vendor"] and src["cpu_vendor"] != "unknown"
+    same_model = src["cpu_model"] == dst["cpu_model"]
+    cpu_type = cfg.get("cpu", "kvm64 (default)") if gtype == "qemu" else None
+    if gtype == "qemu" and running:
+        if not same_vendor:
+            risks.append(f"CPU vendor differs ({src['cpu_vendor']} {src['cpu_model']} -> {dst['cpu_vendor']} "
+                         f"{dst['cpu_model']}): a live migration can complete 'successfully' and leave the guest "
+                         f"frozen. Migrate offline (shutdown, migrate, start).")
+        elif not same_model and str(cpu_type).startswith("host"):
+            risks.append(f"cpu={cpu_type} passes the exact host CPU to the guest; source and target CPU models "
+                         f"differ ({src['cpu_model']} vs {dst['cpu_model']}). Migrate offline or use a generic CPU type.")
+
+    for k in cfg:
+        if k.startswith("hostpci"):
+            blockers.append(f"{k}: PCI passthrough device ({cfg[k]}) cannot move with the guest")
+        if k.startswith("usb"):
+            risks.append(f"{k}: USB passthrough ({cfg[k]}) is tied to the source host")
+    local = []
+    for d in _disk_storages(cfg):
+        st = storages.get(d["storage"], {})
+        if d["cdrom"]:
+            if not st.get("shared"):
+                blockers.append(f"{d['key']}: ISO on local storage '{d['storage']}' is mounted; eject it first")
+        elif not st.get("shared"):
+            local.append(f"{d['key']} on {d['storage']} ({st.get('type', '?')})")
+    if local:
+        risks.append("local disks must be copied (slow, needs space on target): " + ", ".join(local))
+
+    need = int(cfg.get("memory", 512)) * 1024 * 1024
+    headroom = dst["mem_total"] - dst["mem_used"] - need
+    if headroom < dst["mem_total"] * 0.10:
+        risks.append(f"target {target} would have {headroom / 2**30:.1f} GiB left after this guest "
+                     f"({need / 2**30:.1f} GiB); less than 10% of its RAM")
+
+    sid = f"{'vm' if gtype == 'qemu' else 'ct'}:{vmid}"
+    if sid in ha:
+        notes.append(f"{sid} is HA-managed: a migrate request goes to the HA manager (online for VMs). "
+                     f"For an offline move use 'ha-manager relocate {sid} {target}' (stop, move, start).")
+
+    if gtype == "lxc":
+        mode = "restart" if running else "offline"
+        if running:
+            notes.append("containers cannot live-migrate; the move restarts it (brief downtime)")
+    elif not running:
+        mode = "offline"
+    elif any("CPU vendor differs" in r or "passes the exact host CPU" in r for r in risks):
+        mode = "offline"
+    else:
+        mode = "online"
+    if want_online is True and mode != "online":
+        risks.append(f"online migration was requested but the recommended mode is {mode}")
+    verdict = "blocked" if blockers else ("warning" if risks else "ok")
+    return {
+        "verdict": verdict, "recommended_mode": mode,
+        "guest": {"vmid": vmid, "type": gtype, "name": cfg.get("name") or cfg.get("hostname"), "status": status,
+                  "cpu_type": cpu_type, "memory_mb": int(cfg.get("memory", 0))},
+        "source": {k: src[k] for k in ("node", "cpu_vendor", "cpu_model")},
+        "target": {k: dst[k] for k in ("node", "cpu_vendor", "cpu_model")} | {
+            "mem_free_after_gib": round(headroom / 2**30, 1)},
+        "blockers": blockers, "risks": risks, "notes": notes,
+        "after_migration": "run verify_guest on the guest a few minutes after it is up",
+    }
+
+
+async def _try_tcp(ip: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        r, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        w.close()
+        return True
+    except Exception:
+        return False
+
+
+# Interfaces inside a guest that carry host-local addresses (Docker/K8s/LXD bridges, veth pairs);
+# every Docker host has the same default bridge address, so they are not conflicts.
+_VIRTUAL_IFACE_RE = re.compile(r"^(lo|docker\d*|br-|veth|virbr|cni|flannel|kube|lxcbr|lxdbr|podman|cali|vxlan|tun|tap)")
+
+
+def _usable_ip(ip: str, iface: str) -> bool:
+    return bool(ip) and not ip.startswith(("127.", "169.254.")) and not _VIRTUAL_IFACE_RE.match(iface or "")
+
+
+async def _guest_ips(client, node: str, vmid: int, gtype: str) -> List[str]:
+    ips = []
+    try:
+        if gtype == "qemu":
+            data = (await client.get(f"/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces")).get("data", {})
+            for itf in (data.get("result") or []):
+                for a in itf.get("ip-addresses") or []:
+                    if a.get("ip-address-type") == "ipv4" and _usable_ip(a.get("ip-address", ""), itf.get("name", "")):
+                        ips.append(a["ip-address"])
+        else:
+            for itf in (await client.get(f"/nodes/{node}/lxc/{vmid}/interfaces")).get("data", []) or []:
+                name = itf.get("name", "")
+                for a in (itf.get("ip-addresses") or []):
+                    ip = a.get("ip-address", "")
+                    if a.get("ip-address-type") == "inet" and _usable_ip(ip, name):
+                        ips.append(ip)
+                if itf.get("inet") and _usable_ip(str(itf["inet"]).split("/")[0], name):
+                    ips.append(str(itf["inet"]).split("/")[0])
+    except Exception:
+        pass
+    return sorted(set(ips))
+
+
+async def op_verify_guest(client, args: dict, gtype: str) -> dict:
+    node, vmid = args["node"], int(args["vmid"])
+    gtype = gtype or "qemu"
+    samples = max(2, min(int(args.get("samples", 3) or 3), 10))
+    interval = max(2, min(int(args.get("interval", 5) or 5), 30))
+    ports = args.get("ports") or [22, 3389, 80, 443]
+    path = f"/nodes/{node}/{gtype}/{vmid}/status/current"
+    snaps = []
+    for i in range(samples):
+        d = (await client.get(path)).get("data", {}) or {}
+        snaps.append({k: d.get(k) for k in ("status", "uptime", "cpu", "netin", "netout", "diskread", "diskwrite")})
+        if i < samples - 1:
+            await asyncio.sleep(interval)
+    first, last = snaps[0], snaps[-1]
+    checks, problems = {}, []
+    checks["status"] = last.get("status")
+    if last.get("status") != "running":
+        problems.append(f"status is {last.get('status')}")
+    span = interval * (samples - 1)
+    delta = lambda k: (last.get(k) or 0) - (first.get(k) or 0)
+    checks["uptime_advanced"] = delta("uptime") > 0
+    checks["net_bytes_out_in_window"] = delta("netout")
+    checks["net_bytes_in_in_window"] = delta("netin")
+    checks["disk_write_bytes_in_window"] = delta("diskwrite")
+    checks["cpu_usage_pct"] = [round((s.get("cpu") or 0) * 100, 1) for s in snaps]
+    if last.get("status") == "running":
+        if delta("netout") == 0 and delta("netin") == 0:
+            problems.append(f"no network traffic at all in {span}s")
+        if all((s.get("cpu") or 0) == 0 for s in snaps):
+            problems.append("CPU usage is exactly 0 in every sample (guest may be frozen)")
+    agent = None
+    if gtype == "qemu" and last.get("status") == "running":
+        try:
+            await client.post(f"/nodes/{node}/qemu/{vmid}/agent/ping")
+            agent = "responding"
+        except Exception as e:
+            agent = f"not responding ({str(e)[:80]})"
+    checks["guest_agent"] = agent
+    ips = list(args.get("ips") or []) or await _guest_ips(client, node, vmid, gtype)
+    if not ips:
+        cfg = await _guest_config(client, node, vmid, gtype)
+        for k, v in cfg.items():
+            m = re.search(r"(?:^|,)ip=(\d+\.\d+\.\d+\.\d+)", str(v)) if k.startswith(("net", "ipconfig")) else None
+            if m:
+                ips.append(m.group(1))
+    reach = {}
+    for ip in ips[:4]:
+        res = await asyncio.gather(*(_try_tcp(ip, int(p)) for p in ports))
+        reach[ip] = {str(p): ok for p, ok in zip(ports, res)}
+    checks["tcp_from_mcp_server"] = reach
+    if ips and not any(any(v.values()) for v in reach.values()):
+        problems.append(f"none of ports {ports} answer on {', '.join(ips[:4])} (may be a firewall; check the service)")
+    if not ips:
+        problems.append("no IP address known (no guest agent / static ip=); network reachability not tested")
+    verdict = "healthy" if not problems else ("down" if last.get("status") != "running" else "suspect")
+    return {"vmid": vmid, "node": node, "type": gtype, "verdict": verdict, "problems": problems,
+            "checks": checks, "window_seconds": span}
+
+
+async def op_capacity_report(client, args: dict, _t=None) -> dict:
+    res = await _resources(client)
+    nodes = [n["node"] for n in (await client.get("/nodes")).get("data", []) if n.get("status") == "online"]
+    if args.get("node"):
+        nodes = [args["node"]]
+    infos = {n: i for n, i in zip(nodes, await _gather_limited([_node_info(client, n) for n in nodes]))
+             if isinstance(i, dict)}
+    report = []
+    for n, i in infos.items():
+        guests = [r for r in res if r.get("node") == n and r.get("status") == "running"]
+        vm_alloc = sum(r.get("maxmem", 0) for r in guests if r["type"] == "qemu")
+        ct_alloc = sum(r.get("maxmem", 0) for r in guests if r["type"] == "lxc")
+        vm_used = sum(r.get("mem", 0) for r in guests if r["type"] == "qemu")
+        ct_used = sum(r.get("mem", 0) for r in guests if r["type"] == "lxc")
+        report.append({
+            "node": n, "cpu_vendor": i["cpu_vendor"], "cpu_model": i["cpu_model"], "cpus": i["cpus"],
+            "cpu_usage_pct": round((i.get("cpu_usage") or 0) * 100, 1),
+            "mem_total_gib": round(i["mem_total"] / 2**30, 1), "mem_used_gib": round(i["mem_used"] / 2**30, 1),
+            "mem_used_pct": round(i["mem_used"] * 100 / max(i["mem_total"], 1), 1),
+            "vm_allocated_gib": round(vm_alloc / 2**30, 1), "vm_in_use_gib": round(vm_used / 2**30, 1),
+            "ct_limit_gib": round(ct_alloc / 2**30, 1), "ct_in_use_gib": round(ct_used / 2**30, 1),
+            "vm_alloc_vs_ram_pct": round(vm_alloc * 100 / max(i["mem_total"], 1), 1),
+            "running_vms": sum(1 for r in guests if r["type"] == "qemu"),
+            "running_cts": sum(1 for r in guests if r["type"] == "lxc"),
+        })
+    hot_pct = float(args.get("mem_threshold_pct", 75))
+    suggestions = []
+    by_node = {r["node"]: r for r in report}
+    projected = {r["node"]: infos[r["node"]]["mem_used"] for r in report}
+    for r in sorted(report, key=lambda x: -x["mem_used_pct"]):
+        if r["mem_used_pct"] < hot_pct and r["vm_alloc_vs_ram_pct"] < 80:
+            continue
+        cands = sorted([g for g in res if g.get("node") == r["node"] and g.get("status") == "running"
+                        and g["type"] == "qemu"], key=lambda g: -(g.get("mem") or 0))
+        for g in cands[:3]:
+            gmem = g.get("mem") or g.get("maxmem", 0)
+            best = None
+            for t in report:
+                if t["node"] == r["node"]:
+                    continue
+                total = infos[t["node"]]["mem_total"]
+                after = projected[t["node"]] + gmem
+                if after / total > hot_pct / 100:
+                    continue
+                score = (t["cpu_vendor"] == r["cpu_vendor"], -after / total)
+                if best is None or score > best[0]:
+                    best = (score, t)
+            if best:
+                t = best[1]
+                same = t["cpu_vendor"] == r["cpu_vendor"]
+                projected[t["node"]] += gmem
+                projected[r["node"]] -= gmem
+                sug = {
+                    "vmid": g["vmid"], "name": g.get("name"), "from": r["node"], "to": t["node"],
+                    "frees_gib": round(gmem / 2**30, 1),
+                    "mode": "online" if same else "offline (CPU vendor differs: shutdown, migrate, start)",
+                }
+                if not same:
+                    sug["caution"] = ("no same-vendor node has room for this guest; the only target needs an offline "
+                                      "move and puts the guest on different hardware")
+                suggestions.append(sug)
+            if projected[r["node"]] / infos[r["node"]]["mem_total"] * 100 < hot_pct:
+                break
+    return {"nodes": sorted(report, key=lambda x: x["node"]), "suggestions": suggestions,
+            "notes": ["Container memory is a limit, not a reservation; VMs grow towards their allocation.",
+                      "Run migration_preflight before acting on a suggestion."]}
+
+
+async def _all_guest_net(client, with_runtime_ips: bool = True) -> List[dict]:
+    res = await _resources(client)
+    cfgs = await _gather_limited([_guest_config(client, g["node"], g["vmid"], g["type"]) for g in res])
+    runtime = [None] * len(res)
+    if with_runtime_ips:
+        idx = [i for i, g in enumerate(res) if g.get("status") == "running"]
+        got = await _gather_limited([_guest_ips(client, res[i]["node"], res[i]["vmid"], res[i]["type"]) for i in idx])
+        for i, ips in zip(idx, got):
+            runtime[i] = ips if isinstance(ips, list) else []
+    out = []
+    for g, cfg, rips in zip(res, cfgs, runtime):
+        if isinstance(cfg, Exception):
+            cfg = {}
+        nics = []
+        for k, v in cfg.items():
+            if not re.match(r"^net\d+$", k):
+                continue
+            s = str(v)
+            mac = re.search(r"(?:hwaddr=|virtio=|e1000[^=]*=|vmxnet3=|rtl8139=)([0-9A-Fa-f:]{17})", s)
+            ip = re.search(r"(?:^|,)ip=([0-9.]+)(?:/\d+)?", s)
+            nics.append({"nic": k, "mac": mac.group(1).lower() if mac else None,
+                         "static_ip": ip.group(1) if ip else None,
+                         "dhcp": "ip=dhcp" in s, "bridge": (re.search(r"bridge=([^,]+)", s) or [None, None])[1]})
+        for k, v in cfg.items():
+            if k.startswith("ipconfig"):
+                ip = re.search(r"ip=([0-9.]+)", str(v))
+                if ip:
+                    nics.append({"nic": k, "mac": None, "static_ip": ip.group(1), "dhcp": False, "bridge": None})
+        out.append({"vmid": g["vmid"], "name": g.get("name"), "type": g["type"], "node": g["node"],
+                    "status": g.get("status"), "nics": nics, "runtime_ips": rips or []})
+    return out
+
+
+async def op_find_guest(client, args: dict, _t=None) -> dict:
+    q = str(args.get("query", "")).strip().lower()
+    if not q:
+        raise ProxmoxVEError("query is required: an IP, MAC, name fragment or VMID")
+    rows = await _all_guest_net(client, with_runtime_ips=True)
+    hits = []
+    for r in rows:
+        why = []
+        if q == str(r["vmid"]):
+            why.append("vmid")
+        if q in (r.get("name") or "").lower():
+            why.append("name")
+        for n in r["nics"]:
+            if n["mac"] and q.replace("-", ":") == n["mac"]:
+                why.append(f"mac on {n['nic']}")
+            if n["static_ip"] and q == n["static_ip"]:
+                why.append(f"static ip on {n['nic']}")
+        if q in r["runtime_ips"]:
+            why.append("runtime ip")
+        if why:
+            hits.append({**r, "matched_by": why})
+    return {"query": q, "matches": hits, "count": len(hits),
+            "note": None if hits else "not a guest of this cluster (or a DHCP guest without agent/interface data)"}
+
+
+async def op_check_ip_conflicts(client, args: dict, _t=None) -> dict:
+    rows = await _all_guest_net(client, with_runtime_ips=True)
+    owners: Dict[str, list] = {}
+    macs: Dict[str, list] = {}
+    for r in rows:
+        seen = set()
+        for n in r["nics"]:
+            if n["static_ip"]:
+                seen.add((n["static_ip"], "static"))
+            if n["mac"]:
+                macs.setdefault(n["mac"], []).append(f"{r['vmid']} {r.get('name')} ({r['status']})")
+        for ip in r["runtime_ips"]:
+            seen.add((ip, "runtime"))
+        for ip, how in seen:
+            owners.setdefault(ip, []).append({"vmid": r["vmid"], "name": r.get("name"), "node": r["node"],
+                                              "status": r["status"], "source": how})
+    conflicts = []
+    for ip, lst in owners.items():
+        ids = {o["vmid"] for o in lst}
+        if len(ids) > 1:
+            running = [o for o in lst if o["status"] == "running"]
+            conflicts.append({"ip": ip, "severity": "active" if len({o["vmid"] for o in running}) > 1 else "latent",
+                              "guests": lst})
+    dup_macs = [{"mac": m, "guests": g} for m, g in macs.items() if len(g) > 1]
+    return {"ip_conflicts": sorted(conflicts, key=lambda c: (c["severity"] != "active", c["ip"])),
+            "duplicate_macs": dup_macs,
+            "notes": ["active: two running guests use the IP now; latent: a stopped guest would clash when started"]}
+
+
+async def op_backup_coverage(client, args: dict, _t=None) -> dict:
+    max_age = float(args.get("max_age_days", 2))
+    res = await _resources(client)
+    jobs = (await client.get("/cluster/backup")).get("data", []) or []
+    pools = {}
+    try:
+        for p in (await client.get("/pools")).get("data", []) or []:
+            members = (await client.get(f"/pools/{p['poolid']}")).get("data", {}).get("members", [])
+            pools[p["poolid"]] = {m.get("vmid") for m in members if m.get("vmid")}
+    except Exception:
+        pass
+    covered: Dict[int, list] = {}
+    storages = set()
+    for j in jobs:
+        if str(j.get("enabled", 1)) == "0":
+            continue
+        storages.add(j.get("storage"))
+        ids = set()
+        if str(j.get("all", 0)) == "1":
+            ids = {g["vmid"] for g in res if not j.get("node") or g["node"] == j.get("node")}
+            ids -= {int(x) for x in str(j.get("exclude", "")).split(",") if x.strip().isdigit()}
+        elif j.get("pool"):
+            ids = pools.get(j["pool"], set())
+        else:
+            ids = {int(x) for x in str(j.get("vmid", "")).split(",") if x.strip().isdigit()}
+        for i in ids:
+            covered.setdefault(i, []).append(f"{j.get('id')} ({j.get('schedule')} -> {j.get('storage')})")
+    nodes = [n["node"] for n in (await client.get("/nodes")).get("data", []) if n.get("status") == "online"]
+    last: Dict[int, dict] = {}
+    st_errors = {}
+    for s in sorted(x for x in storages if x):
+        for n in nodes:
+            try:
+                items = (await client.get(f"/nodes/{n}/storage/{s}/content", {"content": "backup"})).get("data", []) or []
+            except Exception as e:
+                st_errors[s] = str(e)[:120]
+                continue
+            for it in items:
+                v = it.get("vmid")
+                if v is None:
+                    continue
+                if v not in last or it.get("ctime", 0) > last[v]["ctime"]:
+                    last[v] = {"ctime": it.get("ctime", 0), "storage": s,
+                               "verified": (it.get("verification") or {}).get("state")}
+            st_errors.pop(s, None)
+            break
+    rows, not_covered, stale, never = [], [], [], []
+    for g in res:
+        v = g["vmid"]
+        lb = last.get(v)
+        age = _age_days(lb["ctime"]) if lb else None
+        row = {"vmid": v, "name": g.get("name"), "type": g["type"], "node": g["node"], "status": g.get("status"),
+               "jobs": covered.get(v, []), "last_backup_age_days": age,
+               "last_backup_storage": lb["storage"] if lb else None,
+               "last_backup_verified": lb["verified"] if lb else None}
+        rows.append(row)
+        if not covered.get(v):
+            not_covered.append(row)
+        elif lb is None:
+            never.append(row)
+        elif age is not None and age > max_age:
+            stale.append(row)
+    running_unprotected = [r for r in not_covered + never if r["status"] == "running"]
+    slim = lambda rows: [{k: r[k] for k in ("vmid", "name", "type", "node", "status", "last_backup_age_days")} for r in rows]
+    return {"guests": len(res), "jobs_enabled": sum(1 for j in jobs if str(j.get('enabled', 1)) != '0'),
+            "summary": {"running_without_backup": len(running_unprotected), "not_in_any_job": len(not_covered),
+                        "in_job_but_no_backup_found": len(never), "stale": len(stale)},
+            "running_without_backup": slim(running_unprotected),
+            "not_in_any_job": slim(not_covered), "in_job_but_no_backup_found": slim(never),
+            f"last_backup_older_than_{max_age:g}_days": sorted(stale, key=lambda r: -(r['last_backup_age_days'] or 0)),
+            "storage_errors": st_errors,
+            "hint": "for a failing guest, get_backup_failures shows the reason from the task log"}
+
+
+async def op_notification_health(client, args: dict, _t=None) -> dict:
+    days = max(1, int(args.get("days", 7) or 7))
+    endpoints, matchers = [], []
+    try:
+        # /endpoints lists the endpoint types; the configured endpoints are one level down
+        for kind in (await client.get("/cluster/notifications/endpoints")).get("data", []) or []:
+            ktype = kind.get("name") or kind.get("type")
+            try:
+                items = (await client.get(f"/cluster/notifications/endpoints/{ktype}")).get("data", []) or []
+            except Exception:
+                continue
+            for e in items:
+                endpoints.append({"name": e.get("name"), "type": ktype, "disabled": bool(e.get("disable")),
+                                  "comment": e.get("comment"), "origin": e.get("origin")})
+    except Exception as e:
+        endpoints = [{"error": str(e)[:150]}]
+    try:
+        for m in (await client.get("/cluster/notifications/matchers")).get("data", []) or []:
+            matchers.append({"name": m.get("name"), "targets": m.get("target"), "disabled": bool(m.get("disable"))})
+    except Exception:
+        pass
+    since = int(time.time()) - days * 86400
+    failures: Dict[str, dict] = {}
+    nodes = [n["node"] for n in (await client.get("/nodes")).get("data", []) if n.get("status") == "online"]
+    for n in nodes:
+        try:
+            tasks = (await client.get(f"/nodes/{n}/tasks", {"since": since, "limit": 200, "typefilter": "vzdump"})).get("data", []) or []
+        except Exception:
+            continue
+        for t in tasks[:40]:
+            try:
+                log = (await client.get(f"/nodes/{n}/tasks/{quote(t['upid'], safe='')}/log", {"limit": 5000})).get("data", []) or []
+            except Exception:
+                continue
+            for row in log:
+                line = row.get("t", "")
+                m = re.search(r"could not notify via target [`'\"]?([^`'\":]+)[`'\"]?:?\s*(.*)", line)
+                if m:
+                    f = failures.setdefault(m.group(1), {"target": m.group(1), "count": 0, "last_error": None,
+                                                        "last_seen": None})
+                    f["count"] += 1
+                    ts = _fmt_epoch(t.get("starttime"))
+                    if not f["last_seen"] or (ts or "") > f["last_seen"]:
+                        f["last_seen"], f["last_error"] = ts, m.group(2)[:200]
+    unused = [e["name"] for e in endpoints if e.get("name") and not any(e["name"] in (m.get("targets") or []) for m in matchers)]
+    return {"endpoints": endpoints, "matchers": matchers, "delivery_failures": list(failures.values()),
+            "endpoints_not_used_by_any_matcher": unused, "window_days": days,
+            "verdict": "failing" if failures else "ok"}
+
+
+def _kernel_ver(s: str) -> Optional[tuple]:
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)-(\d+)", s or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+async def op_node_updates(client, args: dict, _t=None) -> dict:
+    nodes = [n["node"] for n in (await client.get("/nodes")).get("data", []) if n.get("status") == "online"]
+    if args.get("node"):
+        nodes = [args["node"]]
+    out = []
+    for n in nodes:
+        row = {"node": n}
+        try:
+            info = await _node_info(client, n)
+            row["running_kernel"] = (re.search(r"\d+\.\d+\.\d+-\d+-\S+", info["kversion"]) or [info["kversion"]])[0]
+            ups = (await client.get(f"/nodes/{n}/apt/update")).get("data", []) or []
+            row["pending_updates"] = len(ups)
+            by_origin: Dict[str, int] = {}
+            for u in ups:
+                by_origin[u.get("Origin") or "unknown"] = by_origin.get(u.get("Origin") or "unknown", 0) + 1
+            row["pending_by_origin"] = by_origin
+            row["pending_sample"] = [f"{u.get('Package')} {u.get('OldVersion')} -> {u.get('Version')}" for u in ups[:8]]
+            vers = (await client.get(f"/nodes/{n}/apt/versions")).get("data", []) or []
+            kernels = [v.get("Package", "") for v in vers if re.match(r"(proxmox|pve)-kernel-\d", v.get("Package", ""))
+                       and v.get("CurrentState") == "Installed"]
+            newest = max((_kernel_ver(k) for k in kernels if _kernel_ver(k)), default=None)
+            run = _kernel_ver(row["running_kernel"])
+            row["newest_installed_kernel"] = ".".join(map(str, newest[:3])) + f"-{newest[3]}" if newest else None
+            row["reboot_needed_for_kernel"] = bool(newest and run and newest > run)
+            row["pve_manager"] = next((v.get("Version") for v in vers if v.get("Package") == "pve-manager"), None)
+        except Exception as e:
+            row["error"] = str(e)[:150]
+        out.append(row)
+    return {"nodes": out, "note": "pending updates come from the node's last 'apt update'; refresh it in the GUI or with pveupdate"}
+
+
+async def op_stale_snapshots(client, args: dict, _t=None) -> dict:
+    days = float(args.get("older_than_days", 14))
+    res = await _resources(client)
+    lists = await _gather_limited([client.get(f"/nodes/{g['node']}/{g['type']}/{g['vmid']}/snapshot") for g in res])
+    stale, total = [], 0
+    for g, r in zip(res, lists):
+        if isinstance(r, Exception):
+            continue
+        for s in r.get("data", []) or []:
+            if s.get("name") == "current":
+                continue
+            total += 1
+            age = _age_days(s.get("snaptime"))
+            if age is not None and age >= days:
+                stale.append({"vmid": g["vmid"], "name": g.get("name"), "node": g["node"], "type": g["type"],
+                              "snapshot": s.get("name"), "age_days": age, "vmstate": bool(s.get("vmstate")),
+                              "description": (s.get("description") or "")[:120]})
+    stale.sort(key=lambda x: -x["age_days"])
+    return {"older_than_days": days, "snapshots_total": total, "stale_count": len(stale), "stale": stale,
+            "note": "old snapshots keep every changed block on Ceph/ZFS alive and slow some operations; delete with care"}
+
+
+_NEW_SYSTEMD_OS = {"ubuntu", "debian", "fedora", "archlinux", "centos", "opensuse", "alpine"}
+
+
+async def op_audit_container_features(client, args: dict, _t=None) -> dict:
+    cts = [g for g in await _resources(client) if g["type"] == "lxc"]
+    cfgs = await _gather_limited([_guest_config(client, g["node"], g["vmid"], "lxc") for g in cts])
+    rows = []
+    for g, c in zip(cts, cfgs):
+        if isinstance(c, Exception):
+            continue
+        feats = dict(x.split("=", 1) for x in str(c.get("features", "")).split(",") if "=" in x)
+        unpriv = str(c.get("unprivileged", 0)) == "1"
+        ostype = c.get("ostype", "unmanaged")
+        findings = []
+        if not unpriv:
+            findings.append("privileged container: root in the container is root on the host; prefer unprivileged")
+            if feats.get("nesting") == "1":
+                findings.append("nesting=1 on a privileged container widens host exposure")
+        if unpriv and ostype in _NEW_SYSTEMD_OS and feats.get("nesting") != "1":
+            findings.append("nesting is off: current systemd releases (e.g. Ubuntu 22.04+, Debian 12+) need nesting=1 "
+                            "for some services; PVE warns about it on start")
+        notes = []
+        if feats.get("nesting") == "1":
+            notes.append("nesting=1 lets the container load its own AppArmor profiles; after an OS upgrade check that "
+                         "rsyslog still receives journal messages (seen failing on Ubuntu 24.04)")
+        if feats.get("keyctl") == "1" and not unpriv:
+            findings.append("keyctl=1 on a privileged container is not needed")
+        if c.get("onboot") in (None, 0, "0") and g.get("status") == "running":
+            findings.append("running but onboot is off: it will not come back after a host reboot")
+        rows.append({"vmid": g["vmid"], "name": g.get("name"), "node": g["node"], "status": g.get("status"),
+                     "ostype": ostype, "unprivileged": unpriv, "features": feats, "findings": findings,
+                     "notes": notes})
+    flagged = [r for r in rows if r["findings"]]
+    counts: Dict[str, int] = {}
+    for r in flagged:
+        for f in r["findings"]:
+            key = f.split(":")[0]
+            counts[key] = counts.get(key, 0) + 1
+    return {"containers": len(rows), "with_findings": len(flagged), "finding_counts": counts,
+            "results": flagged if not args.get("all") else rows,
+            "note": "PVE does not know the OS release inside a container; pair with an inventory tool (e.g. Wazuh) for EOL checks"}
+
+
+async def op_find_oom_events(client, args: dict, _t=None) -> dict:
+    hours = max(1, min(int(args.get("hours", 24) or 24), 72))
+    now = int(time.time())
+    since = now - hours * 3600
+    names = {str(g["vmid"]): g.get("name") for g in await _resources(client)}
+    nodes = [n["node"] for n in (await client.get("/nodes")).get("data", []) if n.get("status") == "online"]
+    if args.get("node"):
+        nodes = [args["node"]]
+    events, errors = [], {}
+    for n in nodes:
+        # A node logs about 1 MB an hour; read the journal in 6-hour windows
+        lines = []
+        for start in range(since, now, 6 * 3600):
+            try:
+                chunk = (await client.get(f"/nodes/{n}/journal",
+                                          {"since": start, "until": min(start + 6 * 3600, now)})).get("data", []) or []
+            except Exception as e:
+                errors[n] = str(e)[:150]
+                continue
+            lines.extend(l for l in chunk if "oom-kill:" in l or "Killed process" in l)
+        pending = None
+        for line in lines:
+            if "oom-kill:" in line:
+                cons = (re.search(r"constraint=(\w+)", line) or [None, None])[1]
+                memcg = (re.search(r"oom_memcg=([^,\s]+)", line) or [None, ""])[1]
+                task = (re.search(r"task=([^,\s]+)", line) or [None, None])[1]
+                guest = re.search(r"/(lxc|qemu\.slice)/(\d+)", memcg)
+                svc = (re.search(r"system\.slice/([^/,\s]+)", memcg) or [None, None])[1]
+                vmid = guest.group(2) if guest else None
+                pending = {"node": n, "time": line[:25].strip(), "constraint": cons, "cgroup": memcg, "task": task,
+                           "guest_vmid": vmid, "guest_name": names.get(vmid) if vmid else None, "service": svc,
+                           "meaning": ("the guest/service hit its OWN memory limit (host had memory)"
+                                       if cons == "CONSTRAINT_MEMCG" else "the HOST ran out of memory")}
+                events.append(pending)
+            elif pending and "Killed process" in line:
+                m = re.search(r"anon-rss:(\d+)kB", line)
+                if m:
+                    pending["killed_anon_rss_mib"] = int(m.group(1)) // 1024
+                pending = None
+    summary: Dict[str, int] = {}
+    for e in events:
+        key = f"{e['node']} {e['guest_vmid'] or 'host'} {e['guest_name'] or ''} {e['service'] or e['task']} [{e['constraint']}]"
+        summary[key] = summary.get(key, 0) + 1
+    return {"hours": hours, "events": events[-100:], "count": len(events),
+            "by_source": [{"source": k, "count": v} for k, v in sorted(summary.items(), key=lambda x: -x[1])],
+            "node_errors": errors}
+
+
+OPS_TOOLS = [
+    Tool(name="migration_preflight",
+         description="Check whether moving a VM/container to another node is safe BEFORE migrating: CPU vendor/model "
+                     "of both nodes (live migration across vendors can freeze the guest), CPU type, local disks, ISO, "
+                     "passthrough devices, target memory headroom, HA. Returns verdict ok/warning/blocked and the "
+                     "recommended mode (online/offline/restart). Provide vmid or vmname and target.",
+         inputSchema={"type": "object", "properties": {
+             "vmid": {"type": "integer", "description": "VM/container ID"},
+             "vmname": {"type": "string", "description": "VM/container name (alternative to vmid)"},
+             "node": {"type": "string", "description": "Current node (optional, auto-detected)"},
+             "target": {"type": "string", "description": "Target node"},
+             "online": {"type": "boolean", "description": "Planned live migration (optional)"}},
+             "required": ["target"], "additionalProperties": False}),
+    Tool(name="verify_guest",
+         description="Verify a VM/container is really working (after a migration, reboot or restore): samples status a "
+                     "few times and checks that uptime, CPU and network counters move, that the guest agent answers, "
+                     "and that common TCP ports answer from the MCP server. Returns healthy/suspect/down with reasons.",
+         inputSchema={"type": "object", "properties": {
+             "vmid": {"type": "integer"}, "vmname": {"type": "string"}, "node": {"type": "string"},
+             "samples": {"type": "integer", "description": "Samples to take (default 3)", "default": 3},
+             "interval": {"type": "integer", "description": "Seconds between samples (default 5)", "default": 5},
+             "ports": {"type": "array", "items": {"type": "integer"}, "description": "TCP ports to test (default 22,3389,80,443)"},
+             "ips": {"type": "array", "items": {"type": "string"}, "description": "IPs to test (default: from agent/config)"}},
+             "additionalProperties": False}),
+    Tool(name="get_capacity_report",
+         description="Per-node capacity: CPU vendor/model, RAM used, memory allocated to running VMs vs physical RAM, "
+                     "container limits vs real use. Suggests which VMs to move where to relieve hot nodes, preferring "
+                     "same-CPU-vendor targets and marking cross-vendor moves as offline-only.",
+         inputSchema={"type": "object", "properties": {
+             "node": {"type": "string", "description": "Only this node"},
+             "mem_threshold_pct": {"type": "number", "description": "Node RAM use % considered hot (default 75)", "default": 75}},
+             "additionalProperties": False}),
+    Tool(name="find_guest",
+         description="Find which VM/container owns an IP address, MAC address, name fragment or VMID across the whole "
+                     "cluster (static config, guest agent and container interfaces).",
+         inputSchema={"type": "object", "properties": {"query": {"type": "string", "description": "IP, MAC, name or VMID"}},
+                      "required": ["query"], "additionalProperties": False}),
+    Tool(name="check_ip_conflicts",
+         description="Find IP addresses used by more than one VM/container (active: both running; latent: a stopped "
+                     "guest would clash when started) and duplicate MAC addresses.",
+         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),
+    Tool(name="get_backup_coverage",
+         description="Backup coverage audit: guests in no enabled backup job, guests in a job with no backup found, and "
+                     "guests whose last backup is older than max_age_days, with the storage and verify state.",
+         inputSchema={"type": "object", "properties": {
+             "max_age_days": {"type": "number", "description": "Max acceptable age of the last backup (default 2)", "default": 2}},
+             "additionalProperties": False}),
+    Tool(name="get_notification_health",
+         description="Notification targets and matchers configured in PVE, and delivery failures found in recent backup "
+                     "task logs (e.g. a webhook answering 401) - when this fails, nobody hears about failed backups.",
+         inputSchema={"type": "object", "properties": {
+             "days": {"type": "integer", "description": "Look back this many days (default 7)", "default": 7}},
+             "additionalProperties": False}),
+    Tool(name="get_node_updates",
+         description="Per node: pending package updates (security count), running kernel vs newest installed kernel "
+                     "(reboot needed), pve-manager version.",
+         inputSchema={"type": "object", "properties": {"node": {"type": "string"}}, "additionalProperties": False}),
+    Tool(name="get_stale_snapshots",
+         description="Snapshots older than N days across all VMs and containers, oldest first.",
+         inputSchema={"type": "object", "properties": {
+             "older_than_days": {"type": "number", "description": "Age threshold in days (default 14)", "default": 14}},
+             "additionalProperties": False}),
+    Tool(name="audit_container_features",
+         description="Audit LXC containers: privileged vs unprivileged, nesting/keyctl features against the OS type, "
+                     "running containers that will not start on boot. Returns findings with the reason.",
+         inputSchema={"type": "object", "properties": {
+             "all": {"type": "boolean", "description": "Include containers without findings", "default": False}},
+             "additionalProperties": False}),
+    Tool(name="find_oom_events",
+         description="Out-of-memory kills from the nodes' kernel logs, mapped to the VM/container and service. Tells "
+                     "apart a guest/service hitting its OWN memory limit from the HOST running out of memory.",
+         inputSchema={"type": "object", "properties": {
+             "hours": {"type": "integer", "description": "Look back this many hours (default 24, max 72)", "default": 24},
+             "node": {"type": "string"}}, "additionalProperties": False}),
+]
+
+OPS_IMPL = {
+    "migration_preflight": op_migration_preflight,
+    "verify_guest": op_verify_guest,
+    "get_capacity_report": op_capacity_report,
+    "find_guest": op_find_guest,
+    "check_ip_conflicts": op_check_ip_conflicts,
+    "get_backup_coverage": op_backup_coverage,
+    "get_notification_health": op_notification_health,
+    "get_node_updates": op_node_updates,
+    "get_stale_snapshots": op_stale_snapshots,
+    "audit_container_features": op_audit_container_features,
+    "find_oom_events": op_find_oom_events,
+}
+
 
 def parse_args():
     """Parse command line arguments with enhanced validation"""
