@@ -4,12 +4,44 @@ Proxmox VE MCP Server - Enhanced Edition with Batch Operations and Pagination
 Provides comprehensive Proxmox VE management functionality including batch data collection
 
 Author: Jason Cheng (jason@jason.tools)
-Version: 1.6.0
-Last Updated: 2026-10-21
+Version: 1.8.0
+Last Updated: 2026-10-23
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 
 Changelog:
+v1.8.0 (2026-10-23) - Feature: node maintenance, HA placement rules, Proxmox Backup Server
+         - plan_node_evacuation (read-only): for every running guest of a node, live migrate (VM,
+           same CPU vendor), restart-migrate (container), offline migrate or no_capacity, honouring
+           strict HA node rules and a free-RAM margin per target. VMs count at their configured RAM:
+           a live-migrated VM holds all of it on the target, and RAM a balloon gives back is not
+           returned to the host right away.
+         - check_node_after_reboot (read-only): node back and quorate, newest kernel running, Ceph
+           OSDs up and PGs clean, noout still set.
+         - audit_ha_rules (read-only): HA VMs that may be placed on nodes of a different CPU vendor
+           (a live move across vendors freezes the guest), non-strict/disabled rules, dangling ones.
+         - get_pbs_status / get_pbs_backups (read-only, through the PVE storage API, no PBS
+           credentials): usage, growth and days until full; per guest newest backup, verify state,
+           never-verified and failed snapshots, stale or missing backups of running guests.
+         - New write tools behind two new toggles (default off, confirm=true): ENABLE_HA_CONFIG ->
+           ha_rule_set (refuses a VM rule spanning CPU vendors unless allow_mixed_vendor),
+           ha_resource_set, ha_move (live move checked by migration_preflight), set_ha_crs;
+           ENABLE_NODE_MAINTENANCE -> set_ceph_flag, reboot_node (refuses unless the node is empty,
+           quorum survives and Ceph is clean; sets noout).
+         - migration_preflight: min_free_gib margin; a target without the memory is a blocker;
+           containers count at current use instead of their limit.
+v1.7.0 (2026-10-23) - Feature: several cluster nodes in PVE_HOST for failover
+         - PVE_HOST / --host accept a comma-separated list of cluster nodes. Any node's API
+           serves the whole cluster, so when one is unreachable the client moves on to the next
+           and keeps using the node that answered for later calls.
+         - GET is retried on another node after any network error. POST/PUT/DELETE are retried
+           only when the request cannot have reached the server (connection refused / connect
+           timeout), so an action such as a migration is never submitted twice.
+         - HTTP 5xx from /version or the login endpoint counts as an unhealthy node.
+         - Connect timeout capped at 5 s (reads keep PVE_TIMEOUT): a dead node now costs ~6 s
+           instead of the full timeout.
+         - get_cluster_status reports api_host (the node that answered) and api_hosts_configured.
+         - A single host keeps working exactly as before.
 v1.6.0 (2026-10-21) - Feature: operations checks ("is this safe?", "what is wrong?")
          - migration_preflight: CPU vendor/model of source and target, CPU type, local disks, ISO,
            passthrough, target memory headroom, HA -> verdict and recommended mode. A live
@@ -152,7 +184,7 @@ import struct
 import io
 import re
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import quote, urlencode
 
 import httpx
@@ -169,7 +201,7 @@ from pydantic import AnyUrl
 import mcp.types as types
 
 # Version information
-__version__ = "1.6.0"
+__version__ = "1.8.0"
 __last_updated__ = "2026-07-01"
 __author__ = "Jason Cheng"
 __email__ = "jason@jason.tools"
@@ -212,6 +244,8 @@ ENABLE_CT_BACKUP = True         # Allow creating container backups
 ENABLE_VM_SNAPSHOT = True       # Allow creating VM snapshots
 ENABLE_CT_SNAPSHOT = True       # Allow creating container snapshots
 ENABLE_BACKUP_JOB = False       # Allow creating backup jobs
+ENABLE_HA_CONFIG = False        # Allow changing HA rules, HA resource settings, CRS options and HA moves
+ENABLE_NODE_MAINTENANCE = False # Allow setting Ceph flags (noout...) and rebooting nodes
 
 # Default pagination limits (prevent context overflow)
 DEFAULT_BATCH_LIMIT = 100       # Default limit for batch operations
@@ -307,13 +341,42 @@ def validate_pagination_params(limit: Optional[int], offset: Optional[int],
 
     return int(limit), int(offset)
 
+class _PVENetworkError(ProxmoxVEError):
+    """The API host could not be reached; another cluster node may answer.
+
+    sent=True means the request may already have reached the server (e.g. a read timeout),
+    so a non-idempotent request must not be retried elsewhere.
+    """
+    def __init__(self, message: str, sent: bool = False):
+        super().__init__(message)
+        self.sent = sent
+
+
+def _split_hosts(host: str) -> List[str]:
+    """PVE_HOST may list several cluster nodes, comma-separated."""
+    return [h.strip().rstrip('/') for h in str(host or "").split(',') if h.strip()]
+
+
+# Index of the API host that answered last. Clients are created per tool call, so this
+# keeps later calls on a working node instead of retrying a dead first entry every time.
+_preferred_host_idx = 0
+
+
 class ProxmoxVEClient:
-    """Proxmox VE API Client with improved error handling and connection management"""
-    
-    def __init__(self, host: str, username: str = None, password: str = None, 
-                 api_token_id: str = None, api_token_secret: str = None, 
+    """Proxmox VE API Client with improved error handling and connection management.
+
+    host may be a comma-separated list of cluster nodes. Any node's API serves the whole
+    cluster, so when one is unreachable the client moves on to the next.
+    """
+
+    def __init__(self, host: str, username: str = None, password: str = None,
+                 api_token_id: str = None, api_token_secret: str = None,
                  verify_ssl: bool = False, timeout: float = 30.0):
-        self.host = host.rstrip('/')
+        self.hosts = _split_hosts(host)
+        if not self.hosts:
+            raise ProxmoxVEError("No PVE host configured")
+        self._host_idx = _preferred_host_idx % len(self.hosts)
+        self.host = self.hosts[self._host_idx]
         self.username = username
         self.password = password
         self.api_token_id = api_token_id
@@ -330,7 +393,8 @@ class ProxmoxVEClient:
         # Use proxy from environment if available (required by Claude Desktop sandbox)
         self.session = httpx.AsyncClient(
             verify=self.verify_ssl,
-            timeout=httpx.Timeout(self.timeout),
+            # Short connect timeout so a dead node fails over quickly; reads keep the full timeout
+            timeout=httpx.Timeout(self.timeout, connect=min(self.timeout, 5.0)),
             trust_env=True,  # Read proxy settings from environment
             headers={
                 'User-Agent': f'PVE-MCP-Server/{__version__}',
@@ -338,11 +402,37 @@ class ProxmoxVEClient:
                 'Content-Type': 'application/x-www-form-urlencoded'
             }
         )
-        if not self._use_api_token:
-            await self.authenticate()
-        else:
-            await self.setup_api_token_auth()
+        await self._connect_any()
         return self
+
+    def _use_host(self, idx: int):
+        global _preferred_host_idx
+        self._host_idx = idx % len(self.hosts)
+        self.host = self.hosts[self._host_idx]
+        _preferred_host_idx = self._host_idx
+
+    async def _connect_any(self):
+        """Authenticate against the first reachable host, starting from the last good one."""
+        errors = []
+        start = self._host_idx
+        for k in range(len(self.hosts)):
+            idx = (start + k) % len(self.hosts)
+            self.host = self.hosts[idx]
+            self._authenticated = False
+            try:
+                if self._use_api_token:
+                    await self.setup_api_token_auth()
+                else:
+                    await self.authenticate()
+            except _PVENetworkError as e:
+                errors.append(f"{self.host}: {e}")
+                logger.warning(f"PVE API host {self.host} unreachable: {e}")
+                continue
+            if k:
+                logger.warning(f"PVE API failover: now using {self.host}")
+            self._use_host(idx)
+            return
+        raise ProxmoxVEError("No PVE API host reachable: " + " | ".join(errors))
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
@@ -370,12 +460,12 @@ class ProxmoxVEClient:
                     logger.info(f"DNS resolved: {hostname} -> {ip}")
                 except socket.gaierror as dns_err:
                     logger.error(f"DNS resolution failed for {hostname}: {dns_err}")
-                    raise ProxmoxVEError(f"DNS resolution failed for {hostname}: {dns_err}")
+                    raise _PVENetworkError(f"DNS resolution failed for {hostname}: {dns_err}")
 
                 # TCP connection test (non-fatal, may fail in sandboxed environments)
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(5.0)
+                    sock.settimeout(2.0)
                     result = sock.connect_ex((ip, port))
                     sock.close()
                     if result == 0:
@@ -404,6 +494,9 @@ class ProxmoxVEClient:
                 raise ProxmoxVEError("API token authentication failed: Invalid token ID or secret")
             elif test_result.status_code == 403:
                 raise ProxmoxVEError("API token authentication failed: Insufficient permissions")
+            elif test_result.status_code >= 500:
+                # pveproxy up but the node is unhealthy (e.g. pmxcfs down) - try another node
+                raise _PVENetworkError(f"API host answered HTTP {test_result.status_code}")
             elif test_result.status_code >= 400:
                 raise ProxmoxVEError(f"API token authentication failed: HTTP {test_result.status_code}")
 
@@ -414,13 +507,13 @@ class ProxmoxVEClient:
         except httpx.ConnectError as e:
             # Provide more detailed connection error message
             logger.error(f"Connection error details: {type(e).__name__}: {e}")
-            raise ProxmoxVEError(f"Connection failed to {self.host}: {e}. Check if the host is reachable and the port is open.")
+            raise _PVENetworkError(f"Connection failed to {self.host}: {e}. Check if the host is reachable and the port is open.")
         except httpx.TimeoutException as e:
             logger.error(f"Timeout error: {e}")
-            raise ProxmoxVEError(f"Connection timeout to {self.host}: {e}")
+            raise _PVENetworkError(f"Connection timeout to {self.host}: {e}")
         except httpx.RequestError as e:
             logger.error(f"Request error details: {type(e).__name__}: {e}")
-            raise ProxmoxVEError(f"Network error during API token setup: {e}")
+            raise _PVENetworkError(f"Network error during API token setup: {e}")
         except Exception as e:
             if isinstance(e, ProxmoxVEError):
                 raise
@@ -455,6 +548,8 @@ class ProxmoxVEClient:
                 raise ProxmoxVEError("Authentication failed: Invalid username or password")
             elif response.status_code == 403:
                 raise ProxmoxVEError("Authentication failed: Access denied")
+            elif response.status_code >= 500:
+                raise _PVENetworkError(f"API host answered HTTP {response.status_code}")
             elif response.status_code >= 400:
                 raise ProxmoxVEError(f"Authentication failed: HTTP {response.status_code}")
                 
@@ -477,14 +572,35 @@ class ProxmoxVEClient:
             logger.info("Ticket authentication successful")
             
         except httpx.RequestError as e:
-            raise ProxmoxVEError(f"Network error during authentication: {e}")
+            raise _PVENetworkError(f"Network error during authentication: {e}")
         except Exception as e:
             if isinstance(e, ProxmoxVEError):
                 raise
             logger.error(f"Authentication error: {e}")
             raise ProxmoxVEError(f"Authentication failed: {e}")
-            
+
     async def _make_request(self, method: str, path: str, params: Optional[Dict] = None, data: Optional[Dict] = None) -> Dict:
+        """Send the request, failing over to the next cluster node when the host is unreachable.
+
+        GET is retried on any network error. POST/PUT/DELETE are only retried when the request
+        cannot have reached the server (connection refused / connect timeout), so an action such
+        as a migration is never submitted twice.
+        """
+        tried = 1
+        while True:
+            try:
+                return await self._request_once(method, path, params, data)
+            except _PVENetworkError as e:
+                if len(self.hosts) < 2 or tried >= len(self.hosts):
+                    raise
+                if e.sent and method.upper() != 'GET':
+                    raise ProxmoxVEError(f"{e} (not retried on another node: the {method.upper()} request may already have been executed)")
+                failed = self.host
+                self._use_host(self._host_idx + 1)
+                tried += 1
+                logger.warning(f"PVE API {method.upper()} {path} failed on {failed} ({e}); retrying on {self.host}")
+
+    async def _request_once(self, method: str, path: str, params: Optional[Dict] = None, data: Optional[Dict] = None) -> Dict:
         """Make HTTP request with improved error handling and retry logic"""
         if not self._authenticated:
             await self.authenticate()
@@ -514,7 +630,7 @@ class ProxmoxVEClient:
                     self._authenticated = False
                     await self.authenticate()
                     # Retry the request once
-                    return await self._make_request(method, path, params, data)
+                    return await self._request_once(method, path, params, data)
             
             # Handle other HTTP errors
             if response.status_code >= 400:
@@ -527,9 +643,13 @@ class ProxmoxVEClient:
             
             response.raise_for_status()
             return response.json()
-            
+
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # Never reached the server: safe to retry anywhere
+            raise _PVENetworkError(f"Cannot connect to {self.host}: {e}", sent=False)
         except httpx.RequestError as e:
-            raise ProxmoxVEError(f"Network error: {e}")
+            # Read/write timeout or dropped connection: the server may have acted on it
+            raise _PVENetworkError(f"Network error on {self.host}: {e}", sent=True)
         except Exception as e:
             if isinstance(e, ProxmoxVEError):
                 raise
@@ -647,6 +767,14 @@ async def handle_list_tools() -> List[Tool]:
         "update_config": ENABLE_VM_UPDATE or ENABLE_CT_UPDATE,
         "delete": ENABLE_VM_DELETE or ENABLE_CT_DELETE,
         "create_backup_job": ENABLE_BACKUP_JOB,
+
+        # HA configuration and node maintenance (v1.8.0)
+        "ha_rule_set": ENABLE_HA_CONFIG,
+        "ha_resource_set": ENABLE_HA_CONFIG,
+        "ha_move": ENABLE_HA_CONFIG,
+        "set_ha_crs": ENABLE_HA_CONFIG,
+        "set_ceph_flag": ENABLE_NODE_MAINTENANCE,
+        "reboot_node": ENABLE_NODE_MAINTENANCE,
     }
 
     # Build complete tool list
@@ -1933,6 +2061,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
         "migrate", "backup", "snapshot",
         "clone", "update_config", "delete",
         "create_backup_job", "create_vm", "create_container",
+        "ha_rule_set", "ha_resource_set", "ha_move", "set_ha_crs", "set_ceph_flag", "reboot_node",
     ]
 
     if name in control_operations:
@@ -3109,7 +3238,12 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
         
         # Cluster and Node Management
         elif name == "get_cluster_status":
-            return await client.get("/cluster/status")
+            result = await client.get("/cluster/status")
+            if isinstance(result, dict):
+                # Which configured node answered (useful when PVE_HOST lists several for failover)
+                result["api_host"] = client.host
+                result["api_hosts_configured"] = client.hosts
+            return result
         
         elif name == "get_cluster_nodes":
             return await client.get("/nodes")
@@ -4957,11 +5091,25 @@ async def op_migration_preflight(client, args: dict, gtype: str) -> dict:
     if local:
         risks.append("local disks must be copied (slow, needs space on target): " + ", ".join(local))
 
-    need = int(cfg.get("memory", 512)) * 1024 * 1024
+    # A live-migrated VM ends up holding its whole configured RAM on the target (all pages are
+    # copied), whatever it used before, and memory given back by the balloon is not returned to
+    # the host straight away - so count the configured size. A container has no preallocation:
+    # its cgroup limit is a ceiling, so its current use is what moves.
+    cur = (await client.get(f"/nodes/{node}/{gtype}/{vmid}/status/current")).get("data") or {}
+    if gtype == "qemu":
+        need = int(cfg.get("memory", 512)) * 1024 * 1024
+    else:
+        need = int(cur.get("mem") or 0) if running else 0
     headroom = dst["mem_total"] - dst["mem_used"] - need
-    if headroom < dst["mem_total"] * 0.10:
+    min_free = args.get("min_free_gib")
+    min_free_b = float(min_free) * 2**30 if min_free is not None else dst["mem_total"] * 0.10
+    min_free_txt = f"{float(min_free):.0f} GiB" if min_free is not None else "10% of its RAM"
+    if running and headroom < 0:
+        blockers.append(f"target {target} does not have the memory: {need / 2**30:.1f} GiB needed, "
+                        f"{(dst['mem_total'] - dst['mem_used']) / 2**30:.1f} GiB free")
+    elif running and headroom < min_free_b:
         risks.append(f"target {target} would have {headroom / 2**30:.1f} GiB left after this guest "
-                     f"({need / 2**30:.1f} GiB); less than 10% of its RAM")
+                     f"({need / 2**30:.1f} GiB); less than the safety margin ({min_free_txt})")
 
     sid = f"{'vm' if gtype == 'qemu' else 'ct'}:{vmid}"
     if sid in ha:
@@ -5521,6 +5669,535 @@ async def op_find_oom_events(client, args: dict, _t=None) -> dict:
             "node_errors": errors}
 
 
+# ---------------------------------------------------------------------------
+# HA rules, node evacuation and node maintenance (v1.8.0)
+# ---------------------------------------------------------------------------
+
+def _rule_nodes(rule: dict) -> List[str]:
+    """'host-1:2,host-2' -> ['host-1', 'host-2'] (priorities dropped)."""
+    return [n.split(":")[0].strip() for n in str(rule.get("nodes") or "").split(",") if n.strip()]
+
+
+def _rule_resources(rule: dict) -> List[str]:
+    return [s.strip() for s in str(rule.get("resources") or "").split(",") if s.strip()]
+
+
+async def _ha_rules(client) -> List[dict]:
+    try:
+        return (await client.get("/cluster/ha/rules")).get("data", []) or []
+    except Exception:
+        return []
+
+
+def _allowed_nodes(sid: str, rules: List[dict], all_nodes: List[str]) -> Tuple[List[str], List[str]]:
+    """Nodes an HA resource may run on according to enabled strict node-affinity rules.
+
+    Returns (allowed_nodes, rule_names). Non-strict rules are only preferences and do not
+    restrict placement, so they are ignored here.
+    """
+    allowed, names = set(all_nodes), []
+    for r in rules:
+        if r.get("type") != "node-affinity" or r.get("disable") or not int(r.get("strict") or 0):
+            continue
+        if sid in _rule_resources(r):
+            allowed &= set(_rule_nodes(r))
+            names.append(r.get("rule"))
+    return sorted(allowed), names
+
+
+async def _cluster_crs(client) -> dict:
+    try:
+        crs = ((await client.get("/cluster/options")).get("data") or {}).get("crs") or {}
+    except Exception:
+        return {}
+    if isinstance(crs, str):  # older format "ha=static,ha-rebalance-on-start=1"
+        out = {}
+        for kv in crs.split(","):
+            k, _, v = kv.partition("=")
+            out[k.strip()] = v.strip()
+        return out
+    return crs
+
+
+async def _online_nodes(client) -> List[str]:
+    return [n["node"] for n in (await client.get("/nodes")).get("data", []) or [] if n.get("status") == "online"]
+
+
+async def op_audit_ha_rules(client, args: dict, _t=None) -> dict:
+    nodes = await _online_nodes(client)
+    infos = {n["node"]: n for n in await _gather_limited([_node_info(client, n) for n in nodes]) if isinstance(n, dict)}
+    vendor = {n: infos[n]["cpu_vendor"] for n in infos}
+    rules = await _ha_rules(client)
+    ha = await _ha_sids(client)
+    guests = {f"{'vm' if g['type'] == 'qemu' else 'ct'}:{g['vmid']}": g for g in await _resources(client)}
+    crs = await _cluster_crs(client)
+    cluster_rebalance = str(crs.get("ha-auto-rebalance", "0")) in ("1", "true")
+
+    cross_vendor, ok_vms = [], 0
+    for sid, r in ha.items():
+        if not sid.startswith("vm:"):
+            continue
+        allowed, names = _allowed_nodes(sid, rules, list(infos))
+        vendors = sorted({vendor.get(n, "unknown") for n in allowed})
+        g = guests.get(sid, {})
+        if len(vendors) > 1:
+            res_rebalance = str(r.get("auto-rebalance", "1")) not in ("0", "false")
+            cross_vendor.append({
+                "sid": sid, "name": g.get("name"), "node": g.get("node"), "status": r.get("state"),
+                "allowed_nodes": allowed, "vendors": vendors, "rules": names or "none",
+                "auto_rebalance": cluster_rebalance and res_rebalance,
+                "risk": "HA may live-migrate it to a node with a different CPU vendor (guest freezes)"
+                        + (" - automatic rebalancing is ON for it" if cluster_rebalance and res_rebalance else
+                           " - on a manual move or node maintenance")})
+        else:
+            ok_vms += 1
+
+    findings = []
+    known = set(ha)
+    for r in rules:
+        missing = [s for s in _rule_resources(r) if s not in known]
+        if missing:
+            findings.append({"rule": r.get("rule"), "issue": "references resources that are not HA-managed", "resources": missing})
+        if r.get("type") == "node-affinity" and not int(r.get("strict") or 0) and not r.get("disable"):
+            findings.append({"rule": r.get("rule"), "issue": "not strict: only a preference, HA may still place "
+                             "these resources on other nodes", "resources": _rule_resources(r)})
+        if r.get("disable"):
+            findings.append({"rule": r.get("rule"), "issue": "rule is disabled", "resources": _rule_resources(r)})
+        bad_nodes = [n for n in _rule_nodes(r) if n not in infos]
+        if bad_nodes:
+            findings.append({"rule": r.get("rule"), "issue": "names nodes that are offline or unknown", "nodes": bad_nodes})
+    for sid in ha:
+        if sid not in guests:
+            findings.append({"sid": sid, "issue": "HA resource has no matching guest"})
+
+    return {
+        "verdict": "risk" if cross_vendor else ("check" if findings else "ok"),
+        "crs": crs, "node_vendors": vendor,
+        "vms_cross_vendor_risk": cross_vendor, "vms_vendor_safe": ok_vms,
+        "findings": findings,
+        "fix": "Give each HA VM a strict node-affinity rule listing only same-vendor nodes (ha_rule_set). "
+               "Containers can move across vendors (they restart).",
+    }
+
+
+async def op_plan_node_evacuation(client, args: dict, _t=None) -> dict:
+    """Read-only: where each running guest of a node should go before that node reboots."""
+    node = args["node"]
+    min_free = float(args.get("min_free_gib", 16)) * 2**30
+    shutdown_ok = {int(v) for v in (args.get("shutdown_ok") or [])}
+    nodes = [n for n in await _online_nodes(client)]
+    if node not in nodes:
+        return {"error": f"node {node} is not online"}
+    infos = {n["node"]: n for n in await _gather_limited([_node_info(client, n) for n in nodes]) if isinstance(n, dict)}
+    free = {n: infos[n]["mem_total"] - infos[n]["mem_used"] for n in infos if n != node}
+    src_vendor = infos[node]["cpu_vendor"]
+    rules = await _ha_rules(client)
+    ha = await _ha_sids(client)
+    running = [g for g in await _resources(client) if g["node"] == node and g.get("status") == "running"]
+    cfgs = await _gather_limited([_guest_config(client, node, g["vmid"], g["type"]) for g in running])
+
+    items = []
+    for g, cfg in zip(running, cfgs):
+        cfg = cfg if isinstance(cfg, dict) else {}
+        sid = f"{'vm' if g['type'] == 'qemu' else 'ct'}:{g['vmid']}"
+        need = int(cfg.get("memory", 0)) * 2**20 if g["type"] == "qemu" else int(g.get("mem") or 0)
+        allowed, rnames = _allowed_nodes(sid, rules, list(infos)) if sid in ha else (list(infos), [])
+        items.append({"vmid": g["vmid"], "name": g.get("name"), "type": "VM" if g["type"] == "qemu" else "CT",
+                      "sid": sid, "ha": sid in ha, "need": need, "allowed": [n for n in allowed if n != node],
+                      "rules": rnames})
+
+    plan, unplaced = [], []
+    for it in sorted(items, key=lambda x: (x["vmid"] not in shutdown_ok, -x["need"])):
+        entry = {k: it[k] for k in ("vmid", "name", "type", "ha")}
+        entry["memory_gib"] = round(it["need"] / 2**30, 1)
+        if it["vmid"] in shutdown_ok:
+            entry.update(action="shutdown", downtime="until the node is back (start it again afterwards)")
+            plan.append(entry)
+            continue
+        if it["type"] == "VM":
+            same = [n for n in it["allowed"] if infos[n]["cpu_vendor"] == src_vendor and src_vendor != "unknown"]
+            other = [n for n in it["allowed"] if n not in same]
+        else:
+            same, other = it["allowed"], []
+        fits = sorted([n for n in same if free[n] - it["need"] >= min_free], key=lambda n: free[n] - it["need"], reverse=True)
+        if fits:
+            t = fits[0]
+            free[t] -= it["need"]
+            if it["type"] == "VM":
+                entry.update(action="live_migrate", target=t, downtime="none")
+            else:
+                entry.update(action="restart_migrate", target=t, downtime="about 20-60 s (containers cannot live-migrate)")
+            plan.append(entry)
+            continue
+        ofits = sorted([n for n in other if free[n] - it["need"] >= min_free], key=lambda n: free[n] - it["need"], reverse=True)
+        if ofits:
+            t = ofits[0]
+            free[t] -= it["need"]
+            entry.update(action="offline_migrate", target=t,
+                         downtime="about 1-2 min: shutdown, move, start (no same-vendor node can take it; "
+                                  "a live move across CPU vendors freezes the guest)")
+            plan.append(entry)
+            continue
+        entry.update(action="no_capacity",
+                     reason=("no allowed node keeps the safety margin after this guest"
+                             + (f" (HA rules {', '.join(it['rules'])} allow only {', '.join(it['allowed']) or 'no other node'})"
+                                if it["rules"] else "")),
+                     options="shut it down for the reboot, add it to shutdown_ok, lower min_free_gib, "
+                             "or move another guest first")
+        unplaced.append(entry)
+
+    return {
+        "node": node, "cpu_vendor": src_vendor, "min_free_gib": float(args.get("min_free_gib", 16)),
+        "verdict": "ready" if not unplaced else "needs_decision",
+        "plan": plan, "no_capacity": unplaced,
+        "projected_free_gib": {n: round(v / 2**30, 1) for n, v in free.items()},
+        "counts": {a: sum(1 for p in plan if p["action"] == a)
+                   for a in ("live_migrate", "restart_migrate", "offline_migrate", "shutdown")},
+        "memory_rule": "VMs are counted at their configured RAM: a live-migrated VM holds all of it on the "
+                       "target. Containers are counted at current use.",
+        "next_steps": ["disable automatic HA rebalancing during the work (set_ha_crs)",
+                       "move/stop guests per plan (migrate / ha_move / shutdown), verify each (verify_guest)",
+                       "reboot_node (sets noout, checks the node is empty and Ceph is clean)",
+                       "check_node_after_reboot until it reports ready, then move guests back"],
+    }
+
+
+async def _ceph_state(client) -> dict:
+    try:
+        st = (await client.get("/cluster/ceph/status")).get("data") or {}
+    except Exception as e:
+        return {"available": False, "error": str(e)[:120]}
+    om = st.get("osdmap", {}) or {}
+    om = om.get("osdmap", om)  # some versions nest it
+    pg = st.get("pgmap", {}) or {}
+    clean = sum(x.get("count", 0) for x in pg.get("pgs_by_state", []) if x.get("state_name") == "active+clean")
+    try:
+        flags = [f["name"] for f in (await client.get("/cluster/ceph/flags")).get("data", []) or [] if f.get("value")]
+    except Exception:
+        flags = []
+    return {"available": True, "health": (st.get("health") or {}).get("status"),
+            "osds_up": om.get("num_up_osds"), "osds_total": om.get("num_osds"),
+            "pgs_clean": clean, "pgs_total": pg.get("num_pgs"), "flags": flags,
+            "all_clean": om.get("num_up_osds") == om.get("num_osds") and clean == pg.get("num_pgs")}
+
+
+async def op_check_node_after_reboot(client, args: dict, _t=None) -> dict:
+    node = args["node"]
+    status = (await client.get("/cluster/status")).get("data", []) or []
+    entry = next((x for x in status if x.get("type") == "node" and x.get("name") == node), {})
+    cluster = next((x for x in status if x.get("type") == "cluster"), {})
+    checks, problems = {}, []
+    checks["online"] = bool(entry.get("online"))
+    checks["quorate"] = bool(cluster.get("quorate"))
+    if not checks["online"]:
+        problems.append(f"{node} is not online in the cluster yet")
+    if not checks["quorate"]:
+        problems.append("cluster is not quorate")
+    if checks["online"]:
+        upd = (await op_node_updates(client, {"node": node}))["nodes"][0]
+        st = (await client.get(f"/nodes/{node}/status")).get("data") or {}
+        checks["uptime_min"] = round(int(st.get("uptime") or 0) / 60, 1)
+        checks["running_kernel"] = upd.get("running_kernel")
+        checks["newest_installed_kernel"] = upd.get("newest_installed_kernel")
+        if upd.get("reboot_needed_for_kernel"):
+            problems.append("still running an older kernel than the newest installed one")
+    ceph = await _ceph_state(client)
+    checks["ceph"] = ceph
+    if ceph.get("available"):
+        if not ceph.get("all_clean"):
+            problems.append(f"Ceph not settled yet: {ceph.get('osds_up')}/{ceph.get('osds_total')} OSDs up, "
+                            f"{ceph.get('pgs_clean')}/{ceph.get('pgs_total')} PGs active+clean")
+        if "noout" in ceph.get("flags", []):
+            problems.append("noout is still set; clear it (set_ceph_flag noout false) once the node is back and Ceph is clean")
+    return {"node": node, "verdict": "ready" if not problems else "not_ready", "problems": problems, "checks": checks}
+
+
+def _need_toggle(flag: bool, name: str):
+    if not flag:
+        raise ProxmoxVEError(f"This operation is disabled. Set {name} = True in mcp_pve.py to enable it. Safety feature.")
+
+
+async def op_ha_rule_set(client, args: dict, _t=None) -> dict:
+    _need_toggle(ENABLE_HA_CONFIG, "ENABLE_HA_CONFIG")
+    action, rule = args["action"], args["rule"]
+    if action == "delete":
+        await client.delete(f"/cluster/ha/rules/{rule}")
+        return {"result": "deleted", "rule": rule}
+    rtype = args.get("type", "node-affinity")
+    data = {"type": rtype}
+    for k in ("nodes", "resources", "comment", "affinity"):
+        if args.get(k) is not None:
+            data[k] = ",".join(args[k]) if isinstance(args[k], list) else args[k]
+    for k in ("strict", "disable"):
+        if args.get(k) is not None:
+            data[k] = 1 if args[k] else 0
+    warnings = []
+    if rtype == "node-affinity" and data.get("nodes"):
+        nodes = [n.split(":")[0] for n in data["nodes"].split(",")]
+        vendors = {}
+        for n in nodes:
+            try:
+                vendors[n] = (await _node_info(client, n))["cpu_vendor"]
+            except Exception:
+                vendors[n] = "unknown"
+        res = data.get("resources")
+        if res is None and action == "update":
+            res = ",".join(next((_rule_resources(r) for r in await _ha_rules(client) if r.get("rule") == rule), []))
+        has_vm = any(s.startswith("vm:") for s in str(res or "").split(","))
+        if has_vm and len(set(vendors.values())) > 1:
+            if not args.get("allow_mixed_vendor"):
+                return {"result": "refused", "reason": f"the rule would let VMs run on nodes with different CPU vendors "
+                        f"{vendors}; HA could live-migrate them across vendors and freeze them. Pass "
+                        f"allow_mixed_vendor=true only for a short, supervised window.", "node_vendors": vendors}
+            warnings.append(f"mixed CPU vendors allowed for VMs: {vendors}")
+    if action == "create":
+        await client.post("/cluster/ha/rules", data={"rule": rule, **data})
+    elif action == "update":
+        await client.put(f"/cluster/ha/rules/{rule}", data=data)
+    else:
+        raise ProxmoxVEError("action must be create, update or delete")
+    now = next((r for r in await _ha_rules(client) if r.get("rule") == rule), None)
+    return {"result": action + "d", "rule": now, "warnings": warnings}
+
+
+async def op_ha_resource_set(client, args: dict, _t=None) -> dict:
+    _need_toggle(ENABLE_HA_CONFIG, "ENABLE_HA_CONFIG")
+    sid = args["sid"]
+    data = {}
+    if args.get("state"):
+        data["state"] = args["state"]
+    for k, api in (("auto_rebalance", "auto-rebalance"), ("failback", "failback")):
+        if args.get(k) is not None:
+            data[api] = 1 if args[k] else 0
+    for k in ("max_relocate", "max_restart"):
+        if args.get(k) is not None:
+            data[k] = int(args[k])
+    if args.get("comment") is not None:
+        data["comment"] = args["comment"]
+    if not data:
+        return {"result": "nothing to change"}
+    await client.put(f"/cluster/ha/resources/{sid}", data=data)
+    now = next((r for r in (await client.get("/cluster/ha/resources")).get("data", []) or [] if r.get("sid") == sid), None)
+    return {"result": "updated", "resource": now}
+
+
+async def op_ha_move(client, args: dict, _t=None) -> dict:
+    _need_toggle(ENABLE_HA_CONFIG, "ENABLE_HA_CONFIG")
+    sid, target, mode = args["sid"], args["target"], args.get("mode", "migrate")
+    kind_, _, vmid = sid.partition(":")
+    g = next((x for x in await _resources(client) if str(x["vmid"]) == vmid), None)
+    if not g:
+        raise ProxmoxVEError(f"{sid} not found")
+    pre = None
+    if kind_ == "vm" and mode == "migrate" and g.get("status") == "running":
+        pre = await op_migration_preflight(client, {"node": g["node"], "vmid": int(vmid), "target": target,
+                                                    "online": True, "min_free_gib": args.get("min_free_gib")}, "qemu")
+        if (pre["verdict"] == "blocked" or pre["recommended_mode"] != "online") and not args.get("force"):
+            return {"result": "refused", "reason": "preflight does not allow a live move; use mode=relocate "
+                    "(stop, move, start) or force=true", "preflight": pre}
+    path = "migrate" if mode == "migrate" else "relocate"
+    await client.post(f"/cluster/ha/resources/{sid}/{path}", data={"node": target})
+    return {"result": f"{path} requested", "sid": sid, "from": g["node"], "to": target,
+            "note": "the HA manager carries it out asynchronously; follow with get_ha_resources / verify_guest",
+            "preflight": pre}
+
+
+async def op_set_ha_crs(client, args: dict, _t=None) -> dict:
+    _need_toggle(ENABLE_HA_CONFIG, "ENABLE_HA_CONFIG")
+    cur = await _cluster_crs(client)
+    new = {"ha": cur.get("ha", "basic"), "ha-auto-rebalance": cur.get("ha-auto-rebalance", 0),
+           "ha-rebalance-on-start": cur.get("ha-rebalance-on-start", 0)}
+    if args.get("ha"):
+        new["ha"] = args["ha"]
+    if args.get("auto_rebalance") is not None:
+        new["ha-auto-rebalance"] = 1 if args["auto_rebalance"] else 0
+    if args.get("rebalance_on_start") is not None:
+        new["ha-rebalance-on-start"] = 1 if args["rebalance_on_start"] else 0
+    value = ",".join(f"{k}={int(v) if isinstance(v, bool) else v}" for k, v in new.items())
+    await client.put("/cluster/options", data={"crs": value})
+    return {"result": "updated", "before": cur, "after": await _cluster_crs(client)}
+
+
+_CEPH_FLAGS_ALLOWED = ("noout", "norebalance", "nobackfill", "norecover", "noscrub", "nodeep-scrub", "noin", "nodown")
+
+
+async def op_set_ceph_flag(client, args: dict, _t=None) -> dict:
+    _need_toggle(ENABLE_NODE_MAINTENANCE, "ENABLE_NODE_MAINTENANCE")
+    flag = args["flag"]
+    if flag not in _CEPH_FLAGS_ALLOWED:
+        raise ProxmoxVEError(f"flag must be one of {', '.join(_CEPH_FLAGS_ALLOWED)}")
+    await client.put(f"/cluster/ceph/flags/{flag}", data={"value": 1 if args.get("value", True) else 0})
+    return {"result": "set" if args.get("value", True) else "cleared", "flag": flag,
+            "flags_now": (await _ceph_state(client)).get("flags")}
+
+
+async def op_reboot_node(client, args: dict, _t=None) -> dict:
+    _need_toggle(ENABLE_NODE_MAINTENANCE, "ENABLE_NODE_MAINTENANCE")
+    node = args["node"]
+    force = bool(args.get("force"))
+    problems = []
+    running = [f"{g['vmid']} {g.get('name')}" for g in await _resources(client)
+               if g["node"] == node and g.get("status") == "running"]
+    if running:
+        problems.append(f"{len(running)} guests still running on {node}: {', '.join(running[:10])}")
+    status = (await client.get("/cluster/status")).get("data", []) or []
+    if not next((x for x in status if x.get("type") == "cluster"), {}).get("quorate"):
+        problems.append("cluster is not quorate")
+    online = [x for x in status if x.get("type") == "node" and x.get("online")]
+    total = [x for x in status if x.get("type") == "node"]
+    if len(online) - 1 <= len(total) // 2:
+        problems.append(f"only {len(online)}/{len(total)} nodes online: rebooting {node} would lose quorum")
+    ceph = await _ceph_state(client)
+    if ceph.get("available") and not ceph.get("all_clean"):
+        problems.append(f"Ceph not clean ({ceph.get('osds_up')}/{ceph.get('osds_total')} OSDs up, "
+                        f"{ceph.get('pgs_clean')}/{ceph.get('pgs_total')} PGs active+clean)")
+    if problems and not force:
+        return {"result": "refused", "problems": problems,
+                "hint": "evacuate the node first (plan_node_evacuation) and wait for Ceph; force=true overrides"}
+    if ceph.get("available") and args.get("set_noout", True):
+        await client.put("/cluster/ceph/flags/noout", data={"value": 1})
+    await client.post(f"/nodes/{node}/status", data={"command": "reboot"})
+    return {"result": "reboot requested", "node": node, "noout_set": bool(ceph.get("available") and args.get("set_noout", True)),
+            "overridden": problems if force else [],
+            "next": f"poll check_node_after_reboot node={node} until ready, then set_ceph_flag noout false"}
+
+
+# ---------------------------------------------------------------------------
+# Proxmox Backup Server, read through the PVE storage API (v1.8.0) - no PBS credentials
+# ---------------------------------------------------------------------------
+
+async def _pbs_storages(client) -> List[dict]:
+    return [s for s in (await client.get("/storage")).get("data", []) or [] if s.get("type") == "pbs"]
+
+
+async def _pbs_node(client, storage: str) -> Optional[str]:
+    """An online node where the PBS storage is active (any node can read it)."""
+    for n in await _online_nodes(client):
+        try:
+            st = (await client.get(f"/nodes/{n}/storage/{storage}/status")).get("data") or {}
+            if st.get("active"):
+                return n
+        except Exception:
+            continue
+    return None
+
+
+def _iso(ts) -> Optional[str]:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
+    except (TypeError, ValueError):
+        return None
+
+
+async def op_pbs_status(client, args: dict, _t=None) -> dict:
+    out = []
+    for s in await _pbs_storages(client):
+        sid = s.get("storage")
+        row = {"storage": sid, "server": s.get("server"), "datastore": s.get("datastore"),
+               "namespace": s.get("namespace") or "(root)", "enabled": not s.get("disable"),
+               "user": s.get("username"), "encryption": bool(s.get("encryption-key"))}
+        if s.get("disable"):
+            row["state"] = "disabled in PVE"
+            out.append(row)
+            continue
+        node = await _pbs_node(client, sid)
+        if not node:
+            row["state"] = "not reachable from any online node"
+            out.append(row)
+            continue
+        st = (await client.get(f"/nodes/{node}/storage/{sid}/status")).get("data") or {}
+        total, used = int(st.get("total") or 0), int(st.get("used") or 0)
+        row.update(state="active", read_via=node, total_tib=round(total / 2**40, 2), used_tib=round(used / 2**40, 2),
+                   used_pct=round(used * 100 / total, 1) if total else None,
+                   avail_tib=round((total - used) / 2**40, 2))
+        try:
+            rrd = [x for x in (await client.get(f"/nodes/{node}/storage/{sid}/rrddata",
+                                                {"timeframe": "month"})).get("data", []) or [] if x.get("used")]
+            if len(rrd) > 10:
+                a, b = rrd[0], rrd[-1]
+                days = (b["time"] - a["time"]) / 86400
+                per_day = (b["used"] - a["used"]) / days if days else 0
+                row["growth_gib_per_day"] = round(per_day / 2**30, 1)
+                row["days_until_full"] = round((total - used) / per_day) if per_day > 0 else None
+        except Exception as e:
+            row["trend_error"] = str(e)[:80]
+        out.append(row)
+    warn = [f"{r['storage']}: {r['used_pct']}% used" for r in out if (r.get("used_pct") or 0) >= 80]
+    warn += [f"{r['storage']}: full in about {r['days_until_full']} days at the current rate"
+             for r in out if r.get("days_until_full") is not None and r["days_until_full"] < 90]
+    return {"pbs_storages": out, "warnings": warn,
+            "note": "Read through the PVE storage API. Garbage collection, verify/prune/sync job results and PBS "
+                    "tasks are only visible on the PBS itself."}
+
+
+async def op_pbs_backups(client, args: dict, _t=None) -> dict:
+    stale_days = float(args.get("stale_days", 2))
+    want_vmid = args.get("vmid")
+    storages = [s for s in await _pbs_storages(client) if not s.get("disable")]
+    if args.get("storage"):
+        storages = [s for s in storages if s.get("storage") == args["storage"]]
+    names = {g["vmid"]: g for g in await _resources(client)}
+    now = time.time()
+    per = {}
+    for s in storages:
+        sid = s["storage"]
+        node = await _pbs_node(client, sid)
+        if not node:
+            continue
+        params = {"content": "backup"}
+        if want_vmid:
+            params["vmid"] = int(want_vmid)
+        for b in (await client.get(f"/nodes/{node}/storage/{sid}/content", params)).get("data", []) or []:
+            v = int(b.get("vmid") or 0)
+            p = per.setdefault((sid, v), {"storage": sid, "vmid": v, "backups": []})
+            p["backups"].append(b)
+
+    guests, latest_unverified, verify_failed, stale = [], [], [], []
+    for (sid, v), p in sorted(per.items()):
+        bs = sorted(p["backups"], key=lambda x: x.get("ctime", 0))
+        last = bs[-1]
+        lstate = (last.get("verification") or {}).get("state", "none")
+        failed = [x for x in bs if (x.get("verification") or {}).get("state") == "failed"]
+        g = names.get(v, {})
+        row = {"storage": sid, "vmid": v, "name": g.get("name"), "guest_status": g.get("status", "not in cluster"),
+               "count": len(bs), "latest": _iso(last.get("ctime")), "latest_age_days": _age_days(last.get("ctime")),
+               "latest_size_gib": round(int(last.get("size") or 0) / 2**30, 1), "latest_verify": lstate,
+               "verified": sum(1 for x in bs if (x.get("verification") or {}).get("state") == "ok"),
+               "unverified": sum(1 for x in bs if not x.get("verification")),
+               "verify_failed": len(failed), "protected": sum(1 for x in bs if x.get("protected")),
+               "encrypted": bool(last.get("encrypted")), "oldest": _iso(bs[0].get("ctime"))}
+        if args.get("details"):
+            row["snapshots"] = [{"time": _iso(x.get("ctime")), "size_gib": round(int(x.get("size") or 0) / 2**30, 1),
+                                 "verify": (x.get("verification") or {}).get("state", "none"),
+                                 "protected": bool(x.get("protected")), "notes": (x.get("notes") or "")[:80]}
+                                for x in bs[-20:]]
+        guests.append(row)
+        if lstate != "ok":
+            latest_unverified.append(f"{v} {g.get('name') or ''}".strip())
+        if failed:
+            verify_failed.append({"vmid": v, "name": g.get("name"), "failed": [_iso(x.get("ctime")) for x in failed]})
+        if g.get("status") == "running" and (now - int(last.get("ctime") or 0)) > stale_days * 86400:
+            stale.append({"vmid": v, "name": g.get("name"), "latest": row["latest"], "age_days": row["latest_age_days"]})
+
+    backed = {v for (_, v) in per}
+    running_without = [f"{g['vmid']} {g.get('name') or ''}".strip() for g in names.values()
+                       if g.get("status") == "running" and g["vmid"] not in backed and not want_vmid]
+    return {
+        "storages": [s["storage"] for s in storages],
+        "summary": {"guests": len(guests), "snapshots": sum(g["count"] for g in guests),
+                    "unverified_snapshots": sum(g["unverified"] for g in guests),
+                    "guests_latest_not_verified": len(latest_unverified),
+                    "guests_with_failed_verify": len(verify_failed),
+                    "running_guests_stale": len(stale), "running_guests_without_pbs_backup": len(running_without)},
+        "verify_failed": verify_failed, "stale_running_guests": stale,
+        "latest_not_verified": latest_unverified[:50],
+        "running_guests_without_pbs_backup": running_without[:50],
+        "guests": guests if (want_vmid or args.get("all")) else guests[:int(args.get("limit", 50))],
+        "note": "Snapshots without a verification state were never verified; schedule a verify job on the PBS "
+                "datastore. Verify, GC and sync job results themselves are only visible on the PBS.",
+    }
+
+
 OPS_TOOLS = [
     Tool(name="migration_preflight",
          description="Check whether moving a VM/container to another node is safe BEFORE migrating: CPU vendor/model "
@@ -5532,7 +6209,8 @@ OPS_TOOLS = [
              "vmname": {"type": "string", "description": "VM/container name (alternative to vmid)"},
              "node": {"type": "string", "description": "Current node (optional, auto-detected)"},
              "target": {"type": "string", "description": "Target node"},
-             "online": {"type": "boolean", "description": "Planned live migration (optional)"}},
+             "online": {"type": "boolean", "description": "Planned live migration (optional)"},
+             "min_free_gib": {"type": "number", "description": "RAM that must stay free on the target after the move (default: 10% of its RAM)"}},
              "required": ["target"], "additionalProperties": False}),
     Tool(name="verify_guest",
          description="Verify a VM/container is really working (after a migration, reboot or restore): samples status a "
@@ -5595,6 +6273,106 @@ OPS_TOOLS = [
          inputSchema={"type": "object", "properties": {
              "hours": {"type": "integer", "description": "Look back this many hours (default 24, max 72)", "default": 24},
              "node": {"type": "string"}}, "additionalProperties": False}),
+    Tool(name="get_pbs_status",
+         description="Proxmox Backup Server storages attached to PVE: server, datastore, namespace, enabled, used/total, "
+                     "growth per day over the last month and estimated days until full. Read through the PVE API "
+                     "(no PBS credentials needed).",
+         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),
+    Tool(name="get_pbs_backups",
+         description="Backups on Proxmox Backup Server per guest: count, newest/oldest, size, whether the newest is "
+                     "verified, failed verifications, never-verified snapshots, protected, encrypted; running guests "
+                     "whose newest backup is older than stale_days or that have none on PBS.",
+         inputSchema={"type": "object", "properties": {
+             "storage": {"type": "string", "description": "Only this PBS storage (default: all enabled)"},
+             "vmid": {"type": "integer", "description": "Only this guest"},
+             "stale_days": {"type": "number", "description": "Newest backup older than this is stale (default 2)", "default": 2},
+             "details": {"type": "boolean", "description": "Include the last 20 snapshots per guest", "default": False},
+             "all": {"type": "boolean", "description": "Return every guest instead of the first 'limit'", "default": False},
+             "limit": {"type": "integer", "description": "Guests to return (default 50)", "default": 50}},
+             "additionalProperties": False}),
+    Tool(name="audit_ha_rules",
+         description="Audit HA placement rules: HA VMs that may be placed on nodes with a different CPU vendor (a live "
+                     "move across vendors freezes the guest), whether automatic rebalancing is on for them, non-strict "
+                     "or disabled rules, rules naming unknown resources or nodes.",
+         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}),
+    Tool(name="plan_node_evacuation",
+         description="Read-only plan for emptying a node before a reboot: for each running guest, live migrate (VM, "
+                     "same CPU vendor), restart-migrate (container), offline migrate (VM with no same-vendor room) or "
+                     "no_capacity - honouring strict HA node rules and a free-RAM safety margin per target. VMs count "
+                     "at their configured RAM (a live-migrated VM holds all of it on the target).",
+         inputSchema={"type": "object", "properties": {
+             "node": {"type": "string", "description": "Node to empty"},
+             "min_free_gib": {"type": "number", "description": "RAM that must stay free on every target (default 16)", "default": 16},
+             "shutdown_ok": {"type": "array", "items": {"type": "integer"},
+                             "description": "VMIDs that may simply be shut down for the reboot"}},
+             "required": ["node"], "additionalProperties": False}),
+    Tool(name="check_node_after_reboot",
+         description="After a node reboot: is it back in the cluster, is the cluster quorate, is it running the newest "
+                     "installed kernel, are all Ceph OSDs up and PGs active+clean, is noout still set. Returns "
+                     "ready/not_ready with the reasons.",
+         inputSchema={"type": "object", "properties": {"node": {"type": "string"}},
+                      "required": ["node"], "additionalProperties": False}),
+    Tool(name="ha_rule_set",
+         description="Create, update or delete an HA rule (node-affinity or resource-affinity). Refuses a node-affinity "
+                     "rule that lets VMs run on nodes of different CPU vendors unless allow_mixed_vendor=true. "
+                     "Requires ENABLE_HA_CONFIG and confirm=true.",
+         inputSchema={"type": "object", "properties": {
+             "action": {"type": "string", "enum": ["create", "update", "delete"]},
+             "rule": {"type": "string", "description": "Rule ID"},
+             "type": {"type": "string", "enum": ["node-affinity", "resource-affinity"], "default": "node-affinity"},
+             "nodes": {"type": "array", "items": {"type": "string"}, "description": "node or node:priority"},
+             "resources": {"type": "array", "items": {"type": "string"}, "description": "e.g. vm:101, ct:200"},
+             "strict": {"type": "boolean"}, "disable": {"type": "boolean"},
+             "affinity": {"type": "string", "enum": ["positive", "negative"]},
+             "comment": {"type": "string"},
+             "allow_mixed_vendor": {"type": "boolean", "default": False},
+             "confirm": {"type": "boolean", "default": False}},
+             "required": ["action", "rule"], "additionalProperties": False}),
+    Tool(name="ha_resource_set",
+         description="Change an HA resource: requested state (started/stopped/disabled/ignored), automatic "
+                     "rebalancing for this resource, failback, max_relocate/max_restart, comment. "
+                     "Requires ENABLE_HA_CONFIG and confirm=true.",
+         inputSchema={"type": "object", "properties": {
+             "sid": {"type": "string", "description": "vm:<id> or ct:<id>"},
+             "state": {"type": "string", "enum": ["started", "stopped", "disabled", "ignored"]},
+             "auto_rebalance": {"type": "boolean"}, "failback": {"type": "boolean"},
+             "max_relocate": {"type": "integer"}, "max_restart": {"type": "integer"},
+             "comment": {"type": "string"}, "confirm": {"type": "boolean", "default": False}},
+             "required": ["sid"], "additionalProperties": False}),
+    Tool(name="ha_move",
+         description="Move an HA-managed guest through the HA manager: mode=migrate (live for VMs, checked by "
+                     "migration_preflight and refused across CPU vendors unless force=true) or mode=relocate (stop, "
+                     "move, start). Requires ENABLE_HA_CONFIG and confirm=true.",
+         inputSchema={"type": "object", "properties": {
+             "sid": {"type": "string"}, "target": {"type": "string"},
+             "mode": {"type": "string", "enum": ["migrate", "relocate"], "default": "migrate"},
+             "min_free_gib": {"type": "number"}, "force": {"type": "boolean", "default": False},
+             "confirm": {"type": "boolean", "default": False}},
+             "required": ["sid", "target"], "additionalProperties": False}),
+    Tool(name="set_ha_crs",
+         description="Set the cluster resource scheduler for HA: mode (basic/static/dynamic), automatic rebalancing, "
+                     "rebalancing on start. Turn rebalancing off before planned node work so HA does not move guests "
+                     "on its own. Requires ENABLE_HA_CONFIG and confirm=true.",
+         inputSchema={"type": "object", "properties": {
+             "ha": {"type": "string", "enum": ["basic", "static", "dynamic"]},
+             "auto_rebalance": {"type": "boolean"}, "rebalance_on_start": {"type": "boolean"},
+             "confirm": {"type": "boolean", "default": False}}, "additionalProperties": False}),
+    Tool(name="set_ceph_flag",
+         description="Set or clear a Ceph OSD flag (noout before a node reboot, norebalance, nobackfill, norecover, "
+                     "noscrub, nodeep-scrub, noin, nodown). Requires ENABLE_NODE_MAINTENANCE and confirm=true.",
+         inputSchema={"type": "object", "properties": {
+             "flag": {"type": "string", "enum": list(_CEPH_FLAGS_ALLOWED)},
+             "value": {"type": "boolean", "default": True},
+             "confirm": {"type": "boolean", "default": False}},
+             "required": ["flag"], "additionalProperties": False}),
+    Tool(name="reboot_node",
+         description="Reboot a cluster node after checking it is empty (no running guests), the cluster stays quorate "
+                     "and Ceph is clean; sets noout first. Refuses otherwise unless force=true. Follow with "
+                     "check_node_after_reboot. Requires ENABLE_NODE_MAINTENANCE and confirm=true.",
+         inputSchema={"type": "object", "properties": {
+             "node": {"type": "string"}, "set_noout": {"type": "boolean", "default": True},
+             "force": {"type": "boolean", "default": False}, "confirm": {"type": "boolean", "default": False}},
+             "required": ["node"], "additionalProperties": False}),
 ]
 
 OPS_IMPL = {
@@ -5609,6 +6387,17 @@ OPS_IMPL = {
     "get_stale_snapshots": op_stale_snapshots,
     "audit_container_features": op_audit_container_features,
     "find_oom_events": op_find_oom_events,
+    "get_pbs_status": op_pbs_status,
+    "get_pbs_backups": op_pbs_backups,
+    "audit_ha_rules": op_audit_ha_rules,
+    "plan_node_evacuation": op_plan_node_evacuation,
+    "check_node_after_reboot": op_check_node_after_reboot,
+    "ha_rule_set": op_ha_rule_set,
+    "ha_resource_set": op_ha_resource_set,
+    "ha_move": op_ha_move,
+    "set_ha_crs": op_set_ha_crs,
+    "set_ceph_flag": op_set_ceph_flag,
+    "reboot_node": op_reboot_node,
 }
 
 
@@ -5727,19 +6516,18 @@ async def main():
         # 4. DNS resolution test
         pve_host_env = os.environ.get('PVE_HOST', '')
         if pve_host_env:
-            try:
-                # Extract hostname from URL
-                from urllib.parse import urlparse
-                parsed = urlparse(pve_host_env)
-                hostname = parsed.hostname or parsed.path.split(':')[0]
-                print(f"\n[DNS Resolution Test]", file=sys.stderr)
-                print(f"  Target hostname: {hostname}", file=sys.stderr)
-                ip = socket.gethostbyname(hostname)
-                print(f"  Resolved IP: {ip}", file=sys.stderr)
-            except socket.gaierror as e:
-                print(f"  DNS resolution FAILED: {e}", file=sys.stderr)
-            except Exception as e:
-                print(f"  DNS test error: {e}", file=sys.stderr)
+            from urllib.parse import urlparse
+            print(f"\n[DNS Resolution Test]", file=sys.stderr)
+            for pve_url in _split_hosts(pve_host_env):
+                try:
+                    parsed = urlparse(pve_url)
+                    hostname = parsed.hostname or parsed.path.split(':')[0]
+                    ip = socket.gethostbyname(hostname)
+                    print(f"  {hostname} -> {ip}", file=sys.stderr)
+                except socket.gaierror as e:
+                    print(f"  {pve_url}: DNS resolution FAILED: {e}", file=sys.stderr)
+                except Exception as e:
+                    print(f"  {pve_url}: DNS test error: {e}", file=sys.stderr)
 
         # 5. Network interface info
         print(f"\n[Network Info]", file=sys.stderr)
@@ -5776,7 +6564,7 @@ async def main():
             print("Usage: python mcp_pve.py [OPTIONS]")
             print()
             print("Proxmox VE connection:")
-            print("  --host HOST               PVE host URL (env: PVE_HOST)")
+            print("  --host HOST               PVE host URL; comma-separate several cluster nodes for failover (env: PVE_HOST)")
             print("  --username USER            PVE username (env: PVE_USERNAME)")
             print("  --password PASS            PVE password (env: PVE_PASSWORD)")
             print("  --api-token-id ID          PVE API token ID (env: PVE_API_TOKEN_ID)")

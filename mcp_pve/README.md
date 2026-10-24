@@ -1,10 +1,10 @@
 # Proxmox VE MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Proxmox VE**, providing comprehensive cluster, node, VM/CT, storage, Ceph, HA and firewall management through a single file. It exposes **57 tools**: read-only queries are always available, while write/lifecycle operations are gated behind explicit feature toggles (read-only by default).
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Proxmox VE**, providing comprehensive cluster, node, VM/CT, storage, Ceph, HA and firewall management through a single file. It exposes **81 tools**: read-only queries are always available, while write/lifecycle operations are gated behind explicit feature toggles (read-only by default).
 
 - **Author:** Jason Cheng (jason@jason.tools)
 - **License:** MIT
-- **Version:** 1.6.0
+- **Version:** 1.8.0
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -50,7 +50,7 @@ Settings are resolved in this order: **CLI args > environment variables > defaul
 
 | Env var | CLI arg | Default | Description |
 |---|---|---|---|
-| `PVE_HOST` | `--host` | — (required) | Base URL, e.g. `https://pve.example.com:8006` |
+| `PVE_HOST` | `--host` | — (required) | Base URL, e.g. `https://pve.example.com:8006`. List several cluster nodes comma-separated for failover: `https://pve1.example.com:8006,https://pve2.example.com:8006` |
 | `PVE_USERNAME` | `--username` | — | e.g. `root@pam` (password auth) |
 | `PVE_PASSWORD` | `--password` | — | Password (password auth) |
 | `PVE_API_TOKEN_ID` | `--api-token-id` | — | e.g. `root@pam!mytoken` (token auth, preferred) |
@@ -151,13 +151,13 @@ Write/lifecycle operations are **disabled by default** and controlled by `ENABLE
 Default state:
 
 - **Enabled** by default: `ENABLE_VM_BACKUP`, `ENABLE_CT_BACKUP`, `ENABLE_VM_SNAPSHOT`, `ENABLE_CT_SNAPSHOT`.
-- **Disabled** by default: everything else (create / clone / update / delete / start / stop / shutdown / reboot / reset / migrate / backup-job).
+- **Disabled** by default: everything else (create / clone / update / delete / start / stop / shutdown / reboot / reset / migrate / backup-job), plus `ENABLE_HA_CONFIG` (HA rules, HA resource settings, HA moves, CRS options) and `ENABLE_NODE_MAINTENANCE` (Ceph flags, node reboot).
 
 Recommendation: keep `ENABLE_VM_DELETE` and `ENABLE_CT_DELETE` = `False` in production, and enable only the operations you actively use.
 
 ---
 
-## Tools (70)
+## Tools (81)
 
 ### Cluster & nodes
 
@@ -189,6 +189,22 @@ These answer "is this safe?" and "what is wrong?" instead of returning raw API d
 | `get_stale_snapshots` | Snapshots older than N days across the cluster |
 | `audit_container_features` | Privileged containers, nesting/keyctl against the OS type, running containers that will not start on boot |
 | `find_oom_events` | OOM kills from the nodes' kernel logs mapped to the guest and service; tells a guest hitting its own memory limit apart from the host running out of memory |
+| `audit_ha_rules` | HA VMs that may be placed on nodes with a different CPU vendor (a live move across vendors freezes the guest), whether automatic rebalancing is on for them, non-strict, disabled or dangling rules |
+| `plan_node_evacuation` | Plan for emptying a node before a reboot: per running guest live migrate / restart-migrate / offline migrate / no_capacity, honouring strict HA node rules and a free-RAM margin (`min_free_gib`, default 16). VMs count at their configured RAM |
+| `check_node_after_reboot` | Node back and quorate, newest installed kernel running, Ceph OSDs up and PGs clean, `noout` still set → ready / not_ready |
+
+### Node maintenance & HA configuration *(feature-toggled, confirm=true)*
+
+| Tool | Toggle | Description |
+|---|---|---|
+| `ha_rule_set` | `ENABLE_HA_CONFIG` | Create / update / delete an HA node- or resource-affinity rule; refuses a VM rule spanning CPU vendors unless `allow_mixed_vendor` |
+| `ha_resource_set` | `ENABLE_HA_CONFIG` | Requested state, per-resource auto-rebalance, failback, max_relocate / max_restart |
+| `ha_move` | `ENABLE_HA_CONFIG` | Move an HA guest: `migrate` (live, checked by `migration_preflight`) or `relocate` (stop, move, start) |
+| `set_ha_crs` | `ENABLE_HA_CONFIG` | Scheduler mode and automatic rebalancing — turn rebalancing off before planned node work |
+| `set_ceph_flag` | `ENABLE_NODE_MAINTENANCE` | Set / clear `noout`, `norebalance`, `nobackfill`, `norecover`, `noscrub`, `nodeep-scrub`, `noin`, `nodown` |
+| `reboot_node` | `ENABLE_NODE_MAINTENANCE` | Reboot a node only if it is empty, quorum survives and Ceph is clean; sets `noout` first |
+
+HA node maintenance mode (`ha-manager crm-command node-maintenance`) has no API, so the workflow is: `plan_node_evacuation` → move or stop guests → `reboot_node` → `check_node_after_reboot` → `set_ceph_flag noout false` → move guests back.
 
 `migrate` now runs `migration_preflight` first and refuses a live migration it rates unsafe (for example across CPU vendors, where the migration can finish "successfully" and leave the guest frozen); `force=true` overrides. Containers are moved in restart mode.
 
@@ -230,6 +246,15 @@ These answer "is this safe?" and "what is wrong?" instead of returning raw API d
 | `get_next_vmid` | Next available VM/CT ID |
 | `get_vm_config_options` | Available VM creation options (CPU types, NIC types, …) |
 | `get_network_bridges` | Available network bridges and their config |
+
+### Proxmox Backup Server (read through the PVE storage API — no PBS credentials)
+
+| Tool | Description |
+|---|---|
+| `get_pbs_status` | PBS storages attached to PVE: server, datastore, namespace, enabled, used/total, growth per day over the last month, estimated days until full |
+| `get_pbs_backups` | Per guest: snapshot count, newest/oldest, size, newest verified or not, failed and never-verified snapshots, protected, encrypted; running guests with stale or no PBS backups |
+
+Garbage collection, verify / prune / sync job results and PBS tasks are only visible on the PBS itself.
 
 ### Storage & backups
 
@@ -294,6 +319,7 @@ These answer "is this safe?" and "what is wrong?" instead of returning raw API d
 
 - **VM memory accuracy (v1.5.6).** Proxmox's `mem` for a running QEMU VM is the host-side KVM process RSS (includes emulation overhead) and can exceed the configured RAM. `list_vms` now derives true in-guest usage from `status/current` `ballooninfo` when the guest reports virtio-balloon stats, and clamps `memory_used_mb` so it never exceeds `memory_mb`. For accurate Windows guest usage, install the **virtio-balloon driver + service**.
 - **Pagination.** Batch `get_all_*` and list tools support `limit`/`offset` to avoid overflowing the LLM context; limits are clamped internally (no `maximum` in the schema, so OpenAPI proxies like mcpo don't reject large values).
+- **Several nodes for failover (v1.7.0).** Any node's API serves the whole cluster, so `PVE_HOST` can list several nodes. When the current one is unreachable the server moves to the next and keeps using whichever answered. Reads (GET) are retried on another node after any network error; actions (POST/PUT/DELETE) only when the request cannot have reached the server (connection refused / connect timeout), so a migration or shutdown is never sent twice. The connect timeout is capped at 5 s, so a dead node costs a few seconds. `get_cluster_status` shows the answering node in `api_host`.
 - All tools return structured JSON; errors come back in the payload rather than raising.
 - DNS-rebinding protection is disabled on the HTTP transports to avoid `421 Misdirected Request` behind reverse proxies.
 
@@ -301,6 +327,8 @@ These answer "is this safe?" and "what is wrong?" instead of returning raw API d
 
 ## Changelog (recent)
 
+- **v1.8.0** — Node maintenance and HA: `plan_node_evacuation`, `check_node_after_reboot`, `audit_ha_rules` (read-only); `ha_rule_set`, `ha_resource_set`, `ha_move`, `set_ha_crs` (`ENABLE_HA_CONFIG`); `set_ceph_flag`, `reboot_node` (`ENABLE_NODE_MAINTENANCE`). Proxmox Backup Server through the PVE API: `get_pbs_status`, `get_pbs_backups`. `migration_preflight` takes `min_free_gib`, blocks a target without the memory and counts containers at current use.
+- **v1.7.0** — `PVE_HOST` accepts a comma-separated list of cluster nodes with automatic failover; non-idempotent requests are never resent after they may have reached the server; 5 s connect timeout; `get_cluster_status` reports `api_host`.
 - **v1.6.0** — Eleven read-only operations checks: `migration_preflight`, `verify_guest`, `get_capacity_report`, `find_guest`, `check_ip_conflicts`, `get_backup_coverage`, `get_notification_health`, `get_node_updates`, `get_stale_snapshots`, `audit_container_features`, `find_oom_events`. `migrate` runs the preflight and refuses unsafe live migrations. `get_all_operation_logs` fills `vmid` from the UPID; `get_all_snapshots` adds `age_days`; `MCP_PVE_COMPACT=1` for short descriptions.
 - **v1.5.8** — New `get_task_log` and `get_backup_failures`. A backup job only reported `job errors`; the guest that failed and the reason were in the task log, which no tool could read.
 - **v1.5.7** — SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
