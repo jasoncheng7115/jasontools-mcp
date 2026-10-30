@@ -1,10 +1,10 @@
 # Odoo MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **18 read tools** for sales quotations, sales analysis, purchase orders, deliveries, products, stock, invoices, partners and chatter history — with token-saving output controls tuned for small/local LLMs — plus **13 opt-in write tools** for quotations and customers (`--enable-write`).
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **18 read tools** for sales quotations, sales analysis, purchase orders, deliveries, products, stock, invoices, partners and chatter history — with token-saving output controls tuned for small/local LLMs — plus **21 opt-in write tools** for quotations, customers, products, invoices and delivery orders (`--enable-write`).
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.11.0
+- **Version:** 1.14.0
 - **Tested:** Odoo 13 and 18 Community Edition (write tools: Odoo 18)
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
@@ -13,7 +13,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 ## Features
 
 - **Sales / quotations** — flexible search (partner, state, date & amount range, product names/keywords with AND/OR and exclude logic), quick stats, and full order details.
-- **Purchasing & delivery** — search purchase orders and delivery orders (stock pickings) with state / date / product-keyword filters; detailed views by ID.
+- **Purchasing & delivery** — search purchase orders and delivery orders (stock pickings) with state / date / product-keyword filters; detailed views by ID. Delivery orders can be edited with the opt-in write tools.
 - **Products & stock** — keyword/multi-keyword product search, product details, and on-hand stock by warehouse/location.
 - **Quotation writing (opt-in)** — create quotations with note/section lines, edit header and lines, copy to another customer, confirm, set a customer's default pricelist / payment terms, add contacts, download the quotation or pro-forma PDF. Prices are protected from pricelist recomputation; every write is audited.
 - **Partners** — search partners (returns a Markdown link to the partner page) and create-or-get with VAT / 統一編號, customer/supplier flags and contacts.
@@ -70,7 +70,7 @@ The **Odoo connection is configured via environment variables**; transport/auth 
 | — | `--host` / `-H` | `127.0.0.1` | HTTP bind address |
 | — | `--port` / `-p` | `8001` | HTTP port |
 | `MCP_API_KEY` | `--api-key` / `-k` | — | Bearer token to protect the HTTP/SSE endpoint |
-| `ODOO_ENABLE_WRITE` | `--enable-write` | off | Register the 13 write tools (see below) |
+| `ODOO_ENABLE_WRITE` | `--enable-write` | off | Register the write tools (see below) |
 
 ### Write tools
 
@@ -165,7 +165,7 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 ---
 
-## Tools (18 + 13 write)
+## Tools (18 + 21 write)
 
 ### System
 
@@ -235,7 +235,7 @@ Two behaviours worth knowing:
 |---|---|
 | `create_quotation` | Create a draft quotation: customer, lines, note, validity date, customer PO number, payment terms; company / team / salesperson / pricelist / tax from the site defaults unless given |
 | `update_quotation` | Change header fields of a draft/sent quotation (customer, PO number, note, validity date, quotation date, payment terms, pricelist, team, salesperson, addresses); on a confirmed order only the PO number. Returns before → after per field |
-| `update_quotation_lines` | Add / change / delete lines, including `line_note` and `line_section` lines and `sequence` |
+| `update_quotation_lines` | Add / change / delete lines, including `line_note` and `line_section` lines, `sequence`, and `note_after` on add or update |
 | `preview_quotation_copy` | Show what a copy to another customer would look like; writes nothing |
 | `copy_quotation` | Copy a quotation to another customer (`confirm=True` required) |
 | `confirm_quotation` | Confirm a quotation into a sales order (`confirm=True` required; otherwise a preview) |
@@ -246,6 +246,14 @@ Two behaviours worth knowing:
 | `post_note` | Internal note on a quotation, partner, invoice, delivery or purchase order (no email is sent) |
 | `change_quotation_state` | Set a sent/cancelled quotation back to draft, or mark a draft as sent (no email). Cancelling is deliberately not offered |
 | `download_quotation_pdf` | Quotation (`sale.report_saleorder`) or pro-forma PDF |
+| `create_product` | Create a product (template + variant) with the site-default sales/purchase tax; refuses duplicates by name or internal reference |
+| `update_product` | Change a product's name, sales description, prices, taxes, internal reference, category, sale/purchase flags; archive or restore |
+| `duplicate_invoice` | Copy a customer invoice into a new draft with new dates (recurring monthly charges) |
+| `create_invoice` | Create a draft customer invoice |
+| `post_invoice` | Post a draft invoice (`confirm=True` required; otherwise a preview) |
+| `draft_invoice` | Reset a posted invoice to draft (`confirm=True` required; otherwise a preview) |
+| `update_delivery_order` | Change a delivery order's scheduled date, delivery address, source document, note, responsible, priority. On a done delivery only note and responsible; cancelled ones are refused |
+| `update_delivery_lines` | Add / change / delete delivery lines: `qty` (demand), `quantity` (done), `description_picking`, `sequence`. Only draft lines can be deleted; for others set `qty` to 0. Not for done or cancelled deliveries |
 
 Line spec example — a product line with its quantity formula as a separate note line below it:
 
@@ -265,11 +273,14 @@ What the write tools guard against:
 - **Wrong product names.** Writes run with `lang=zh_TW`; English product names may still carry stale `(copy)` suffixes. When a product line's `name` is given, its first line must be exactly the product's name (`quote_line_name` from `search_products`) — the quotation PDF prints only the description, so an abbreviated first line is what the customer sees. Anything else is refused.
 - **Wrong currency.** Results carry a warning when the quotation's currency is not the company's.
 - **Missing PO number.** `confirm_quotation` warns when `client_order_ref` is empty.
+- **Unknown line keys.** Line specs accept only `product_id`, `name`, `qty` (`quantity` / `product_qty` / `product_uom_qty`), `price_unit`, `discount`, `tax_id` (`taxes_id` / `tax_ids`), `sequence`, `display_type`, `note_after` (and `line_id` / `action` in `update_quotation_lines`). Anything else — e.g. `"line_note": "..."` — is refused with a hint (`display_type: "line_note"` or `note_after`) and nothing is written, in `dry_run` too.
+- **Notes that are not notes.** A line with neither `product_id` nor `display_type` becomes a product line with no product (it only looks like a note); both tools warn about it.
+- **Deliveries stay deliveries.** The delivery tools refuse receipts and internal transfers, never validate a delivery or move stock, and warn that changes do not flow back to the sales order.
 - **Trying it first.** Every write tool takes `dry_run=True` (or, for copy / confirm / state change, works as a preview until `confirm=True`) and reports exactly what it would change.
 - **Nothing destructive.** There is no tool to delete or cancel a quotation or to delete a partner.
 - **Mistyped customers.** `copy_quotation` takes `new_partner_id`, or a name that matches exactly one partner; it never creates a partner.
 
-Every write returns the record as read back from Odoo (untaxed / tax / total, currency, first line of each description), is appended to `ODOO_AUDIT_LOG`, and is posted as an internal note in the record's chatter.
+Every write returns the record as read back from Odoo (untaxed / tax / total, currency, and the full text of every line description and note), is appended to `ODOO_AUDIT_LOG`, and is posted as an internal note in the record's chatter.
 
 `download_quotation_pdf` renders through Odoo's web session (reports are not available over XML-RPC). Over HTTP it returns a link to `/files/<token>/<file>.pdf` that is valid for 15 minutes; the random token stands in for the API key, so the link can be fetched with plain `curl`. In stdio mode the file is saved to `ODOO_PDF_DIR`.
 
@@ -288,6 +299,29 @@ Enable them only for clients that should change data. A typical setup runs one r
 ---
 
 ## Changelog (recent)
+
+### v1.14.0 — Delivery order editing
+
+- New write tools: `update_delivery_order` (scheduled date, delivery address, source document, note, responsible, priority) and `update_delivery_lines` (add / change / delete lines). Neither validates a delivery or moves stock.
+- Writes on a delivery are posted to its chatter, like quotations and partners.
+
+### v1.13.0 — Stricter quotation lines
+
+- `create_quotation` and `update_quotation_lines` refuse unknown line keys instead of silently dropping them (a `line_note` key used to vanish while the result said `created` with no warning). The error names the key, the likely intended field and the allowed keys.
+- `update_quotation_lines`: `note_after` also works on `update`, adding a note line right below the product line.
+- Warning when a line has neither `product_id` nor `display_type` (it becomes a product line with no product, not a note), including in `dry_run`.
+- Results return each line's full description and note text instead of the first line.
+
+### v1.12.0 — Products, invoices, safer writes
+
+- New write tools: `create_product`, `update_product`, `duplicate_invoice`, `create_invoice`, `post_invoice`, `draft_invoice`.
+- `update_quotation_lines` writes taxes (`tax_id` 23 / [23] / []); quantity also accepted as `quantity` / `product_qty`; `id` accepted for `line_id`.
+- `search_quotations` global search no longer lists unrelated orders on no hit, and searches line descriptions.
+
+### v1.11.1 — Line items fix
+
+- `get_quotation_details` with `include_lines` (the default) and `get_purchase_order_details` failed with `'int' object is not subscriptable` on any line carrying a tax, because Odoo returns the tax field as plain ids. Tax names are now looked up from `account.tax`.
+- `download_quotation_pdf` gains `return_mode`: `url` (default), `base64`, or `text` (the PDF text, for clients that cannot read PDF).
 
 ### v1.11.0 — Sales analysis, line search, partner editing, safer writes
 

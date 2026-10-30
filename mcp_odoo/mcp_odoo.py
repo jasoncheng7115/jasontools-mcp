@@ -1,16 +1,60 @@
 #!/usr/bin/env python3
 """
-MCP server for Odoo API – v1.11.0 Sales Analysis & Safer Writes
+MCP server for Odoo API – v1.14.0 Delivery Order Editing
 ===============================================================================
 Author: Jason Cheng (Jason Tools)
 Created: 2025-07-14
-Updated: 2026-10-09
-Version: 1.11.0
+Updated: 2026-10-30
+Version: 1.14.0
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Tested: Odoo 13 Community Edition
 
 FastMCP-based Odoo integration with comprehensive business management capabilities.
+
+NEW in v1.14.0:
+- Write: update_delivery_order (scheduled date, delivery address, source document, note,
+  responsible, priority; a done delivery only note and responsible) and update_delivery_lines
+  (add / change / delete stock moves: demand qty, done quantity, slip description, sequence).
+  Deliveries could only be read before. Neither validates a delivery or moves stock, and
+  changes do not flow back to the sales order (warned). Unknown line keys are refused.
+
+NEW in v1.13.0:
+- create_quotation / update_quotation_lines refuse unknown line keys instead of dropping
+  them. A "line_note": "..." key was ignored, the result said created with no warning
+  (dry_run too), and the note was missing. The error names the key, what was probably
+  meant (display_type / note_after / name ...) and the allowed keys; nothing is written.
+- update_quotation_lines: note_after also works on "update" (adds a line_note right below
+  the product line). It answered "沒有要修改的欄位".
+- Warning for a line with neither product_id nor display_type: it becomes a product line
+  with no product that only looks like a note. Shown in dry_run as well.
+- Results return each line's full description and note text, not the first line only;
+  dry_run of both tools returns its warnings.
+
+NEW in v1.12.0:
+- Write: create_product (template + variant, site-default sales/purchase tax, duplicate
+  check by name / code, dry_run) and update_product (name, sales description, prices,
+  taxes, code, category, sale/purchase flags, archive / restore). Quotation lines for
+  products missing from the catalogue had to be free text with no product and 0 tax.
+- update_quotation_lines writes taxes: tax_id 23 / [23] / [] (taxes_id, tax_ids accepted);
+  an int used to fail with "'int' object is not iterable".
+- search_quotations global_search: no hit now returns nothing (it listed the latest
+  orders, which looked like matches), and line descriptions are searched too.
+- Line quantity also accepted as quantity / product_qty (create_quotation ignored
+  "quantity" and created qty 1); "id" is accepted for line_id; an operation without
+  action is an update when it has line_id, otherwise an add.
+- Plain-text quotation notes keep their line breaks (converted to <br/>).
+- Write: duplicate_invoice (copy a customer invoice into a draft with new dates - the
+  recurring monthly charge), create_invoice, post_invoice and draft_invoice (both need
+  confirm=True; without it they preview). Invoices could only be read before.
+- get_invoice_details lines return product_id, line_id and taxes; with two products of the
+  same name the line could not be traced back to one.
+
+FIXED in v1.11.1:
+- get_quotation_details (include_lines, the default) and get_purchase_order_details failed
+  with "'int' object is not subscriptable" on any line with a tax: read returns the tax
+  field as plain ids. Tax names are now looked up from account.tax.
+- download_quotation_pdf: return_mode 'base64' or 'text' besides the download link.
 
 NEW in v1.11.0:
 - Read: get_sales_report (sale.report read_group by month/customer/product/...),
@@ -405,7 +449,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Version information
-__version__ = "1.11.0"
+__version__ = "1.14.0"
 __author__ = "Jason Cheng (Jason Tools)"
 
 # Configure logging
@@ -1404,7 +1448,8 @@ def search_quotations(partner_name: Optional[str] = None, quotation_number: Opti
         min_amount: Minimum total amount filter
         max_amount: Maximum total amount filter
         description_contains: Search in quotation notes
-        global_search: Search across all fields
+        global_search: Text found in the order number, customer, salesperson, terms (note),
+            customer reference, source document or any line description
         limit: Max results (default: 10)
         offset: Skip first N results for pagination (default: 0)
         compact: Return minimal fields only (default: False)
@@ -1505,6 +1550,15 @@ def search_quotations(partner_name: Optional[str] = None, quotation_number: Opti
                         logger.debug(f"Search domain {search_domain} failed: {e}")
                         continue
                 
+                # Line descriptions too: the product text lives on the lines, not the order
+                try:
+                    line_hits = _cached_odoo_call('sale.order.line', 'search_read',
+                                                  [[['name', 'ilike', global_search]]],
+                                                  {'fields': ['order_id'], 'limit': 2000})
+                    quotation_ids_from_global.extend(l['order_id'][0] for l in line_hits if l.get('order_id'))
+                except Exception as e:
+                    logger.debug(f"Line description search failed: {e}")
+
                 # Remove duplicates
                 quotation_ids_from_global = list(set(quotation_ids_from_global))
                 logger.info(f"Global search found {len(quotation_ids_from_global)} quotations")
@@ -1643,8 +1697,10 @@ def search_quotations(partner_name: Optional[str] = None, quotation_number: Opti
         elif product_name:
             all_found_ids = quotation_ids_from_lines
 
-        # Add ID filter to domain if we found specific quotations
-        if all_found_ids:
+        # Add ID filter to domain if we found specific quotations. A global search with no
+        # hit must return nothing; without the filter it used to list the latest orders.
+        if all_found_ids or (global_search and quotation_ids_from_keywords is None
+                             and quotation_ids_from_multi_products is None):
             domain.append(['id', 'in', all_found_ids])
         elif product_keywords and len(product_keywords) > 0:
             # No quotations found with products matching all keywords
@@ -2018,6 +2074,13 @@ def get_quotation_stats(date_from: Optional[str] = None, date_to: Optional[str] 
         logger.error(f"Error getting quotation stats: {e}")
         return json.dumps({"error": str(e)}, indent=2, ensure_ascii=False)
 
+def _tax_names_by_id(lines, field):
+    """Map tax id -> name for a many2many tax field; read returns plain id lists."""
+    ids = sorted({t for line in lines for t in (line.get(field) or []) if isinstance(t, int)})
+    if not ids:
+        return {}
+    return {t['id']: t['name'] for t in _cached_odoo_call('account.tax', 'read', [ids], {'fields': ['name']})}
+
 @mcp.tool()
 def get_quotation_details(quotation_id: int, include_lines: bool = True) -> str:
     """Get detailed quotation/sales order information by ID.
@@ -2074,8 +2137,8 @@ def get_quotation_details(quotation_id: int, include_lines: bool = True) -> str:
                     'order': 'sequence'
                 }
             )
-            
-            
+            tax_name_by_id = _tax_names_by_id(lines, 'tax_id')
+
             # Format line items with currency and language
             for line in lines:
                 formatted_line = line.copy()
@@ -2104,8 +2167,7 @@ def get_quotation_details(quotation_id: int, include_lines: bool = True) -> str:
                     formatted_line['uom_name'] = line['product_uom'][1]
                 
                 if line.get('tax_id'):
-                    tax_names = [tax[1] for tax in line['tax_id']]
-                    formatted_line['tax_names'] = tax_names
+                    formatted_line['tax_names'] = [tax_name_by_id.get(t, str(t)) for t in line['tax_id']]
                 
                 quotation_lines.append(formatted_line)
         
@@ -2603,6 +2665,8 @@ def get_purchase_order_details(po_id: int, include_lines: bool = True) -> str:
                 }
             )
             
+            tax_name_by_id = _tax_names_by_id(lines, 'taxes_id')
+
             # Format line items with currency
             for line in lines:
                 formatted_line = line.copy()
@@ -2631,8 +2695,7 @@ def get_purchase_order_details(po_id: int, include_lines: bool = True) -> str:
                     formatted_line['uom_name'] = line['product_uom'][1]
                 
                 if line.get('taxes_id'):
-                    tax_names = [tax[1] for tax in line['taxes_id']]
-                    formatted_line['tax_names'] = tax_names
+                    formatted_line['tax_names'] = [tax_name_by_id.get(t, str(t)) for t in line['taxes_id']]
                 
                 # Format dates
                 if line.get('date_planned'):
@@ -4898,7 +4961,8 @@ def get_invoice_details(invoice_id: Optional[int] = None,
                                           [inv["invoice_line_ids"]],
                                           {"fields": ["name", "quantity", "price_unit",
                                                       "price_subtotal", "product_id",
-                                                      "discount", "display_type"]})
+                                                      "discount", "display_type", "tax_ids"]})
+            tax_name_by_id = _tax_names_by_id(raw_lines, "tax_ids")
             lines = []
             for l in raw_lines:
                 # Section and note rows carry no amounts; keep them for context
@@ -4908,8 +4972,12 @@ def get_invoice_details(invoice_id: Optional[int] = None,
                     continue
                 product = l.get("product_id") or [None, None]
                 lines.append({
+                    "line_id": l.get("id"),
                     "description": l.get("name", ""),
+                    "product_id": product[0],
                     "product": product[1] if len(product) > 1 else None,
+                    "tax_ids": l.get("tax_ids") or [],
+                    "taxes": [tax_name_by_id.get(t, str(t)) for t in (l.get("tax_ids") or [])],
                     "quantity": l.get("quantity"),
                     "unit_price": l.get("price_unit"),
                     "discount_pct": l.get("discount") or 0,
@@ -5480,6 +5548,7 @@ def get_record_messages(record_type: str, record_id: int, include_tracking: bool
 
 import secrets
 import base64
+import subprocess
 
 WRITE_LANG = 'zh_TW'
 AUDIT_LOG = os.path.expanduser(os.getenv('ODOO_AUDIT_LOG', '~/.local/state/mcp_odoo/audit.jsonl'))
@@ -5491,6 +5560,19 @@ PDF_REPORTS = {
 }
 EDITABLE_STATES = ('draft', 'sent')
 LINE_FIELDS = ('product_id', 'name', 'product_uom_qty', 'price_unit', 'discount', 'sequence', 'display_type')
+LINE_ALIASES = ('qty', 'quantity', 'product_qty', 'tax_id', 'taxes_id', 'tax_ids')
+LINE_KEYS = set(LINE_FIELDS) | set(LINE_ALIASES) | {'note_after'}
+# What callers typed instead of a real field, and what they meant.
+LINE_KEY_HINTS = {
+    'line_note': '註解行請寫 {"display_type": "line_note", "name": "文字"}；接在產品行正下方的註解用 note_after',
+    'line_section': '章節行請寫 {"display_type": "line_section", "name": "文字"}',
+    'note': '註解行請用 display_type: "line_note"，或在產品行加 note_after',
+    'section': '章節行請用 display_type: "line_section"',
+    'type': '請用 display_type（line_note／line_section）',
+    'description': '描述請用 name', 'text': '文字請用 name', 'label': '文字請用 name',
+    'product': '請用 product_id', 'price': '請用 price_unit', 'unit_price': '請用 price_unit',
+    'uom_qty': '請用 qty 或 product_uom_qty', 'taxes': '請用 tax_id',
+}
 
 _pdf_store: Dict[str, Dict[str, Any]] = {}
 _http_mode = False  # set in __main__; PDFs are served as links instead of saved files
@@ -5561,7 +5643,7 @@ def _audit(ctx, action: str, model: str, res_id: Optional[int], changes: Any, re
         logger.error(f"Audit log write failed: {e}")
     logger.info(f"AUDIT {action} {model}#{res_id} {record_name}")
 
-    if post_chatter and res_id and model in ('sale.order', 'res.partner'):
+    if post_chatter and res_id and model in ('sale.order', 'res.partner', 'stock.picking'):
         who = entry.get('client') or entry.get('user_agent') or ''
         where = entry.get('client_ip', '')
         body = f"[MCP] {action}" + (f" ({who} {where})".rstrip() if who or where else '')
@@ -5575,7 +5657,7 @@ def _audit(ctx, action: str, model: str, res_id: Optional[int], changes: Any, re
 
 
 def _read_order(order_id: int) -> Dict:
-    """Read back an order the way a person checks it: totals, currency and each line's first line."""
+    """Read back an order the way a person checks it: totals, currency and each line's full text."""
     so = _wcall('sale.order', 'read', [[order_id]], {'fields': [
         'name', 'state', 'partner_id', 'company_id', 'currency_id', 'pricelist_id',
         'payment_term_id', 'team_id', 'user_id', 'validity_date', 'client_order_ref',
@@ -5589,13 +5671,15 @@ def _read_order(order_id: int) -> Dict:
                     'order': 'sequence, id'})
     out_lines = []
     for l in lines:
-        first = (l.get('name') or '').split('\n')[0]
+        # Full text, not the first line: callers check here that a multi-line
+        # description or a note was written completely.
+        text = l.get('name') or ''
         if l.get('display_type'):
-            out_lines.append({'line_id': l['id'], 'sequence': l['sequence'], 'type': l['display_type'], 'text': first})
+            out_lines.append({'line_id': l['id'], 'sequence': l['sequence'], 'type': l['display_type'], 'text': text})
         else:
             out_lines.append({
                 'line_id': l['id'], 'sequence': l['sequence'],
-                'product': _m2o(l['product_id']), 'name': first,
+                'product': _m2o(l['product_id']), 'name': text,
                 'qty': l['product_uom_qty'], 'price_unit': l['price_unit'],
                 'discount': l['discount'], 'subtotal': l['price_subtotal'],
             })
@@ -5664,11 +5748,35 @@ def _check_products(product_ids: List[int], company_id: int) -> List[str]:
     return errors
 
 
+def _check_line_keys(spec: Dict, label: str, extra: tuple = ()) -> None:
+    """Refuse fields this tool does not know. They used to be dropped silently: a
+    `line_note` key was ignored, the result said created with no warning, and the
+    note was simply missing from the quotation."""
+    unknown = [k for k in spec if k not in LINE_KEYS and k not in extra]
+    if unknown:
+        msgs = [f"{k!r}" + (f"（{LINE_KEY_HINTS[k]}）" if k in LINE_KEY_HINTS else '') for k in unknown]
+        raise ValueError(f"{label}：不認得的明細欄位 {'、'.join(msgs)}；可用欄位："
+                         f"{', '.join(sorted(LINE_KEYS | set(extra)))}。未寫入任何資料")
+
+
+def _free_text_warnings(items: List[tuple]) -> List[str]:
+    """items: [(label, vals)]. A line with no product and no display_type is an ordinary
+    product line (qty / price 0) that only looks like a note."""
+    return [f"{label}：沒有 product_id 也沒有 display_type，會建成沒有產品的普通產品行，不是註解；"
+            f"要註解請加 display_type: \"line_note\"" for label, v in items
+            if not v.get('display_type') and not v.get('product_id')]
+
+
 def _line_vals(spec: Dict) -> Dict:
     """Validate one line spec and turn it into sale.order.line values."""
     spec = dict(spec)
-    if 'qty' in spec and 'product_uom_qty' not in spec:
-        spec['product_uom_qty'] = spec.pop('qty')
+    # Callers reach for the usual names; Odoo only knows product_uom_qty / tax_id.
+    for alias in ('qty', 'quantity', 'product_qty'):
+        if alias in spec and 'product_uom_qty' not in spec:
+            spec['product_uom_qty'] = spec.pop(alias)
+    for alias in ('taxes_id', 'tax_ids'):
+        if alias in spec and 'tax_id' not in spec:
+            spec['tax_id'] = spec.pop(alias)
     vals = {k: spec[k] for k in LINE_FIELDS if k in spec and spec[k] is not None}
     dt = vals.get('display_type')
     if dt not in (None, False, 'line_note', 'line_section'):
@@ -5680,8 +5788,24 @@ def _line_vals(spec: Dict) -> Dict:
             vals.pop(k, None)
         vals['product_uom_qty'] = 0
     if 'tax_id' in spec and spec['tax_id'] is not None:
-        vals['tax_id'] = [(6, 0, list(spec['tax_id']))]
+        taxes = spec['tax_id']
+        if isinstance(taxes, (int, str)) and not isinstance(taxes, bool):
+            taxes = [taxes]
+        try:
+            taxes = [int(t) for t in taxes if t not in (None, '', 0, False)]
+        except (TypeError, ValueError):
+            raise ValueError(f"tax_id 要是稅別 ID 或 ID 清單（例：23 或 [23]），收到 {spec['tax_id']!r}")
+        vals['tax_id'] = [(6, 0, taxes)]  # [] clears the taxes
     return vals
+
+
+def _note_html(note: Optional[str]) -> Optional[str]:
+    """Terms are an HTML field: plain text loses its line breaks in the PDF. Turn a plain
+    text note into HTML with <br/>; a note that already contains tags is left alone."""
+    if not note or re.search(r'<[a-zA-Z/][^>]*>', note):
+        return note
+    import html as _h
+    return '<p>' + '<br/>'.join(_h.escape(l) for l in note.strip('\n').split('\n')) + '</p>'
 
 
 def _expand_lines(specs: List[Dict], start_seq: int) -> List[Dict]:
@@ -5750,6 +5874,7 @@ DEFAULT_TEAM_ID = _env_int('ODOO_DEFAULT_TEAM_ID')
 DEFAULT_SALESPERSON_ID = _env_int('ODOO_DEFAULT_SALESPERSON_ID')
 DEFAULT_PRICELIST_ID = _env_int('ODOO_DEFAULT_PRICELIST_ID')
 DEFAULT_SALE_TAX_IDS = [int(x) for x in (os.getenv('ODOO_DEFAULT_SALE_TAX_IDS') or '').split(',') if x.strip().isdigit()]
+DEFAULT_PURCHASE_TAX_IDS = [int(x) for x in (os.getenv('ODOO_DEFAULT_PURCHASE_TAX_IDS') or '').split(',') if x.strip().isdigit()]
 
 
 def _user_company_id() -> int:
@@ -5822,7 +5947,10 @@ def create_quotation(partner_id: int, lines: List[Dict], note: Optional[str] = N
                Note / section line: {"display_type": "line_note"|"line_section", "name": "text"}
                `sequence` is optional (10, 20, ... in list order). `note_after` adds a separate
                line_note directly below the product line.
-        note: Terms and conditions (HTML allowed)
+               Allowed keys: product_id, name, qty (quantity / product_qty / product_uom_qty),
+               price_unit, discount, tax_id (taxes_id / tax_ids), sequence, display_type,
+               note_after. Any other key (e.g. "line_note": "...") is refused, nothing is created.
+        note: Terms and conditions. HTML, or plain text (line breaks become <br/>)
         validity_date: Expiry YYYY-MM-DD
         client_order_ref: Customer PO number
         payment_term_id: Payment terms
@@ -5836,8 +5964,10 @@ def create_quotation(partner_id: int, lines: List[Dict], note: Optional[str] = N
     quotation's company or to no company.
 
     Returns:
-        The quotation as read back (number, currency, untaxed / tax / total, every line),
-        plus `warnings` (e.g. currency other than the company's).
+        The quotation as read back (number, currency, untaxed / tax / total, every line
+        with its full description / note text), plus `warnings` (e.g. currency other than
+        the company's, a line with neither product_id nor display_type). dry_run returns
+        the exact values that would be written and the same warnings.
     """
     try:
         partner = _resolve_partner(partner_id, None)
@@ -5845,8 +5975,12 @@ def create_quotation(partner_id: int, lines: List[Dict], note: Optional[str] = N
         team_id = team_id or DEFAULT_TEAM_ID
         user_id = user_id or DEFAULT_SALESPERSON_ID
         pricelist_id = pricelist_id or DEFAULT_PRICELIST_ID
+        for n, spec in enumerate(lines or [], 1):
+            _check_line_keys(spec, f"第 {n} 行")
         specs = _expand_lines(lines or [], 0)
         vals_lines = [_line_vals(s) for s in specs]
+        warnings = _free_text_warnings([(f"第 {n} 行（sequence {v.get('sequence')}）", v)
+                                        for n, v in enumerate(vals_lines, 1)])
         if DEFAULT_SALE_TAX_IDS and company_id == DEFAULT_COMPANY_ID:
             for v in vals_lines:
                 if v.get('product_id') and 'tax_id' not in v:
@@ -5861,16 +5995,17 @@ def create_quotation(partner_id: int, lines: List[Dict], note: Optional[str] = N
                 'order_line': [(0, 0, v) for v in vals_lines]}
         for k, v in (('team_id', team_id), ('user_id', user_id), ('pricelist_id', pricelist_id),
                      ('payment_term_id', payment_term_id), ('validity_date', validity_date),
-                     ('note', note), ('client_order_ref', client_order_ref)):
+                     ('note', _note_html(note)), ('client_order_ref', client_order_ref)):
             if v is not None:
                 vals[k] = v
         header = {k: v for k, v in vals.items() if k != 'order_line'}
         if dry_run:
             return _ok({'status': 'dry_run', 'message': '檢查通過；未建立。拿掉 dry_run 即建立',
+                        'warnings': warnings,
                         'partner': partner['display_name'], 'header': header, 'lines': vals_lines})
 
         order_id = _wcall('sale.order', 'create', [vals], company_id=company_id)
-        warnings = _enforce_prices(order_id, vals_lines, company_id)
+        warnings += _enforce_prices(order_id, vals_lines, company_id)
         cache.clear()
         result = _read_order(order_id)
         cw = _currency_warning(result, company_id)
@@ -5918,7 +6053,7 @@ def update_quotation(quotation_id: int, partner_id: Optional[int] = None,
         quotation_id: Quotation ID
         partner_id: New customer (contact person change, e.g. 承辦換人)
         client_order_ref: Customer PO number
-        note: Terms and conditions (HTML)
+        note: Terms and conditions. HTML, or plain text (line breaks become <br/>)
         validity_date: Expiry YYYY-MM-DD
         date_order: Quotation date YYYY-MM-DD (or "YYYY-MM-DD HH:MM:SS")
         payment_term_id, pricelist_id, team_id, user_id: Payment terms, pricelist, sales team, salesperson
@@ -5937,7 +6072,7 @@ def update_quotation(quotation_id: int, partner_id: Optional[int] = None,
             return _err(ValueError(f"找不到報價單 {quotation_id}"))
         so = so[0]
         company_id = so['company_id'][0]
-        vals = {k: v for k, v in (('partner_id', partner_id), ('client_order_ref', client_order_ref), ('note', note),
+        vals = {k: v for k, v in (('partner_id', partner_id), ('client_order_ref', client_order_ref), ('note', _note_html(note)),
                                   ('validity_date', validity_date), ('date_order', date_order),
                                   ('payment_term_id', payment_term_id), ('pricelist_id', pricelist_id),
                                   ('team_id', team_id), ('user_id', user_id),
@@ -5996,11 +6131,18 @@ def update_quotation_lines(quotation_id: int, line_updates: List[Dict], dry_run:
              "note_after": "(3Nodes x 2CPUs x 1Year) = 6"}
             {"action": "add", "display_type": "line_note", "name": "text", "sequence": 26}
             {"action": "update", "line_id": 345, "qty": 4, "price_unit": 900, "name": "..."}
+            {"action": "update", "line_id": 345, "note_after": "text"}  (adds a note below it)
             {"action": "delete", "line_id": 346}
-            ("create" is accepted for "add".) Fields: product_id, name, qty / product_uom_qty,
-            price_unit, discount, tax_id (list of IDs), sequence, display_type
-            (line_note / line_section). New lines without a sequence go to the bottom.
-        dry_run: Validate and list the operations without writing.
+            Without "action": an operation with line_id is an update, otherwise an add.
+            "id" is accepted for line_id. Fields: product_id, name, qty (or quantity /
+            product_uom_qty), price_unit, discount, tax_id (23, [23], or [] to clear;
+            taxes_id / tax_ids accepted), sequence, display_type (line_note / line_section).
+            New lines without a sequence go to the bottom. Setting product_id on a free-text
+            line links it to the product; Odoo then fills the unit of measure and taxes.
+            note_after works on add and on update of a product line. Any other key is
+            refused and nothing is written. Adding a line with neither product_id nor
+            display_type gives a warning: it becomes a product line with no product, not a note.
+        dry_run: Validate and list the operations (exact values to be written) without writing.
 
     A product line's `name` must start with the product's exact zh_TW name (first line),
     like create_quotation. Products must belong to the quotation's company or to no
@@ -6019,29 +6161,47 @@ def update_quotation_lines(quotation_id: int, line_updates: List[Dict], dry_run:
         by_id = {l['id']: l for l in existing}
         max_seq = max([l['sequence'] for l in existing] or [0])
 
-        ops, name_checks = [], []
+        ops, name_checks, warnings = [], [], []
         for n, op in enumerate(line_updates, 1):
             op = dict(op)
+            if 'line_id' not in op and 'id' in op:
+                op['line_id'] = op.pop('id')
             action = op.pop('action', None)
-            action = {'create': 'add'}.get(action, action)
+            if action is None:
+                action = 'update' if op.get('line_id') else 'add'
+            action = {'create': 'add', 'edit': 'update', 'remove': 'delete'}.get(action, action)
             if action not in ('add', 'update', 'delete'):
                 return _err(ValueError(f"第 {n} 個操作：未知的 action {action!r}，只能是 add／update／delete"))
             if action in ('update', 'delete') and op.get('line_id') not in by_id:
                 return _err(ValueError(f"第 {n} 個操作：明細 {op.get('line_id')} 不屬於報價單 {so['name']}"))
+            if action != 'delete':
+                _check_line_keys(op, f"第 {n} 個操作", extra=('line_id',) if action == 'update' else ())
             if action == 'add':
                 for spec in _expand_lines([op], max_seq):
                     max_seq = max(max_seq, spec['sequence'])
                     v = _line_vals(spec)
                     ops.append(('add', None, v))
+                    warnings += _free_text_warnings([(f"第 {n} 個操作", v)])
                     if not v.get('display_type'):
                         name_checks.append({'label': f"第 {n} 個操作", 'product_id': v.get('product_id'), 'name': v.get('name')})
             elif action == 'update':
                 line_id = op.pop('line_id')
+                note_after = op.pop('note_after', None)
                 vals = _line_vals(op)
-                if not vals:
-                    return _err(ValueError(f"明細 {line_id} 沒有要修改的欄位"))
-                ops.append(('update', line_id, vals))
                 line = by_id[line_id]
+                if note_after and line.get('display_type'):
+                    return _err(ValueError(f"第 {n} 個操作：明細 {line_id} 是 {line['display_type']}，"
+                                           f"note_after 只能接在產品行下方"))
+                if not vals and not note_after:
+                    return _err(ValueError(f"明細 {line_id} 沒有要修改的欄位"))
+                if vals:
+                    ops.append(('update', line_id, vals))
+                if note_after:
+                    # Same sequence, created later (higher id): Odoo orders lines by
+                    # sequence, id, so the note lands right below this line.
+                    ops.append(('add', None, {'display_type': 'line_note', 'name': note_after,
+                                              'sequence': vals.get('sequence', line['sequence']),
+                                              'product_uom_qty': 0}))
                 if 'name' in vals and not line.get('display_type'):
                     pid = vals.get('product_id') or (line['product_id'][0] if line.get('product_id') else None)
                     name_checks.append({'label': f"第 {n} 個操作（明細 {line_id}）", 'product_id': pid, 'name': vals['name']})
@@ -6053,9 +6213,10 @@ def update_quotation_lines(quotation_id: int, line_updates: List[Dict], dry_run:
             return _ok({'error': '檢查未通過，未做任何修改', 'details': errors})
         if dry_run:
             return _ok({'status': 'dry_run', 'quotation': so['name'], 'message': '檢查通過；未寫入',
+                        'warnings': warnings,
                         'operations': [{'action': a, 'line_id': i, 'fields': v} for a, i, v in ops]})
 
-        results, warnings = [], []
+        results = []
         for action, line_id, vals in ops:
             if action == 'add':
                 new_id = _wcall('sale.order.line', 'create', [{**vals, 'order_id': quotation_id}], company_id=company_id)
@@ -6361,21 +6522,27 @@ def _fetch_report_pdf(report_name: str, record_id: int) -> bytes:
     return r.content
 
 
-def download_quotation_pdf(quotation_id: int, report: str = 'quotation', ctx: Context = None) -> str:
+def download_quotation_pdf(quotation_id: int, report: str = 'quotation', return_mode: str = 'url',
+                           ctx: Context = None) -> str:
     """Get a quotation / sales order as PDF.
 
     Args:
         quotation_id: Quotation ID
         report: 'quotation' (報價單, sale.report_saleorder) or
                 'pro_forma' (預開發票／對帳單, sale.report_saleorder_pro_forma)
+        return_mode: 'url' (default), 'base64' (file content in the reply), or 'text'
+                (the PDF's text, for clients that cannot read PDF). For line items as data,
+                get_quotation_details is usually better.
 
     Returns:
-        HTTP transports: a download link valid for 15 minutes (no API key needed; fetch it
-        with curl -o). stdio: the path of the saved file.
+        url: HTTP transports give a download link valid for 15 minutes (no API key needed;
+        fetch it with curl -o); stdio gives the path of the saved file.
     """
     try:
         if report not in PDF_REPORTS:
             return _err(ValueError(f"report 只能是 {' / '.join(PDF_REPORTS)}"))
+        if return_mode not in ('url', 'base64', 'text'):
+            return _err(ValueError("return_mode 只能是 url / base64 / text"))
         so = _wcall('sale.order', 'read', [[quotation_id]], {'fields': ['name', 'partner_id']})
         if not so:
             return _err(ValueError(f"找不到報價單 {quotation_id}"))
@@ -6385,6 +6552,16 @@ def download_quotation_pdf(quotation_id: int, report: str = 'quotation', ctx: Co
         filename = f"{safe}{'_proforma' if report == 'pro_forma' else ''}.pdf"
         info = {'quotation': so['name'], 'report': report, 'filename': filename, 'size': len(pdf),
                 'sha256': hashlib.sha256(pdf).hexdigest()}
+
+        if return_mode == 'base64':
+            info['content_base64'] = base64.b64encode(pdf).decode()
+            return _ok(info)
+        if return_mode == 'text':
+            r = subprocess.run(['pdftotext', '-layout', '-', '-'], input=pdf, capture_output=True, timeout=60)
+            if r.returncode != 0:
+                return _err(RuntimeError(f"pdftotext failed: {r.stderr.decode(errors='replace')[:200]}"))
+            info['text'] = r.stdout.decode('utf-8', errors='replace')
+            return _ok(info)
 
         if _http_mode:
             now = time.time()
@@ -6651,11 +6828,797 @@ async def _serve_pdf(request):
                     headers={'Content-Disposition': f'attachment; filename="{item["filename"]}"'})
 
 
+_PRODUCT_TYPES = {'consu': 'consu', 'goods': 'consu', 'product': 'consu', 'storable': 'consu',
+                  'service': 'service', 'serv': 'service', 'combo': 'combo'}
+_PRODUCT_FIELDS = ['name', 'display_name', 'default_code', 'type', 'categ_id', 'uom_id', 'uom_po_id',
+                   'sale_ok', 'purchase_ok', 'list_price', 'standard_price', 'taxes_id',
+                   'supplier_taxes_id', 'company_id', 'description_sale', 'active', 'product_tmpl_id']
+
+
+def _tax_ids(value, use: str, company_id: Optional[int], label: str) -> List[int]:
+    """Normalise 23 / [23] / [] and check each tax is a <use> tax of the company."""
+    if value is None:
+        return []
+    ids = [value] if isinstance(value, (int, str)) and not isinstance(value, bool) else list(value)
+    ids = [int(t) for t in ids if t not in (None, '', 0, False)]
+    if not ids:
+        return []
+    taxes = {t['id']: t for t in _wcall('account.tax', 'read', [ids],
+                                         {'fields': ['name', 'type_tax_use', 'company_id', 'active']})}
+    for t in ids:
+        tax = taxes.get(t)
+        if not tax:
+            raise ValueError(f"{label}：稅別 {t} 不存在")
+        if tax['type_tax_use'] != use:
+            raise ValueError(f"{label}：稅別 {t}「{tax['name']}」是 {tax['type_tax_use']}，不是 {use}")
+        if company_id and tax['company_id'] and tax['company_id'][0] != company_id:
+            raise ValueError(f"{label}：稅別 {t}「{tax['name']}」屬於公司 {tax['company_id'][0]}，不是 {company_id}")
+    return ids
+
+
+def _product_summary(product_id: int) -> Dict:
+    p = _wcall('product.product', 'read', [[product_id]], {'fields': _PRODUCT_FIELDS})[0]
+    flat = lambda v: v[1] if isinstance(v, list) and len(v) == 2 and isinstance(v[0], int) else v
+    out = {k: flat(p[k]) for k in _PRODUCT_FIELDS if k not in ('product_tmpl_id', 'taxes_id', 'supplier_taxes_id')}
+    out.update({'id': p['id'], 'product_tmpl_id': p['product_tmpl_id'][0],
+                'company_id': p['company_id'][0] if p['company_id'] else False,
+                'company': p['company_id'][1] if p['company_id'] else None,
+                'taxes_id': p['taxes_id'], 'supplier_taxes_id': p['supplier_taxes_id'],
+                'odoo_url': _generate_product_url(p['id'])})
+    return out
+
+
+def create_product(name: str, list_price: float, description_sale: Optional[str] = None,
+                   type: str = 'consu', default_code: Optional[str] = None,
+                   categ_id: int = 1, uom_id: int = 1, uom_po_id: Optional[int] = None,
+                   sale_ok: bool = True, purchase_ok: bool = True, standard_price: float = 0.0,
+                   taxes_id: Optional[Union[int, List[int]]] = None,
+                   supplier_taxes_id: Optional[Union[int, List[int]]] = None,
+                   company_id: Optional[int] = None, allow_duplicate: bool = False,
+                   dry_run: bool = False, ctx: Context = None) -> str:
+    """Create a product (product.template plus its product.product variant) so quotation
+    lines can link to it and carry its taxes.
+
+    Args:
+        name: Product name (zh_TW). It becomes the first line every quotation line must start
+              with, so use the exact catalogue name. With default_code the line name is
+              "[CODE] name".
+        list_price: Sales price
+        description_sale: Multi-line sales description; quotation lines show it below the name
+        type: 'consu' (goods, default) or 'service'
+        default_code: Internal reference / part number (optional)
+        categ_id: Product category ID (default 1, "All")
+        uom_id: Unit of measure ID (default 1, 單位); uom_po_id defaults to the same
+        sale_ok, purchase_ok: Can be sold / purchased (default both True)
+        standard_price: Cost (default 0)
+        taxes_id: Sales tax ID(s), e.g. 23. Default: the site default sales tax.
+        supplier_taxes_id: Purchase tax ID(s), e.g. 24. Default: the site default purchase tax.
+        company_id: Owning company. Default: the site default company.
+        allow_duplicate: Create even if an active or archived product has the same name or code
+        dry_run: Validate and show the values; nothing is written
+
+    Returns:
+        id (product.product, use it on quotation lines), product_tmpl_id, display_name,
+        company, taxes and odoo_url.
+    """
+    try:
+        name = (name or '').strip()
+        if not name or '\n' in name:
+            return _err(ValueError('name 必填，且只能一行；規格請放 description_sale'))
+        ptype = _PRODUCT_TYPES.get((type or '').strip().lower())
+        if not ptype:
+            return _err(ValueError(f"type 只能是 consu（商品）或 service（服務），收到 {type!r}"))
+        if list_price is None or float(list_price) < 0:
+            return _err(ValueError('list_price 必填且不可為負數'))
+        company_id = company_id or DEFAULT_COMPANY_ID
+        sale_taxes = _tax_ids(taxes_id if taxes_id is not None else DEFAULT_SALE_TAX_IDS,
+                              'sale', company_id, 'taxes_id')
+        purchase_taxes = _tax_ids(supplier_taxes_id if supplier_taxes_id is not None else DEFAULT_PURCHASE_TAX_IDS,
+                                  'purchase', company_id, 'supplier_taxes_id')
+        if sale_ok and not sale_taxes:
+            return _err(ValueError('可銷售的產品需要銷售稅（taxes_id），否則報價單會是 0 稅'
+                                   + ('；本站沒有設定預設銷售稅 ODOO_DEFAULT_SALE_TAX_IDS，請傳 taxes_id' if taxes_id is None
+                                      else '；免稅品請用免稅稅別的 ID')))
+        for model, rid, label in (('product.category', categ_id, 'categ_id'), ('uom.uom', uom_id, 'uom_id'),
+                                  ('uom.uom', uom_po_id or uom_id, 'uom_po_id')):
+            if not _wcall(model, 'search', [[['id', '=', rid]]], {'limit': 1}):
+                return _err(ValueError(f"{label} {rid} 不存在"))
+
+        dup_domain = ['|', ['name', '=', name], ['default_code', '=', default_code]] if default_code \
+            else [['name', '=', name]]
+        dups = _wcall('product.product', 'search_read',
+                      [dup_domain + ['|', ['active', '=', True], ['active', '=', False]]],
+                      {'fields': ['display_name', 'active', 'company_id'], 'limit': 5})
+        if dups and not allow_duplicate:
+            return _ok({'error': '已有同名或同料號的產品，未建立',
+                        'existing': [{'id': d['id'], 'display_name': d['display_name'], 'active': d['active'],
+                                      'company': d['company_id'][1] if d['company_id'] else None,
+                                      'odoo_url': _generate_product_url(d['id'])} for d in dups],
+                        'hint': '用既有產品，或已封存的用 update_product(active=True) 取回；確定要另建請加 allow_duplicate=True'})
+
+        vals = {'name': name, 'type': ptype, 'categ_id': categ_id, 'uom_id': uom_id,
+                'uom_po_id': uom_po_id or uom_id, 'sale_ok': bool(sale_ok), 'purchase_ok': bool(purchase_ok),
+                'list_price': float(list_price), 'standard_price': float(standard_price or 0),
+                'taxes_id': [(6, 0, sale_taxes)], 'supplier_taxes_id': [(6, 0, purchase_taxes)],
+                'company_id': company_id or False}
+        if description_sale:
+            vals['description_sale'] = description_sale.strip('\n')
+        if default_code:
+            vals['default_code'] = default_code.strip()
+        if dry_run:
+            return _ok({'status': 'dry_run', 'message': '檢查通過；未建立。拿掉 dry_run 即建立',
+                        'would_create': {**vals, 'taxes_id': sale_taxes, 'supplier_taxes_id': purchase_taxes},
+                        'duplicates_ignored': [d['id'] for d in dups]})
+
+        tmpl_id = _wcall('product.template', 'create', [vals], company_id=company_id)
+        variant = _wcall('product.product', 'search', [[['product_tmpl_id', '=', tmpl_id]]], {'limit': 1})
+        cache.clear()
+        product = _product_summary(variant[0])
+        _audit(ctx, 'create_product', 'product.template', tmpl_id,
+               {**vals, 'taxes_id': sale_taxes, 'supplier_taxes_id': purchase_taxes}, product['display_name'])
+        return _ok({'status': 'created', 'product': product,
+                    'quote_line_name': product['display_name'],
+                    'note': '報價明細的 name 第一行要逐字等於 quote_line_name'})
+    except Exception as e:
+        return _err(e, name=name)
+
+
+_PRODUCT_EDITABLE = ('name', 'description_sale', 'list_price', 'standard_price', 'default_code',
+                     'categ_id', 'sale_ok', 'purchase_ok', 'active')
+
+
+def update_product(product_id: int, name: Optional[str] = None, description_sale: Optional[str] = None,
+                   list_price: Optional[float] = None, standard_price: Optional[float] = None,
+                   taxes_id: Optional[Union[int, List[int]]] = None,
+                   supplier_taxes_id: Optional[Union[int, List[int]]] = None,
+                   default_code: Optional[str] = None, categ_id: Optional[int] = None,
+                   sale_ok: Optional[bool] = None, purchase_ok: Optional[bool] = None,
+                   active: Optional[bool] = None, dry_run: bool = False, ctx: Context = None) -> str:
+    """Change a product. Only the arguments you pass are changed; the change applies to the
+    product template, so every variant and future quotation line uses it.
+
+    Args:
+        product_id: product.product ID (the id used on quotation lines; from search_products)
+        name: New name (zh_TW). Existing quotation lines keep their own text.
+        description_sale: New sales description (replaces the old one)
+        list_price, standard_price: Sales price / cost
+        taxes_id: Sales tax ID(s), e.g. 23 or [23]
+        supplier_taxes_id: Purchase tax ID(s), e.g. 24
+        default_code: Internal reference ("" clears it)
+        categ_id: Product category ID
+        sale_ok, purchase_ok: Can be sold / purchased
+        active: False archives the product, True restores it
+        dry_run: Show before/after without writing
+
+    Returns:
+        The values before and after for every changed field.
+    """
+    try:
+        found = _wcall('product.product', 'search_read',
+                       [[['id', '=', product_id], '|', ['active', '=', True], ['active', '=', False]]],
+                       {'fields': _PRODUCT_FIELDS})
+        if not found:
+            return _err(ValueError(f"產品 {product_id} 不存在"))
+        before = found[0]
+        company_id = before['company_id'][0] if before['company_id'] else None
+        vals = {k: v for k, v in (('name', name), ('description_sale', description_sale),
+                                  ('list_price', list_price), ('standard_price', standard_price),
+                                  ('default_code', default_code), ('categ_id', categ_id),
+                                  ('sale_ok', sale_ok), ('purchase_ok', purchase_ok), ('active', active))
+                if v is not None}
+        if 'name' in vals:
+            vals['name'] = vals['name'].strip()
+            if not vals['name'] or '\n' in vals['name']:
+                return _err(ValueError('name 不可空白，且只能一行'))
+        if 'default_code' in vals:
+            vals['default_code'] = vals['default_code'].strip() or False
+        if 'description_sale' in vals:
+            vals['description_sale'] = vals['description_sale'].strip('\n') or False
+        if taxes_id is not None:
+            vals['taxes_id'] = [(6, 0, _tax_ids(taxes_id, 'sale', company_id, 'taxes_id'))]
+        if supplier_taxes_id is not None:
+            vals['supplier_taxes_id'] = [(6, 0, _tax_ids(supplier_taxes_id, 'purchase', company_id, 'supplier_taxes_id'))]
+        if not vals:
+            return _err(ValueError('沒有要修改的欄位'))
+        planned = {k: ({'before': before[k], 'after': v[0][2]} if k in ('taxes_id', 'supplier_taxes_id')
+                       else {'before': before[k][1] if isinstance(before[k], list) and len(before[k]) == 2 else before[k],
+                             'after': v})
+                   for k, v in vals.items()}
+        planned = {k: v for k, v in planned.items() if v['before'] != v['after']}
+        if dry_run:
+            return _ok({'status': 'dry_run', 'product': before['display_name'], 'changes': planned})
+        tmpl_id = before['product_tmpl_id'][0]
+        _wcall('product.template', 'write', [[tmpl_id], vals], company_id=company_id)
+        cache.clear()
+        after = _product_summary(product_id)
+        changes = {k: {'before': planned[k]['before'], 'after': after.get(k)} for k in planned
+                   if planned[k]['before'] != after.get(k)}
+        _audit(ctx, 'update_product', 'product.template', tmpl_id, changes, after['display_name'])
+        return _ok({'status': 'updated' if changes else 'unchanged', 'product': after, 'changes': changes})
+    except Exception as e:
+        return _err(e, product_id=product_id)
+
+
+_INVOICE_TYPES = ('out_invoice', 'out_refund')
+_INVOICE_FIELDS = ['name', 'state', 'move_type', 'partner_id', 'invoice_date', 'invoice_date_due', 'date',
+                   'currency_id', 'invoice_payment_term_id', 'user_id', 'company_id', 'journal_id',
+                   'ref', 'invoice_origin', 'amount_untaxed', 'amount_tax', 'amount_total',
+                   'amount_residual', 'payment_state', 'invoice_line_ids']
+
+
+def _today_local() -> str:
+    return datetime.now().strftime('%Y-%m-%d')
+
+
+def _check_date(value: Optional[str], label: str) -> Optional[str]:
+    if value in (None, ''):
+        return None
+    try:
+        return datetime.strptime(value.strip()[:10], '%Y-%m-%d').strftime('%Y-%m-%d')
+    except ValueError:
+        raise ValueError(f"{label} 要是 YYYY-MM-DD，收到 {value!r}")
+
+
+def _find_invoice(invoice_id: Optional[int], invoice_number: Optional[str]) -> Dict:
+    if invoice_id:
+        domain = [['id', '=', invoice_id]]
+    elif invoice_number:
+        domain = [['name', '=', invoice_number.strip()]]
+    else:
+        raise ValueError('需要 invoice_id 或 invoice_number')
+    found = _wcall('account.move', 'search_read', [domain], {'fields': _INVOICE_FIELDS, 'limit': 2})
+    if not found:
+        raise ValueError(f"找不到發票 {invoice_id or invoice_number}")
+    inv = found[0]
+    if inv['move_type'] not in _INVOICE_TYPES:
+        raise ValueError(f"{inv['name']} 是 {inv['move_type']}，這裡只處理客戶發票與折讓（out_invoice / out_refund）")
+    return inv
+
+
+def _read_invoice(move_id: int) -> Dict:
+    inv = _wcall('account.move', 'read', [[move_id]], {'fields': _INVOICE_FIELDS})[0]
+    lines = _wcall('account.move.line', 'read', [inv['invoice_line_ids']],
+                   {'fields': ['name', 'product_id', 'quantity', 'price_unit', 'discount', 'tax_ids',
+                               'price_subtotal', 'display_type', 'sequence']}) if inv['invoice_line_ids'] else []
+    flat = lambda v: v[1] if isinstance(v, list) and len(v) == 2 else v
+    return {
+        'id': inv['id'], 'name': inv['name'], 'state': inv['state'], 'move_type': inv['move_type'],
+        'partner': flat(inv['partner_id']), 'partner_id': inv['partner_id'][0] if inv['partner_id'] else None,
+        'invoice_date': inv['invoice_date'], 'due_date': inv['invoice_date_due'],
+        'currency': flat(inv['currency_id']), 'payment_term': flat(inv['invoice_payment_term_id']) or None,
+        'salesperson': flat(inv['user_id']) or None, 'company_id': inv['company_id'][0] if inv['company_id'] else None,
+        'journal': flat(inv['journal_id']), 'ref': inv['ref'] or None, 'invoice_origin': inv['invoice_origin'] or None,
+        'amount_untaxed': inv['amount_untaxed'], 'amount_tax': inv['amount_tax'], 'amount_total': inv['amount_total'],
+        'amount_residual': inv['amount_residual'], 'payment_state': inv['payment_state'],
+        'lines': [{'line_id': l['id'], 'product_id': l['product_id'][0] if l['product_id'] else None,
+                   'product': flat(l['product_id']) or None, 'description': l['name'],
+                   'quantity': l['quantity'], 'unit_price': l['price_unit'], 'discount': l['discount'],
+                   'tax_ids': l['tax_ids'], 'subtotal': l['price_subtotal']}
+                  if l['display_type'] not in ('line_note', 'line_section')
+                  else {'line_id': l['id'], 'type': l['display_type'], 'text': l['name']}
+                  for l in sorted(lines, key=lambda x: x['sequence'])],
+        'odoo_url': _generate_record_url(inv['id'], 'account.move'),
+    }
+
+
+def duplicate_invoice(invoice_id: Optional[int] = None, invoice_number: Optional[str] = None,
+                      invoice_date: Optional[str] = None, due_date: Optional[str] = None,
+                      dry_run: bool = False, ctx: Context = None) -> str:
+    """Copy a customer invoice into a new draft - the usual way to bill a recurring charge.
+    Customer, currency, salesperson, payment terms and every line (product, description,
+    quantity, price, taxes) are kept; only the dates change. The draft gets its number when
+    posted (post_invoice).
+
+    Args:
+        invoice_id: Source invoice ID; or give invoice_number
+        invoice_number: Source invoice number, e.g. "INV/2026/0010"
+        invoice_date: Date of the new invoice, YYYY-MM-DD (default: today)
+        due_date: Due date. Default: with a payment term Odoo computes it from the term;
+                  without one it keeps the source's gap between invoice date and due date
+                  (same day when the source was due on its invoice date).
+        dry_run: Show the source and the dates that would be used; nothing is written
+
+    Returns:
+        The new draft: id, name ("/" until posted), dates, amounts, lines, odoo_url.
+    """
+    try:
+        src = _find_invoice(invoice_id, invoice_number)
+        new_date = _check_date(invoice_date, 'invoice_date') or _today_local()
+        due = _check_date(due_date, 'due_date')
+        default = {'invoice_date': new_date, 'date': new_date}
+        if due:
+            if due < new_date:
+                return _err(ValueError(f"due_date {due} 早於 invoice_date {new_date}"))
+            default['invoice_date_due'] = due
+            default['invoice_payment_term_id'] = False
+            due_rule = '指定的到期日（不套用付款條件）'
+        elif src['invoice_payment_term_id']:
+            due_rule = f"依付款條件「{src['invoice_payment_term_id'][1]}」計算"
+        else:
+            gap = 0
+            if src['invoice_date'] and src['invoice_date_due']:
+                gap = (datetime.strptime(src['invoice_date_due'], '%Y-%m-%d')
+                       - datetime.strptime(src['invoice_date'], '%Y-%m-%d')).days
+            due = (datetime.strptime(new_date, '%Y-%m-%d') + timedelta(days=max(gap, 0))).strftime('%Y-%m-%d')
+            default['invoice_date_due'] = due
+            due_rule = f"與來源相同，發票日後 {max(gap, 0)} 天"
+        source = _read_invoice(src['id'])
+        if dry_run:
+            return _ok({'status': 'dry_run', 'message': '檢查通過；未建立。拿掉 dry_run 即建立草稿',
+                        'source': {k: source[k] for k in ('id', 'name', 'state', 'partner', 'invoice_date', 'due_date',
+                                                          'amount_total', 'currency', 'lines')},
+                        'new_invoice_date': new_date, 'new_due_date': due or '（由付款條件計算）', 'due_rule': due_rule})
+        company_id = src['company_id'][0] if src['company_id'] else None
+        new_id = _wcall('account.move', 'copy', [[src['id']]], {'default': default}, company_id=company_id)
+        if isinstance(new_id, list):
+            new_id = new_id[0]
+        cache.clear()
+        result = _read_invoice(new_id)
+        warnings = []
+        if len([l for l in result['lines'] if 'product_id' in l]) != len([l for l in source['lines'] if 'product_id' in l]):
+            warnings.append('新草稿的明細數與來源不同，請檢查')
+        if abs(result['amount_total'] - source['amount_total']) > 0.005:
+            warnings.append(f"金額與來源不同：{source['amount_total']} → {result['amount_total']}")
+        _audit(ctx, 'duplicate_invoice', 'account.move', new_id,
+               {'source': source['name'], 'invoice_date': new_date, 'due_date': result['due_date']},
+               f"{result['name']} (copy of {source['name']})")
+        return _ok({'status': 'created', 'source': source['name'], 'due_rule': due_rule,
+                    'warnings': warnings, 'invoice': result})
+    except Exception as e:
+        return _err(e, invoice_id=invoice_id, invoice_number=invoice_number)
+
+
+def create_invoice(partner_id: int, lines: List[Dict], invoice_date: Optional[str] = None,
+                   due_date: Optional[str] = None, currency_id: Optional[int] = None,
+                   payment_term_id: Optional[int] = None, ref: Optional[str] = None,
+                   invoice_origin: Optional[str] = None, user_id: Optional[int] = None,
+                   company_id: Optional[int] = None, dry_run: bool = False, ctx: Context = None) -> str:
+    """Create a draft customer invoice. To repeat an earlier invoice, duplicate_invoice is
+    simpler and keeps its exact lines.
+
+    Args:
+        partner_id: Customer ID
+        lines: [{"product_id": 172, "name": "description", "quantity": 1, "price_unit": 10000,
+                 "discount": 0, "tax_ids": [23]}, ...]. product_id is optional (free-text line);
+               a product line without tax_ids gets the product's taxes, a free-text line gets
+               none. "unit_price" is accepted for price_unit, "qty" for quantity, "tax_id"
+               for tax_ids. {"display_type": "line_note"|"line_section", "name": "text"} adds
+               a note / section.
+        invoice_date: YYYY-MM-DD (default: today)
+        due_date: YYYY-MM-DD. Without it Odoo uses the payment term, or the invoice date.
+        currency_id: Currency ID (default: the company currency)
+        payment_term_id: Payment term ID
+        ref: Customer reference
+        invoice_origin: Source document text
+        user_id: Salesperson (default: the site default salesperson)
+        company_id: Company (default: the site default company)
+        dry_run: Validate and show the values; nothing is written
+
+    Returns:
+        The new draft: id, name ("/" until posted), amounts untaxed / tax / total, odoo_url.
+    """
+    try:
+        partner = _wcall('res.partner', 'read', [[partner_id]], {'fields': ['display_name', 'company_id']})
+        if not partner:
+            return _err(ValueError(f"客戶 {partner_id} 不存在"))
+        company_id = company_id or DEFAULT_COMPANY_ID
+        if not lines:
+            return _err(ValueError('lines 至少要一行'))
+        inv_date = _check_date(invoice_date, 'invoice_date') or _today_local()
+        due = _check_date(due_date, 'due_date')
+        if due and due < inv_date:
+            return _err(ValueError(f"due_date {due} 早於 invoice_date {inv_date}"))
+        vals_lines, warnings = [], []
+        for n, spec in enumerate(lines, 1):
+            spec = dict(spec)
+            for a, b in (('unit_price', 'price_unit'), ('qty', 'quantity'), ('product_uom_qty', 'quantity'),
+                         ('tax_id', 'tax_ids'), ('taxes_id', 'tax_ids')):
+                if a in spec and b not in spec:
+                    spec[b] = spec.pop(a)
+            dt = spec.get('display_type')
+            if dt:
+                if dt not in ('line_note', 'line_section') or not spec.get('name'):
+                    return _err(ValueError(f"第 {n} 行：display_type 只能是 line_note／line_section，且要有 name"))
+                vals_lines.append({'display_type': dt, 'name': spec['name']})
+                continue
+            if not spec.get('product_id') and not spec.get('name'):
+                return _err(ValueError(f"第 {n} 行：要有 product_id 或 name"))
+            v = {k: spec[k] for k in ('product_id', 'name', 'quantity', 'price_unit', 'discount')
+                 if spec.get(k) is not None}
+            v.setdefault('quantity', 1)
+            if 'tax_ids' in spec and spec['tax_ids'] is not None:
+                v['tax_ids'] = [(6, 0, _tax_ids(spec['tax_ids'], 'sale', company_id, f"第 {n} 行 tax_ids"))]
+            elif not spec.get('product_id'):
+                warnings.append(f"第 {n} 行是自由文字且未給 tax_ids，不會有稅")
+            vals_lines.append(v)
+        errors = _check_products([v.get('product_id') for v in vals_lines], company_id) if company_id else []
+        if errors:
+            return _ok({'error': '檢查未通過，未建立', 'details': errors})
+        vals = {'move_type': 'out_invoice', 'partner_id': partner_id, 'invoice_date': inv_date,
+                'invoice_line_ids': [(0, 0, v) for v in vals_lines]}
+        for k, v in (('invoice_date_due', due), ('currency_id', currency_id),
+                     ('invoice_payment_term_id', payment_term_id), ('ref', ref),
+                     ('invoice_origin', invoice_origin), ('user_id', user_id or DEFAULT_SALESPERSON_ID),
+                     ('company_id', company_id)):
+            if v:
+                vals[k] = v
+        if dry_run:
+            return _ok({'status': 'dry_run', 'message': '檢查通過；未建立。拿掉 dry_run 即建立草稿',
+                        'partner': partner[0]['display_name'], 'would_create': vals, 'warnings': warnings})
+        new_id = _wcall('account.move', 'create', [vals], company_id=company_id)
+        cache.clear()
+        result = _read_invoice(new_id)
+        _audit(ctx, 'create_invoice', 'account.move', new_id, vals, result['partner'])
+        return _ok({'status': 'created', 'warnings': warnings, 'invoice': result})
+    except Exception as e:
+        return _err(e, partner_id=partner_id)
+
+
+def post_invoice(invoice_id: Optional[int] = None, invoice_number: Optional[str] = None,
+                 confirm: bool = False, ctx: Context = None) -> str:
+    """Post (validate) a draft customer invoice: it gets its number (INV/YYYY/NNNN) and its
+    journal entries. Without confirm=True only shows what would be posted.
+
+    Args:
+        invoice_id: Draft invoice ID; or invoice_number
+        invoice_number: Invoice number (drafts show "/", so use the ID for them)
+        confirm: Must be True to post
+
+    Notes:
+        A posted invoice can be set back to draft (draft_invoice) but keeps its number.
+        This Odoo has no e-invoice upload module; posting only books the invoice.
+    """
+    try:
+        inv = _find_invoice(invoice_id, invoice_number)
+        if inv['state'] != 'draft':
+            return _err(ValueError(f"{inv['name']} 狀態為 {inv['state']}，只有 draft 可以過帳"))
+        current = _read_invoice(inv['id'])
+        if not confirm:
+            return _ok({'status': 'preview', 'message': '確認後以 confirm=True 過帳；過帳後會取得正式單號',
+                        'invoice': current})
+        company_id = inv['company_id'][0] if inv['company_id'] else None
+        _wcall('account.move', 'action_post', [[inv['id']]], company_id=company_id)
+        cache.clear()
+        result = _read_invoice(inv['id'])
+        _audit(ctx, 'post_invoice', 'account.move', inv['id'], {'from': 'draft', 'to': result['state']}, result['name'])
+        return _ok({'status': 'posted', 'invoice': result})
+    except Exception as e:
+        return _err(e, invoice_id=invoice_id, invoice_number=invoice_number)
+
+
+def draft_invoice(invoice_id: Optional[int] = None, invoice_number: Optional[str] = None,
+                  confirm: bool = False, ctx: Context = None) -> str:
+    """Set a posted customer invoice back to draft so it can be corrected. It keeps its
+    number. Refused when payments are reconciled with it. Without confirm=True only shows
+    what would change.
+
+    Args:
+        invoice_id: Invoice ID; or invoice_number
+        invoice_number: Invoice number, e.g. "INV/2026/0011"
+        confirm: Must be True to reset
+    """
+    try:
+        inv = _find_invoice(invoice_id, invoice_number)
+        if inv['state'] != 'posted':
+            return _err(ValueError(f"{inv['name']} 狀態為 {inv['state']}，只有 posted 可以設回草稿"))
+        if inv['payment_state'] not in ('not_paid', False, None):
+            return _err(ValueError(f"{inv['name']} 付款狀態為 {inv['payment_state']}，有收款紀錄時請先在 Odoo 取消對帳"))
+        current = _read_invoice(inv['id'])
+        if not confirm:
+            return _ok({'status': 'preview', 'message': '確認後以 confirm=True 設回草稿（單號保留）', 'invoice': current})
+        company_id = inv['company_id'][0] if inv['company_id'] else None
+        _wcall('account.move', 'button_draft', [[inv['id']]], company_id=company_id)
+        cache.clear()
+        result = _read_invoice(inv['id'])
+        _audit(ctx, 'draft_invoice', 'account.move', inv['id'], {'from': 'posted', 'to': result['state']}, result['name'])
+        return _ok({'status': 'reset_to_draft', 'invoice': result})
+    except Exception as e:
+        return _err(e, invoice_id=invoice_id, invoice_number=invoice_number)
+
+
+# ─── Delivery orders ───
+
+_DELIVERY_FIELDS = ['name', 'state', 'picking_type_code', 'partner_id', 'scheduled_date', 'date_done', 'origin',
+                    'note', 'user_id', 'priority', 'sale_id', 'company_id', 'location_id', 'location_dest_id',
+                    'picking_type_id']
+_DELIVERY_MOVE_FIELDS = ['product_id', 'name', 'description_picking', 'product_uom_qty', 'quantity', 'product_uom',
+                         'state', 'sale_line_id', 'sequence']
+_DELIVERY_DONE_EDITABLE = ('note', 'user_id')  # Odoo locks the rest once the goods have left
+_DELIVERY_LINE_KEYS = {'product_id', 'qty', 'product_uom_qty', 'quantity', 'description_picking', 'sequence'}
+_DELIVERY_LINE_HINTS = {
+    'name': '出貨單上的描述請用 description_picking', 'description': '描述請用 description_picking',
+    'product': '請用 product_id', 'product_qty': '需求量請用 qty', 'demand': '需求量請用 qty',
+    'done_qty': '完成量請用 quantity', 'quantity_done': '完成量請用 quantity', 'price_unit': '出貨單沒有單價',
+}
+
+
+def _read_delivery(picking_id: int) -> Dict:
+    """Read back a delivery the way a person checks it: dates in local time, full line text."""
+    found = _wcall('stock.picking', 'read', [[picking_id]], {'fields': _DELIVERY_FIELDS})
+    if not found:
+        raise ValueError(f"出貨單 {picking_id} 不存在")
+    p = found[0]
+    moves = _wcall('stock.move', 'search_read', [[['picking_id', '=', picking_id]]],
+                   {'fields': _DELIVERY_MOVE_FIELDS, 'order': 'sequence, id'})
+    return {
+        'id': picking_id, 'name': p['name'], 'state': p['state'],
+        'partner': _m2o(p['partner_id']), 'scheduled_date': _utc_to_local(p['scheduled_date']),
+        'date_done': _utc_to_local(p['date_done']), 'origin': p['origin'] or None,
+        'note': _html_to_text(p['note']) or None, 'user': _m2o(p['user_id']), 'priority': p['priority'],
+        'sale_order': _m2o(p['sale_id']), 'odoo_url': _generate_delivery_order_url(picking_id),
+        'lines': [{'line_id': m['id'], 'product': _m2o(m['product_id']), 'description': m['description_picking'] or m['name'],
+                   'qty': m['product_uom_qty'], 'quantity': m['quantity'],
+                   'uom': m['product_uom'][1] if m['product_uom'] else None, 'state': m['state'],
+                   'sequence': m['sequence'], 'sale_line_id': m['sale_line_id'][0] if m['sale_line_id'] else None}
+                  for m in moves],
+    }
+
+
+def _editable_delivery(picking_id: int) -> Dict:
+    found = _wcall('stock.picking', 'read', [[picking_id]], {'fields': _DELIVERY_FIELDS})
+    if not found:
+        raise ValueError(f"出貨單 {picking_id} 不存在")
+    p = found[0]
+    if p['picking_type_code'] != 'outgoing':
+        raise ValueError(f"{p['name']} 不是出貨單（類型 {p['picking_type_code']}），這支工具只改出貨單")
+    if p['state'] == 'cancel':
+        raise ValueError(f"{p['name']} 已取消，不能修改")
+    return p
+
+
+def _local_to_utc(value: str, current_utc: Optional[str], label: str) -> str:
+    """'YYYY-MM-DD HH:MM[:SS]' in local time -> Odoo's UTC string. A date alone keeps the
+    current time of day, so moving a delivery to another day does not reset it to midnight."""
+    from datetime import timezone as _tz
+    text = value.strip().replace('T', ' ')
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            local = datetime.strptime(text, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        raise ValueError(f"{label} 要是 YYYY-MM-DD 或 YYYY-MM-DD HH:MM（本地時間），收到 {value!r}")
+    if fmt == '%Y-%m-%d' and current_utc:
+        cur = datetime.strptime(str(current_utc)[:19], '%Y-%m-%d %H:%M:%S').replace(tzinfo=_tz.utc).astimezone()
+        local = local.replace(hour=cur.hour, minute=cur.minute, second=cur.second)
+    return local.astimezone(_tz.utc).strftime('%Y-%m-%d %H:%M:%S')
+
+
+def update_delivery_order(delivery_id: int, scheduled_date: Optional[str] = None, partner_id: Optional[int] = None,
+                          origin: Optional[str] = None, note: Optional[str] = None, user_id: Optional[int] = None,
+                          priority: Optional[str] = None, dry_run: bool = False, ctx: Context = None) -> str:
+    """Change the header of a delivery order (stock picking of type outgoing). Only the
+    arguments you pass are changed. It does not validate the delivery or move any stock.
+
+    On a delivery already done only note and user_id can change; a cancelled one is refused.
+
+    Args:
+        delivery_id: Delivery order ID (from search_delivery_orders)
+        scheduled_date: Local time, YYYY-MM-DD HH:MM. A date alone keeps the current time of day.
+        partner_id: Delivery address. The linked sales order keeps its own customer (warned).
+        origin: Source document ("" clears it)
+        note: Internal note field on the delivery ("" clears it); plain text keeps its line breaks
+        user_id: Responsible user
+        priority: "0" normal, "1" urgent
+        dry_run: Show before/after without writing
+
+    Returns:
+        The values before and after for every changed field, warnings, and the delivery as read back.
+    """
+    try:
+        p = _editable_delivery(delivery_id)
+        company_id = p['company_id'][0]
+        vals, warnings = {}, []
+        if scheduled_date is not None:
+            vals['scheduled_date'] = _local_to_utc(scheduled_date, p['scheduled_date'], 'scheduled_date')
+        if partner_id is not None:
+            found = _wcall('res.partner', 'read', [[partner_id]], {'fields': ['display_name', 'company_id']})
+            if not found:
+                return _err(ValueError(f"客戶 {partner_id} 不存在"))
+            if found[0]['company_id'] and found[0]['company_id'][0] != company_id:
+                return _err(ValueError(f"客戶 {partner_id}「{found[0]['display_name']}」屬於 {found[0]['company_id'][1]}，"
+                                       f"與出貨單的公司不同"))
+            vals['partner_id'] = partner_id
+            if p['sale_id']:
+                warnings.append(f"這張出貨單來自 {p['sale_id'][1]}，銷售訂單上的客戶與送貨地址不會跟著改")
+        if origin is not None:
+            vals['origin'] = origin.strip() or False
+        if note is not None:
+            vals['note'] = _note_html(note) or False
+        if user_id is not None:
+            vals['user_id'] = user_id
+        if priority is not None:
+            if str(priority) not in ('0', '1'):
+                return _err(ValueError('priority 只能是 "0"（一般）或 "1"（緊急）'))
+            vals['priority'] = str(priority)
+        if not vals:
+            return _err(ValueError('沒有要修改的欄位'))
+        if p['state'] == 'done':
+            locked = [k for k in vals if k not in _DELIVERY_DONE_EDITABLE]
+            if locked:
+                return _err(ValueError(f"{p['name']} 已完成，只能改 {'、'.join(_DELIVERY_DONE_EDITABLE)}；"
+                                       f"不能改 {'、'.join(locked)}。未寫入任何資料"))
+        before = _read_delivery(delivery_id)
+        keys = {'scheduled_date': 'scheduled_date', 'partner_id': 'partner', 'origin': 'origin', 'note': 'note',
+                'user_id': 'user', 'priority': 'priority'}
+        if dry_run:
+            planned = {k: {'before': before[keys[k]], 'after': _utc_to_local(v) if k == 'scheduled_date' else v}
+                       for k, v in vals.items()}
+            return _ok({'status': 'dry_run', 'delivery': p['name'], 'message': '檢查通過；未寫入',
+                        'changes': planned, 'warnings': warnings})
+        _wcall('stock.picking', 'write', [[delivery_id], vals], company_id=company_id)
+        cache.clear()
+        after = _read_delivery(delivery_id)
+        changes = {keys[k]: {'before': before[keys[k]], 'after': after[keys[k]]} for k in vals
+                   if before[keys[k]] != after[keys[k]]}
+        _audit(ctx, 'update_delivery_order', 'stock.picking', delivery_id, changes, after['name'])
+        return _ok({'status': 'updated' if changes else 'unchanged', 'changes': changes,
+                    'warnings': warnings, 'delivery': after})
+    except Exception as e:
+        return _err(e, delivery_id=delivery_id)
+
+
+def _delivery_qty(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} 要是數字，收到 {value!r}")
+    try:
+        qty = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} 要是數字，收到 {value!r}")
+    if qty < 0:
+        raise ValueError(f"{label} 不可為負數，收到 {value!r}")
+    return qty
+
+
+def update_delivery_lines(delivery_id: int, line_updates: List[Dict], dry_run: bool = False,
+                          ctx: Context = None) -> str:
+    """Add, change or delete lines (stock moves) of a delivery order that is not done or
+    cancelled. It does not validate the delivery: nothing leaves stock until someone does.
+
+    Args:
+        delivery_id: Delivery order ID
+        line_updates: Operations, applied in order:
+            {"action": "update", "line_id": 216, "qty": 8, "description_picking": "text"}
+            {"action": "add", "product_id": 125, "qty": 2, "description_picking": "text"}
+            {"action": "delete", "line_id": 217}
+            Without "action": an operation with line_id is an update, otherwise an add.
+            "id" is accepted for line_id. line_id comes from get_delivery_order_details
+            or the result of this tool.
+            Fields: qty (or product_uom_qty) = demand, the quantity to deliver;
+            quantity = quantity actually done, which is NOT the demand;
+            description_picking = text printed on the delivery slip; sequence.
+            Any other key is refused and nothing is written. To change a line's product,
+            delete it and add another.
+        dry_run: Validate and list the operations without writing
+
+    Only a draft line can be deleted, as in Odoo; for any other line set qty to 0. Changes do
+    not flow back to the sales order: a line from a sales order gets a warning. Nothing is
+    written if any check fails. If Odoo refuses an operation part way, the result lists what
+    was already applied.
+
+    Returns:
+        Per-operation results, warnings, and the delivery as read back.
+    """
+    try:
+        p = _editable_delivery(delivery_id)
+        if p['state'] == 'done':
+            return _err(ValueError(f"{p['name']} 已完成，明細不能修改。未寫入任何資料"))
+        company_id = p['company_id'][0]
+        existing = _wcall('stock.move', 'search_read', [[['picking_id', '=', delivery_id]]],
+                          {'fields': _DELIVERY_MOVE_FIELDS})
+        by_id = {m['id']: m for m in existing}
+        max_seq = max([m['sequence'] for m in existing] or [0])
+        ops, warnings = [], []
+        if not line_updates:
+            return _err(ValueError('line_updates 是空的'))
+        for n, op in enumerate(line_updates, 1):
+            op = dict(op)
+            if 'line_id' not in op and 'id' in op:
+                op['line_id'] = op.pop('id')
+            action = op.pop('action', None)
+            if action is None:
+                action = 'update' if op.get('line_id') else 'add'
+            action = {'create': 'add', 'edit': 'update', 'remove': 'delete'}.get(action, action)
+            if action not in ('add', 'update', 'delete'):
+                return _err(ValueError(f"第 {n} 個操作：未知的 action {action!r}，只能是 add／update／delete"))
+            line_id = op.pop('line_id', None)
+            line = by_id.get(line_id)
+            if action != 'add' and not line:
+                return _err(ValueError(f"第 {n} 個操作：明細 {line_id} 不屬於出貨單 {p['name']}"))
+            if action == 'delete':
+                if line['state'] != 'draft':
+                    return _err(ValueError(f"第 {n} 個操作：明細 {line_id} 狀態是 {line['state']}，Odoo 只能刪除草稿明細；"
+                                           f"不要出貨請把 qty 設成 0。未寫入任何資料"))
+                ops.append(('delete', line_id, None, None))
+                continue
+            unknown = [k for k in op if k not in _DELIVERY_LINE_KEYS]
+            if unknown:
+                msgs = [f"{k!r}" + (f"（{_DELIVERY_LINE_HINTS[k]}）" if k in _DELIVERY_LINE_HINTS else '') for k in unknown]
+                return _err(ValueError(f"第 {n} 個操作：不認得的明細欄位 {'、'.join(msgs)}；可用欄位："
+                                       f"{', '.join(sorted(_DELIVERY_LINE_KEYS))}。未寫入任何資料"))
+            if 'qty' in op and 'product_uom_qty' in op:
+                return _err(ValueError(f"第 {n} 個操作：qty 與 product_uom_qty 是同一個欄位，只能給一個"))
+            vals = {}
+            if 'qty' in op or 'product_uom_qty' in op:
+                vals['product_uom_qty'] = _delivery_qty(op.get('qty', op.get('product_uom_qty')), f"第 {n} 個操作的 qty")
+            done_qty = _delivery_qty(op['quantity'], f"第 {n} 個操作的 quantity") if 'quantity' in op else None
+            if 'description_picking' in op:
+                vals['description_picking'] = op['description_picking'] or False
+            if 'sequence' in op:
+                vals['sequence'] = int(op['sequence'])
+            if action == 'update':
+                if 'product_id' in op:
+                    return _err(ValueError(f"第 {n} 個操作：明細的產品不能直接換，請刪除後新增"))
+                if not vals and done_qty is None:
+                    return _err(ValueError(f"第 {n} 個操作：明細 {line_id} 沒有要修改的欄位"))
+                if line['sale_line_id'] and 'product_uom_qty' in vals:
+                    warnings.append(f"明細 {line_id} 來自 {line['sale_line_id'][1]}，銷售訂單的數量不會跟著改")
+                ops.append(('update', line_id, vals, done_qty))
+            else:
+                if not op.get('product_id') or 'product_uom_qty' not in vals:
+                    return _err(ValueError(f"第 {n} 個操作：新增明細要有 product_id 與 qty"))
+                errors = _check_products([op['product_id']], company_id)
+                if errors:
+                    return _ok({'error': '檢查未通過，未做任何修改', 'details': errors})
+                prod = _wcall('product.product', 'read', [[op['product_id']]], {'fields': ['display_name', 'uom_id']})[0]
+                if 'sequence' not in vals:
+                    max_seq += 1
+                    vals['sequence'] = max_seq
+                vals.update({'product_id': op['product_id'], 'name': prod['display_name'],
+                             'product_uom': prod['uom_id'][0], 'location_id': p['location_id'][0],
+                             'location_dest_id': p['location_dest_id'][0], 'company_id': company_id,
+                             'picking_type_id': p['picking_type_id'][0], 'additional': True})
+                ops.append(('add', None, vals, done_qty))
+        if dry_run:
+            return _ok({'status': 'dry_run', 'delivery': p['name'], 'message': '檢查通過；未寫入', 'warnings': warnings,
+                        'operations': [{'action': a, 'line_id': i, 'fields': v, 'quantity': q} for a, i, v, q in ops]})
+
+        results = []
+        try:
+            for action, line_id, vals, done_qty in ops:
+                if action == 'add':
+                    # Through the picking: Odoo then confirms the new move along with it.
+                    seen = set(_wcall('stock.move', 'search', [[['picking_id', '=', delivery_id]]]))
+                    _wcall('stock.picking', 'write', [[delivery_id], {'move_ids': [(0, 0, vals)]}], company_id=company_id)
+                    new_ids = set(_wcall('stock.move', 'search', [[['picking_id', '=', delivery_id]]])) - seen
+                    line_id = max(new_ids) if new_ids else None
+                    results.append({'action': 'added', 'line_id': line_id, 'product_id': vals['product_id'],
+                                    'qty': vals['product_uom_qty']})
+                elif action == 'update':
+                    if vals:
+                        _wcall('stock.move', 'write', [[line_id], vals], company_id=company_id)
+                    results.append({'action': 'updated', 'line_id': line_id, 'fields': vals})
+                else:
+                    _wcall('stock.move', 'unlink', [[line_id]], company_id=company_id)
+                    results.append({'action': 'deleted', 'line_id': line_id})
+                if done_qty is not None and line_id:
+                    _wcall('stock.move', 'write', [[line_id], {'quantity': done_qty}], company_id=company_id)
+                    results[-1]['quantity'] = done_qty
+        except Exception as e:
+            cache.clear()
+            if results:
+                _audit(ctx, 'update_delivery_lines', 'stock.picking', delivery_id, results, p['name'])
+            return _err(e, delivery_id=delivery_id, applied=results, message='前面的操作已經寫入，這個操作失敗')
+        cache.clear()
+        after = _read_delivery(delivery_id)
+        added = {r['line_id'] for r in results if r['action'] == 'added'}
+        warnings += [f"新增的明細 {l['line_id']} 狀態仍是草稿，請到 Odoo 確認" for l in after['lines']
+                     if l['line_id'] in added and l['state'] == 'draft']
+        _audit(ctx, 'update_delivery_lines', 'stock.picking', delivery_id, results, after['name'])
+        return _ok({'status': 'updated', 'results': results, 'warnings': warnings, 'delivery': after})
+    except Exception as e:
+        return _err(e, delivery_id=delivery_id)
+
+
 WRITE_TOOLS = [
     create_quotation, update_quotation, update_quotation_lines,
     preview_quotation_copy, copy_quotation, confirm_quotation,
     update_partner_terms, add_contact_to_partner, download_quotation_pdf,
     update_partner, post_note, change_quotation_state, create_or_get_partner,
+    create_product, update_product,
+    duplicate_invoice, create_invoice, post_invoice, draft_invoice,
+    update_delivery_order, update_delivery_lines,
 ]
 
 
