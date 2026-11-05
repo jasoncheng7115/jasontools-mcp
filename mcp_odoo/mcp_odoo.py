@@ -1,16 +1,34 @@
 #!/usr/bin/env python3
 """
-MCP server for Odoo API – v1.14.0 Delivery Order Editing
+MCP server for Odoo API – v1.15.1 No Standalone GET Stream
 ===============================================================================
 Author: Jason Cheng (Jason Tools)
 Created: 2025-07-14
-Updated: 2026-10-30
-Version: 1.14.0
+Updated: 2026-11-05
+Version: 1.15.1
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Tested: Odoo 13 Community Edition
 
 FastMCP-based Odoo integration with comprehensive business management capabilities.
+
+FIX in v1.15.1:
+- /mcp answers GET with 405 (no standalone SSE stream; the server never pushes messages).
+  Claude Code kept that stream open, and when it dropped (server restart, host reboot)
+  it closed the transport, retried for about 15 s and gave up: odoo showed as failed
+  until a manual reconnect. Tool calls are plain POSTs now and survive restarts.
+
+NEW in v1.15.0:
+- Write group: download_delivery_pdf - a delivery order as PDF, 'delivery_slip' (送貨單,
+  stock.report_deliveryslip, with the site's template overrides) or 'picking' (揀貨作業,
+  stock.report_picking). Same return modes as download_quotation_pdf (one-time link,
+  base64, text). Deliveries could be edited but their PDF could not be fetched.
+- FIX one-time PDF links: a non-ASCII file name (every delivery in a company with a Chinese name, e.g. 倉庫/OUT/00001) gave
+  HTTP 500, the Content-Disposition header must be latin-1. The header now carries an
+  ASCII name plus filename*=UTF-8, and the link is URL-encoded.
+- FIX update_delivery_lines: adding a line to a draft delivery confirmed the whole delivery
+  (the move was sent as "additional", and Odoo confirms the picking for that). A draft
+  delivery now stays draft, and its new lines no longer raise a "still draft" warning.
 
 NEW in v1.14.0:
 - Write: update_delivery_order (scheduled date, delivery address, source document, note,
@@ -449,7 +467,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Version information
-__version__ = "1.14.0"
+__version__ = "1.15.1"
 __author__ = "Jason Cheng (Jason Tools)"
 
 # Configure logging
@@ -984,9 +1002,29 @@ def _sse_and_http_app(server):
 
 
 def _pdf_route():
-    """One-time PDF links from download_quotation_pdf; the random token is the credential."""
+    """One-time PDF links from download_*_pdf; the random token is the credential."""
     from starlette.routing import Route
     return Route("/files/{token}/{filename}", endpoint=_serve_pdf)
+
+
+class _NoGetStream:
+    """Refuse the standalone GET stream on /mcp (405, allowed by the MCP spec).
+
+    This server never sends server-initiated messages, so the stream carries nothing.
+    While it is open, Claude Code treats its drop (server restart, host reboot) as a
+    dead transport, retries for ~15 s and then gives up until a manual reconnect.
+    Without it the client only POSTs, and each tool call stands on its own.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] == "GET" and scope["path"].rstrip("/") == "/mcp":
+            from starlette.responses import PlainTextResponse
+            await PlainTextResponse("Method Not Allowed", status_code=405,
+                                    headers={"Allow": "POST, DELETE"})(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 class _APIKeyAuth:
@@ -5558,6 +5596,10 @@ PDF_REPORTS = {
     'quotation': 'sale.report_saleorder',
     'pro_forma': 'sale.report_saleorder_pro_forma',
 }
+DELIVERY_PDF_REPORTS = {
+    'delivery_slip': 'stock.report_deliveryslip',
+    'picking': 'stock.report_picking',
+}
 EDITABLE_STATES = ('draft', 'sent')
 LINE_FIELDS = ('product_id', 'name', 'product_uom_qty', 'price_unit', 'discount', 'sequence', 'display_type')
 LINE_ALIASES = ('qty', 'quantity', 'product_qty', 'tax_id', 'taxes_id', 'tax_ids')
@@ -6553,38 +6595,80 @@ def download_quotation_pdf(quotation_id: int, report: str = 'quotation', return_
         info = {'quotation': so['name'], 'report': report, 'filename': filename, 'size': len(pdf),
                 'sha256': hashlib.sha256(pdf).hexdigest()}
 
-        if return_mode == 'base64':
-            info['content_base64'] = base64.b64encode(pdf).decode()
-            return _ok(info)
-        if return_mode == 'text':
-            r = subprocess.run(['pdftotext', '-layout', '-', '-'], input=pdf, capture_output=True, timeout=60)
-            if r.returncode != 0:
-                return _err(RuntimeError(f"pdftotext failed: {r.stderr.decode(errors='replace')[:200]}"))
-            info['text'] = r.stdout.decode('utf-8', errors='replace')
-            return _ok(info)
-
-        if _http_mode:
-            now = time.time()
-            for k in [k for k, v in _pdf_store.items() if v['expires'] < now]:
-                _pdf_store.pop(k, None)
-            token = secrets.token_urlsafe(24)
-            _pdf_store[token] = {'data': pdf, 'filename': filename, 'expires': now + PDF_TTL}
-            base = ''
-            try:
-                base = str(ctx.request_context.request.base_url).rstrip('/')
-            except Exception:
-                pass
-            info.update({'url': f"{base}/files/{token}/{filename}", 'expires_in_seconds': PDF_TTL,
-                         'how_to_save': f"curl -fsSo {filename} '<url>'"})
-        else:
-            os.makedirs(PDF_DIR, exist_ok=True)
-            path = os.path.join(PDF_DIR, filename)
-            with open(path, 'wb') as f:
-                f.write(pdf)
-            info['path'] = path
-        return _ok(info)
+        return _deliver_pdf(pdf, filename, info, return_mode, ctx)
     except Exception as e:
         return _err(e, quotation_id=quotation_id)
+
+
+def _deliver_pdf(pdf: bytes, filename: str, info: Dict, return_mode: str, ctx: Context) -> str:
+    """Hand a rendered PDF back as base64, text, a one-time link (HTTP) or a saved file (stdio)."""
+    if return_mode == 'base64':
+        info['content_base64'] = base64.b64encode(pdf).decode()
+        return _ok(info)
+    if return_mode == 'text':
+        r = subprocess.run(['pdftotext', '-layout', '-', '-'], input=pdf, capture_output=True, timeout=60)
+        if r.returncode != 0:
+            return _err(RuntimeError(f"pdftotext failed: {r.stderr.decode(errors='replace')[:200]}"))
+        info['text'] = r.stdout.decode('utf-8', errors='replace')
+        return _ok(info)
+
+    if _http_mode:
+        now = time.time()
+        for k in [k for k, v in _pdf_store.items() if v['expires'] < now]:
+            _pdf_store.pop(k, None)
+        token = secrets.token_urlsafe(24)
+        _pdf_store[token] = {'data': pdf, 'filename': filename, 'expires': now + PDF_TTL}
+        base = ''
+        try:
+            base = str(ctx.request_context.request.base_url).rstrip('/')
+        except Exception:
+            pass
+        from urllib.parse import quote
+        info.update({'url': f"{base}/files/{token}/{quote(filename)}", 'expires_in_seconds': PDF_TTL,
+                     'how_to_save': f"curl -fsSo {filename} '<url>'"})
+    else:
+        os.makedirs(PDF_DIR, exist_ok=True)
+        path = os.path.join(PDF_DIR, filename)
+        with open(path, 'wb') as f:
+            f.write(pdf)
+        info['path'] = path
+    return _ok(info)
+
+
+def download_delivery_pdf(delivery_id: int, report: str = 'delivery_slip', return_mode: str = 'url',
+                          ctx: Context = None) -> str:
+    """Get a delivery order (stock.picking) as PDF.
+
+    Args:
+        delivery_id: Delivery order ID (from search_delivery_orders)
+        report: 'delivery_slip' (送貨單, stock.report_deliveryslip) or
+                'picking' (揀貨作業, stock.report_picking)
+        return_mode: 'url' (default), 'base64' (file content in the reply), or 'text'
+                (the PDF's text, for clients that cannot read PDF). For lines as data,
+                get_delivery_order_details is usually better.
+
+    Returns:
+        url: HTTP transports give a download link valid for 15 minutes (no API key needed;
+        fetch it with curl -o); stdio gives the path of the saved file.
+    """
+    try:
+        if report not in DELIVERY_PDF_REPORTS:
+            return _err(ValueError(f"report 只能是 {' / '.join(DELIVERY_PDF_REPORTS)}"))
+        if return_mode not in ('url', 'base64', 'text'):
+            return _err(ValueError("return_mode 只能是 url / base64 / text"))
+        p = _wcall('stock.picking', 'read', [[delivery_id]], {'fields': ['name', 'state', 'partner_id']})
+        if not p:
+            return _err(ValueError(f"找不到交貨單 {delivery_id}"))
+        p = p[0]
+        pdf = _fetch_report_pdf(DELIVERY_PDF_REPORTS[report], delivery_id)
+        safe = re.sub(r'[^\w.-]+', '_', p['name'])
+        filename = f"{safe}{'_picking' if report == 'picking' else ''}.pdf"
+        info = {'delivery': p['name'], 'state': p['state'], 'partner': _m2o(p['partner_id']),
+                'report': report, 'filename': filename, 'size': len(pdf),
+                'sha256': hashlib.sha256(pdf).hexdigest()}
+        return _deliver_pdf(pdf, filename, info, return_mode, ctx)
+    except Exception as e:
+        return _err(e, delivery_id=delivery_id)
 
 
 _PARTNER_EDITABLE = ('name', 'vat', 'email', 'phone', 'mobile', 'street', 'street2', 'city', 'zip',
@@ -6824,8 +6908,15 @@ async def _serve_pdf(request):
     item = _pdf_store.get(request.path_params['token'])
     if not item or item['expires'] < time.time():
         return PlainTextResponse('Link expired or not found', status_code=404)
+    from urllib.parse import quote
+    # Headers are latin-1: a delivery name like 倉庫/OUT/00001 needs RFC 6266 filename*
+    name = item['filename']
+    ascii_name = re.sub(r'[^A-Za-z0-9._-]+', '_', name).strip('_.') or 'document.pdf'
+    if not ascii_name.endswith('.pdf'):
+        ascii_name += '.pdf'
     return Response(item['data'], media_type='application/pdf',
-                    headers={'Content-Disposition': f'attachment; filename="{item["filename"]}"'})
+                    headers={'Content-Disposition': f"attachment; filename=\"{ascii_name}\"; "
+                                                    f"filename*=UTF-8''{quote(name)}"})
 
 
 _PRODUCT_TYPES = {'consu': 'consu', 'goods': 'consu', 'product': 'consu', 'storable': 'consu',
@@ -7568,7 +7659,10 @@ def update_delivery_lines(delivery_id: int, line_updates: List[Dict], dry_run: b
                 vals.update({'product_id': op['product_id'], 'name': prod['display_name'],
                              'product_uom': prod['uom_id'][0], 'location_id': p['location_id'][0],
                              'location_dest_id': p['location_dest_id'][0], 'company_id': company_id,
-                             'picking_type_id': p['picking_type_id'][0], 'additional': True})
+                             'picking_type_id': p['picking_type_id'][0],
+                             # Odoo confirms the whole picking when it sees an additional move:
+                             # a draft delivery must stay draft.
+                             'additional': p['state'] != 'draft'})
                 ops.append(('add', None, vals, done_qty))
         if dry_run:
             return _ok({'status': 'dry_run', 'delivery': p['name'], 'message': '檢查通過；未寫入', 'warnings': warnings,
@@ -7604,7 +7698,7 @@ def update_delivery_lines(delivery_id: int, line_updates: List[Dict], dry_run: b
         after = _read_delivery(delivery_id)
         added = {r['line_id'] for r in results if r['action'] == 'added'}
         warnings += [f"新增的明細 {l['line_id']} 狀態仍是草稿，請到 Odoo 確認" for l in after['lines']
-                     if l['line_id'] in added and l['state'] == 'draft']
+                     if l['line_id'] in added and l['state'] == 'draft' and p['state'] != 'draft']
         _audit(ctx, 'update_delivery_lines', 'stock.picking', delivery_id, results, after['name'])
         return _ok({'status': 'updated', 'results': results, 'warnings': warnings, 'delivery': after})
     except Exception as e:
@@ -7618,7 +7712,7 @@ WRITE_TOOLS = [
     update_partner, post_note, change_quotation_state, create_or_get_partner,
     create_product, update_product,
     duplicate_invoice, create_invoice, post_invoice, draft_invoice,
-    update_delivery_order, update_delivery_lines,
+    update_delivery_order, update_delivery_lines, download_delivery_pdf,
 ]
 
 
@@ -7774,7 +7868,7 @@ Examples:
         from starlette.middleware import Middleware
         from starlette.responses import JSONResponse
 
-        app = _sse_and_http_app(mcp)
+        app = _NoGetStream(_sse_and_http_app(mcp))
 
         # Add API key authentication middleware if api_key is set
         if args.api_key:
@@ -7797,6 +7891,7 @@ Examples:
 
         app = mcp.streamable_http_app()
         app.router.routes.append(_pdf_route())
+        app = _NoGetStream(app)
 
         # Add API key authentication middleware if api_key is set
         if args.api_key:

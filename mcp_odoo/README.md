@@ -1,10 +1,10 @@
 # Odoo MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **18 read tools** for sales quotations, sales analysis, purchase orders, deliveries, products, stock, invoices, partners and chatter history — with token-saving output controls tuned for small/local LLMs — plus **21 opt-in write tools** for quotations, customers, products, invoices and delivery orders (`--enable-write`).
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **18 read tools** for sales quotations, sales analysis, purchase orders, deliveries, products, stock, invoices, partners and chatter history — with token-saving output controls tuned for small/local LLMs — plus **22 opt-in write tools** for quotations, customers, products, invoices and delivery orders (`--enable-write`).
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.14.0
+- **Version:** 1.15.1
 - **Tested:** Odoo 13 and 18 Community Edition (write tools: Odoo 18)
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
@@ -13,7 +13,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 ## Features
 
 - **Sales / quotations** — flexible search (partner, state, date & amount range, product names/keywords with AND/OR and exclude logic), quick stats, and full order details.
-- **Purchasing & delivery** — search purchase orders and delivery orders (stock pickings) with state / date / product-keyword filters; detailed views by ID. Delivery orders can be edited with the opt-in write tools.
+- **Purchasing & delivery** — search purchase orders and delivery orders (stock pickings) with state / date / product-keyword filters; detailed views by ID. Delivery orders can be edited, and their delivery slip / picking PDF downloaded, with the opt-in write tools.
 - **Products & stock** — keyword/multi-keyword product search, product details, and on-hand stock by warehouse/location.
 - **Quotation writing (opt-in)** — create quotations with note/section lines, edit header and lines, copy to another customer, confirm, set a customer's default pricelist / payment terms, add contacts, download the quotation or pro-forma PDF. Prices are protected from pricelist recomputation; every write is audited.
 - **Partners** — search partners (returns a Markdown link to the partner page) and create-or-get with VAT / 統一編號, customer/supplier flags and contacts.
@@ -84,7 +84,7 @@ The **Odoo connection is configured via environment variables**; transport/auth 
 | `ODOO_DEFAULT_SALE_TAX_IDS` | — | Comma-separated tax IDs put on new product lines that name no tax (only for the default company) |
 
 The IDs are specific to one database, so they are settings, not code. Unset means Odoo's own default.
-| `ODOO_PDF_DIR` | `~/Downloads` | Where `download_quotation_pdf` saves files in stdio mode |
+| `ODOO_PDF_DIR` | `~/Downloads` | Where `download_quotation_pdf` / `download_delivery_pdf` save files in stdio mode |
 
 HTTP endpoints: streamable-http at `/mcp`, SSE at `/sse`. Since v1.9.1 the SSE mode serves `/mcp` as well.
 
@@ -165,7 +165,7 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 ---
 
-## Tools (18 + 21 write)
+## Tools (18 + 22 write)
 
 ### System
 
@@ -254,6 +254,7 @@ Two behaviours worth knowing:
 | `draft_invoice` | Reset a posted invoice to draft (`confirm=True` required; otherwise a preview) |
 | `update_delivery_order` | Change a delivery order's scheduled date, delivery address, source document, note, responsible, priority. On a done delivery only note and responsible; cancelled ones are refused |
 | `update_delivery_lines` | Add / change / delete delivery lines: `qty` (demand), `quantity` (done), `description_picking`, `sequence`. Only draft lines can be deleted; for others set `qty` to 0. Not for done or cancelled deliveries |
+| `download_delivery_pdf` | Delivery slip (`stock.report_deliveryslip`, 送貨單) or picking operations (`stock.report_picking`) PDF of a delivery order, in any state |
 
 Line spec example — a product line with its quantity formula as a separate note line below it:
 
@@ -275,14 +276,14 @@ What the write tools guard against:
 - **Missing PO number.** `confirm_quotation` warns when `client_order_ref` is empty.
 - **Unknown line keys.** Line specs accept only `product_id`, `name`, `qty` (`quantity` / `product_qty` / `product_uom_qty`), `price_unit`, `discount`, `tax_id` (`taxes_id` / `tax_ids`), `sequence`, `display_type`, `note_after` (and `line_id` / `action` in `update_quotation_lines`). Anything else — e.g. `"line_note": "..."` — is refused with a hint (`display_type: "line_note"` or `note_after`) and nothing is written, in `dry_run` too.
 - **Notes that are not notes.** A line with neither `product_id` nor `display_type` becomes a product line with no product (it only looks like a note); both tools warn about it.
-- **Deliveries stay deliveries.** The delivery tools refuse receipts and internal transfers, never validate a delivery or move stock, and warn that changes do not flow back to the sales order.
+- **Deliveries stay deliveries.** The delivery editing tools refuse receipts and internal transfers, never validate a delivery or move stock, and warn that changes do not flow back to the sales order.
 - **Trying it first.** Every write tool takes `dry_run=True` (or, for copy / confirm / state change, works as a preview until `confirm=True`) and reports exactly what it would change.
 - **Nothing destructive.** There is no tool to delete or cancel a quotation or to delete a partner.
 - **Mistyped customers.** `copy_quotation` takes `new_partner_id`, or a name that matches exactly one partner; it never creates a partner.
 
 Every write returns the record as read back from Odoo (untaxed / tax / total, currency, and the full text of every line description and note), is appended to `ODOO_AUDIT_LOG`, and is posted as an internal note in the record's chatter.
 
-`download_quotation_pdf` renders through Odoo's web session (reports are not available over XML-RPC). Over HTTP it returns a link to `/files/<token>/<file>.pdf` that is valid for 15 minutes; the random token stands in for the API key, so the link can be fetched with plain `curl`. In stdio mode the file is saved to `ODOO_PDF_DIR`.
+`download_quotation_pdf` and `download_delivery_pdf` render through Odoo's web session (reports are not available over XML-RPC). Over HTTP they return a link to `/files/<token>/<file>.pdf` that is valid for 15 minutes; the random token stands in for the API key, so the link can be fetched with plain `curl`. In stdio mode the file is saved to `ODOO_PDF_DIR`.
 
 Enable them only for clients that should change data. A typical setup runs one read-only instance for chat front ends (e.g. via mcpo) and one `--enable-write` instance for an agent.
 
@@ -299,6 +300,16 @@ Enable them only for clients that should change data. A typical setup runs one r
 ---
 
 ## Changelog (recent)
+
+### v1.15.1 — Survives server restarts
+
+- `/mcp` answers `GET` with `405 Method Not Allowed`, so clients do not open the standalone SSE stream (this server never sends server-initiated messages). Claude Code treated a drop of that stream (server restart, host reboot) as a dead connection, retried for about 15 seconds and then gave up until a manual reconnect. Tool calls are now plain POSTs and keep working across restarts.
+
+### v1.15.0 — Delivery slip PDF
+
+- New write-group tool: `download_delivery_pdf` — a delivery order as PDF, `delivery_slip` (送貨單, `stock.report_deliveryslip`, including the site's template overrides) or `picking` (揀貨作業, `stock.report_picking`). Same return modes as `download_quotation_pdf`: one-time link, `base64`, or `text`.
+- Fix: one-time PDF links returned HTTP 500 for non-ASCII file names (every delivery order name in a Chinese-named company). The download now sends an ASCII `filename` plus `filename*=UTF-8''…`, and the link is URL-encoded.
+- Fix: `update_delivery_lines` adding a line to a **draft** delivery confirmed the whole delivery (the move was sent as `additional`, which makes Odoo confirm the picking). A draft delivery now stays draft.
 
 ### v1.14.0 — Delivery order editing
 
