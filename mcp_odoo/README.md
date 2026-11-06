@@ -1,10 +1,10 @@
 # Odoo MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **18 read tools** for sales quotations, sales analysis, purchase orders, deliveries, products, stock, invoices, partners and chatter history — with token-saving output controls tuned for small/local LLMs — plus **22 opt-in write tools** for quotations, customers, products, invoices and delivery orders (`--enable-write`).
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Odoo**, built on FastMCP over Odoo's XML-RPC API. It exposes **18 read tools** for sales quotations, sales analysis, purchase orders, deliveries, products, stock, invoices, partners and chatter history — with token-saving output controls tuned for small/local LLMs — plus **25 opt-in write tools** for quotations, customers, products, invoices and delivery orders (`--enable-write`).
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.15.1
+- **Version:** 1.16.0
 - **Tested:** Odoo 13 and 18 Community Edition (write tools: Odoo 18)
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
@@ -13,7 +13,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 ## Features
 
 - **Sales / quotations** — flexible search (partner, state, date & amount range, product names/keywords with AND/OR and exclude logic), quick stats, and full order details.
-- **Purchasing & delivery** — search purchase orders and delivery orders (stock pickings) with state / date / product-keyword filters; detailed views by ID. Delivery orders can be edited, and their delivery slip / picking PDF downloaded, with the opt-in write tools.
+- **Purchasing & delivery** — search purchase orders and delivery orders (stock pickings) with state / date / product-keyword filters; detailed views by ID. Delivery orders can be created (by hand or from a sales order, services included), edited, validated, and their delivery slip / picking PDF downloaded, with the opt-in write tools.
 - **Products & stock** — keyword/multi-keyword product search, product details, and on-hand stock by warehouse/location.
 - **Quotation writing (opt-in)** — create quotations with note/section lines, edit header and lines, copy to another customer, confirm, set a customer's default pricelist / payment terms, add contacts, download the quotation or pro-forma PDF. Prices are protected from pricelist recomputation; every write is audited.
 - **Partners** — search partners (returns a Markdown link to the partner page) and create-or-get with VAT / 統一編號, customer/supplier flags and contacts.
@@ -165,7 +165,7 @@ Each tool is then available at `POST http://host:8008/<tool_name>` with `Authori
 
 ---
 
-## Tools (18 + 22 write)
+## Tools (18 + 25 write)
 
 ### System
 
@@ -247,13 +247,16 @@ Two behaviours worth knowing:
 | `change_quotation_state` | Set a sent/cancelled quotation back to draft, or mark a draft as sent (no email). Cancelling is deliberately not offered |
 | `download_quotation_pdf` | Quotation (`sale.report_saleorder`) or pro-forma PDF |
 | `create_product` | Create a product (template + variant) with the site-default sales/purchase tax; refuses duplicates by name or internal reference |
-| `update_product` | Change a product's name, sales description, prices, taxes, internal reference, category, sale/purchase flags; archive or restore |
+| `update_product` | Change a product's name, sales description, prices, taxes, internal reference, category, sale/purchase flags, type (service / goods), inventory tracking, internal notes, delivery slip description; archive or restore |
 | `duplicate_invoice` | Copy a customer invoice into a new draft with new dates (recurring monthly charges) |
 | `create_invoice` | Create a draft customer invoice |
 | `post_invoice` | Post a draft invoice (`confirm=True` required; otherwise a preview) |
 | `draft_invoice` | Reset a posted invoice to draft (`confirm=True` required; otherwise a preview) |
 | `update_delivery_order` | Change a delivery order's scheduled date, delivery address, source document, note, responsible, priority. On a done delivery only note and responsible; cancelled ones are refused |
 | `update_delivery_lines` | Add / change / delete delivery lines: `qty` (demand), `quantity` (done), `description_picking`, `sequence`. Only draft lines can be deleted; for others set `qty` to 0. Not for done or cancelled deliveries |
+| `create_delivery_order` | New draft delivery order by hand: partner, lines (`product_id`, `qty`, `description`), source document, scheduled date, note, operation type. Services allowed. Not linked to a sales order |
+| `create_delivery_from_order` | New draft delivery for what a confirmed sales order still has to deliver, services included; linked to the order, its delivery address and warehouse. Lines already on other deliveries are skipped |
+| `validate_delivery_order` | Odoo's *Validate*: preview unless `confirm=True`; done quantities per line (default = demand); when short, `backorder` must say whether the rest goes on a backorder. Warns before stock would go negative |
 | `download_delivery_pdf` | Delivery slip (`stock.report_deliveryslip`, 送貨單) or picking operations (`stock.report_picking`) PDF of a delivery order, in any state |
 
 Line spec example — a product line with its quantity formula as a separate note line below it:
@@ -276,7 +279,7 @@ What the write tools guard against:
 - **Missing PO number.** `confirm_quotation` warns when `client_order_ref` is empty.
 - **Unknown line keys.** Line specs accept only `product_id`, `name`, `qty` (`quantity` / `product_qty` / `product_uom_qty`), `price_unit`, `discount`, `tax_id` (`taxes_id` / `tax_ids`), `sequence`, `display_type`, `note_after` (and `line_id` / `action` in `update_quotation_lines`). Anything else — e.g. `"line_note": "..."` — is refused with a hint (`display_type: "line_note"` or `note_after`) and nothing is written, in `dry_run` too.
 - **Notes that are not notes.** A line with neither `product_id` nor `display_type` becomes a product line with no product (it only looks like a note); both tools warn about it.
-- **Deliveries stay deliveries.** The delivery editing tools refuse receipts and internal transfers, never validate a delivery or move stock, and warn that changes do not flow back to the sales order.
+- **Deliveries stay deliveries.** The delivery tools refuse receipts and internal transfers. Creating or editing a delivery never moves stock; only `validate_delivery_order` with `confirm=True` does. Edits warn that they do not flow back to the sales order.
 - **Trying it first.** Every write tool takes `dry_run=True` (or, for copy / confirm / state change, works as a preview until `confirm=True`) and reports exactly what it would change.
 - **Nothing destructive.** There is no tool to delete or cancel a quotation or to delete a partner.
 - **Mistyped customers.** `copy_quotation` takes `new_partner_id`, or a name that matches exactly one partner; it never creates a partner.
@@ -300,6 +303,12 @@ Enable them only for clients that should change data. A typical setup runs one r
 ---
 
 ## Changelog (recent)
+
+### v1.16.0 — Create and validate delivery orders
+
+- New write tools: `create_delivery_order` (by hand) and `create_delivery_from_order` (from a confirmed sales order, for the quantities not yet on a delivery). Both accept services, which Odoo never puts on a delivery when an order is confirmed, and create a draft.
+- New write tool: `validate_delivery_order`, the *Validate* button. It only previews unless `confirm=True`, takes done quantities per line, and when a quantity is short refuses to guess: `backorder=True` keeps the rest on a backorder, `False` drops it.
+- `update_product` can change `type` (service / goods), `is_storable`, `description` (internal notes) and `description_picking` (text on delivery slips).
 
 ### v1.15.1 — Survives server restarts
 

@@ -1,16 +1,27 @@
 #!/usr/bin/env python3
 """
-MCP server for Odoo API – v1.15.1 No Standalone GET Stream
+MCP server for Odoo API – v1.16.0 Create & Validate Deliveries
 ===============================================================================
 Author: Jason Cheng (Jason Tools)
 Created: 2025-07-14
-Updated: 2026-11-05
-Version: 1.15.1
+Updated: 2026-11-06
+Version: 1.16.0
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Tested: Odoo 13 Community Edition
 
 FastMCP-based Odoo integration with comprehensive business management capabilities.
+
+NEW in v1.16.0:
+- Write group: create_delivery_order - a delivery order by hand (partner, lines, source
+  document, date, note). Services are allowed; confirming an order never creates a
+  delivery for them.
+- Write group: create_delivery_from_order - a delivery for what a confirmed sales order
+  still has to deliver, services included, linked to the order (sale_id, sale_line_id).
+- Write group: validate_delivery_order - Odoo's Validate button: preview without
+  confirm=True, optional done quantities, explicit backorder choice when short.
+- update_product: type (service/consu), is_storable, description (internal notes),
+  description_picking (text on delivery slips).
 
 FIX in v1.15.1:
 - /mcp answers GET with 405 (no standalone SSE stream; the server never pushes messages).
@@ -467,7 +478,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 # Version information
-__version__ = "1.15.1"
+__version__ = "1.16.0"
 __author__ = "Jason Cheng (Jason Tools)"
 
 # Configure logging
@@ -6923,7 +6934,8 @@ _PRODUCT_TYPES = {'consu': 'consu', 'goods': 'consu', 'product': 'consu', 'stora
                   'service': 'service', 'serv': 'service', 'combo': 'combo'}
 _PRODUCT_FIELDS = ['name', 'display_name', 'default_code', 'type', 'categ_id', 'uom_id', 'uom_po_id',
                    'sale_ok', 'purchase_ok', 'list_price', 'standard_price', 'taxes_id',
-                   'supplier_taxes_id', 'company_id', 'description_sale', 'active', 'product_tmpl_id']
+                   'supplier_taxes_id', 'company_id', 'description_sale', 'active', 'product_tmpl_id',
+                   'is_storable', 'description', 'description_picking']
 
 
 def _tax_ids(value, use: str, company_id: Optional[int], label: str) -> List[int]:
@@ -7064,7 +7076,9 @@ def update_product(product_id: int, name: Optional[str] = None, description_sale
                    supplier_taxes_id: Optional[Union[int, List[int]]] = None,
                    default_code: Optional[str] = None, categ_id: Optional[int] = None,
                    sale_ok: Optional[bool] = None, purchase_ok: Optional[bool] = None,
-                   active: Optional[bool] = None, dry_run: bool = False, ctx: Context = None) -> str:
+                   active: Optional[bool] = None, type: Optional[str] = None,
+                   is_storable: Optional[bool] = None, description: Optional[str] = None,
+                   description_picking: Optional[str] = None, dry_run: bool = False, ctx: Context = None) -> str:
     """Change a product. Only the arguments you pass are changed; the change applies to the
     product template, so every variant and future quotation line uses it.
 
@@ -7079,6 +7093,12 @@ def update_product(product_id: int, name: Optional[str] = None, description_sale
         categ_id: Product category ID
         sale_ok, purchase_ok: Can be sold / purchased
         active: False archives the product, True restores it
+        type: "service" or "consu" (goods). Confirming a sales order creates a delivery
+            order only for goods; services never get one. Changing it affects future
+            orders only.
+        is_storable: Track inventory (goods only). Stock levels apply only when True.
+        description: Internal notes on the product (not printed on quotations); "" clears it
+        description_picking: Text printed on delivery slips for this product; "" clears it
         dry_run: Show before/after without writing
 
     Returns:
@@ -7095,8 +7115,21 @@ def update_product(product_id: int, name: Optional[str] = None, description_sale
         vals = {k: v for k, v in (('name', name), ('description_sale', description_sale),
                                   ('list_price', list_price), ('standard_price', standard_price),
                                   ('default_code', default_code), ('categ_id', categ_id),
-                                  ('sale_ok', sale_ok), ('purchase_ok', purchase_ok), ('active', active))
+                                  ('sale_ok', sale_ok), ('purchase_ok', purchase_ok), ('active', active),
+                                  ('type', type), ('is_storable', is_storable), ('description', description),
+                                  ('description_picking', description_picking))
                 if v is not None}
+        if 'type' in vals and vals['type'] not in ('service', 'consu'):
+            return _err(ValueError(f"type 只能是 service（服務）或 consu（商品），收到 {vals['type']!r}"))
+        final_type = vals.get('type', before['type'])
+        if vals.get('is_storable') and final_type != 'consu':
+            return _err(ValueError('is_storable（追蹤庫存）只適用於商品（type=consu）'))
+        if final_type == 'service' and before['is_storable'] and 'is_storable' not in vals:
+            vals['is_storable'] = False
+        if 'description' in vals:
+            vals['description'] = _note_html(vals['description'].strip('\n')) or False
+        if 'description_picking' in vals:
+            vals['description_picking'] = vals['description_picking'].strip('\n') or False
         if 'name' in vals:
             vals['name'] = vals['name'].strip()
             if not vals['name'] or '\n' in vals['name']:
@@ -7705,6 +7738,322 @@ def update_delivery_lines(delivery_id: int, line_updates: List[Dict], dry_run: b
         return _err(e, delivery_id=delivery_id)
 
 
+def _outgoing_type(company_id: int, picking_type: Optional[Union[int, str]]) -> Dict:
+    """The delivery operation type of a company: an ID, a name, or None for the default."""
+    fields = ['name', 'company_id', 'code', 'default_location_src_id', 'default_location_dest_id', 'warehouse_id']
+    if isinstance(picking_type, int) or (isinstance(picking_type, str) and picking_type.isdigit()):
+        found = _wcall('stock.picking.type', 'read', [[int(picking_type)]], {'fields': fields})
+    else:
+        domain = [['code', '=', 'outgoing'], ['company_id', '=', company_id]]
+        if picking_type and picking_type.strip().lower() not in ('delivery orders', 'delivery', 'outgoing', '交貨單', '出貨單'):
+            domain.append(['name', 'ilike', picking_type.strip()])
+        found = _wcall('stock.picking.type', 'search_read', [domain], {'fields': fields, 'order': 'sequence, id'})
+    if not found:
+        raise ValueError(f"找不到公司 {company_id} 的出貨作業類型 {picking_type!r}")
+    t = found[0]
+    if t['code'] != 'outgoing':
+        raise ValueError(f"作業類型 {t['id']}「{t['name']}」不是出貨（{t['code']}）")
+    if t['company_id'] and t['company_id'][0] != company_id:
+        raise ValueError(f"作業類型 {t['id']}「{t['name']}」屬於 {t['company_id'][1]}，不是公司 {company_id}")
+    if not t['default_location_src_id'] or not t['default_location_dest_id']:
+        raise ValueError(f"作業類型「{t['name']}」沒有設定預設的來源或目的位置")
+    return t
+
+
+def _move_vals(product: Dict, qty: float, description: Optional[str], t: Dict, company_id: int, seq: int) -> Dict:
+    vals = {'product_id': product['id'], 'name': product['display_name'], 'product_uom_qty': qty,
+            'product_uom': product['uom_id'][0], 'location_id': t['default_location_src_id'][0],
+            'location_dest_id': t['default_location_dest_id'][0], 'company_id': company_id,
+            'picking_type_id': t['id'], 'sequence': seq}
+    if description:
+        vals['description_picking'] = description
+    return vals
+
+
+def _new_delivery(header: Dict, moves: List[Dict], company_id: int) -> int:
+    picking_id = _wcall('stock.picking', 'create', [{**header, 'move_ids': [(0, 0, m) for m in moves]}],
+                        company_id=company_id)
+    return picking_id[0] if isinstance(picking_id, list) else picking_id
+
+
+_CREATE_DELIVERY_LINE_KEYS = {'product_id', 'qty', 'description'}
+
+
+def create_delivery_order(partner_id: int, lines: List[Dict], origin: Optional[str] = None,
+                          scheduled_date: Optional[str] = None, note: Optional[str] = None,
+                          picking_type: Optional[Union[int, str]] = None, company_id: Optional[int] = None,
+                          dry_run: bool = False, ctx: Context = None) -> str:
+    """Create a delivery order by hand, not linked to any sales order (use
+    create_delivery_from_order for that). Services are allowed: confirming an order never
+    creates a delivery for them. The delivery is created as a draft; nothing leaves stock
+    until validate_delivery_order.
+
+    Args:
+        partner_id: Delivery address (customer or contact)
+        lines: [{"product_id": 125, "qty": 1, "description": "text on the slip"}, ...]
+            description is optional; without it the slip shows the product name.
+        origin: Source document, e.g. a sales order number or the customer's PO number
+        scheduled_date: Local time, YYYY-MM-DD or YYYY-MM-DD HH:MM (default: now)
+        note: Note on the delivery; plain text keeps its line breaks
+        picking_type: Operation type ID or name (default: the company's Delivery Orders)
+        company_id: Company (default: the customer's company, else the user's)
+        dry_run: Check everything and show what would be created, without writing
+
+    Returns:
+        The delivery as read back (id, name, state, lines with line_id), and its Odoo link.
+    """
+    try:
+        found = _wcall('res.partner', 'read', [[partner_id]], {'fields': ['display_name', 'company_id']})
+        if not found:
+            return _err(ValueError(f"客戶 {partner_id} 不存在"))
+        partner = found[0]
+        if company_id is None:
+            company_id = partner['company_id'][0] if partner['company_id'] else _user_company_id()
+        elif partner['company_id'] and partner['company_id'][0] != company_id:
+            return _err(ValueError(f"客戶 {partner_id}「{partner['display_name']}」屬於 {partner['company_id'][1]}，"
+                                   f"不是公司 {company_id}"))
+        if not lines:
+            return _err(ValueError('lines 是空的，交貨單至少要有一行'))
+        for n, line in enumerate(lines, 1):
+            unknown = [k for k in line if k not in _CREATE_DELIVERY_LINE_KEYS]
+            if unknown:
+                return _err(ValueError(f"第 {n} 行：不認得的欄位 {'、'.join(map(repr, unknown))}；"
+                                       f"可用欄位：product_id, qty, description。未寫入任何資料"))
+            if not line.get('product_id') or 'qty' not in line:
+                return _err(ValueError(f"第 {n} 行：要有 product_id 與 qty"))
+        errors = _check_products([l['product_id'] for l in lines], company_id)
+        if errors:
+            return _ok({'error': '檢查未通過，未做任何修改', 'details': errors})
+        t = _outgoing_type(company_id, picking_type)
+        prods = {p['id']: p for p in _wcall('product.product', 'read', [sorted({l['product_id'] for l in lines})],
+                                            {'fields': ['display_name', 'uom_id', 'type']})}
+        moves = []
+        for n, line in enumerate(lines, 1):
+            qty = _delivery_qty(line['qty'], f"第 {n} 行的 qty")
+            if qty == 0:
+                return _err(ValueError(f"第 {n} 行：qty 不能是 0"))
+            moves.append(_move_vals(prods[line['product_id']], qty, (line.get('description') or '').strip() or None,
+                                    t, company_id, n))
+        header = {'partner_id': partner_id, 'picking_type_id': t['id'], 'company_id': company_id,
+                  'location_id': t['default_location_src_id'][0], 'location_dest_id': t['default_location_dest_id'][0]}
+        if origin:
+            header['origin'] = origin.strip()
+        if scheduled_date:
+            header['scheduled_date'] = _local_to_utc(scheduled_date, None, 'scheduled_date')
+        if note:
+            header['note'] = _note_html(note)
+        if dry_run:
+            return _ok({'status': 'dry_run', 'message': '檢查通過；未寫入', 'partner': partner['display_name'],
+                        'picking_type': t['name'], 'origin': header.get('origin'),
+                        'scheduled_date': _utc_to_local(header['scheduled_date']) if 'scheduled_date' in header else None,
+                        'lines': [{'product': prods[m['product_id']]['display_name'], 'qty': m['product_uom_qty'],
+                                   'description': m.get('description_picking')} for m in moves]})
+        picking_id = _new_delivery(header, moves, company_id)
+        cache.clear()
+        after = _read_delivery(picking_id)
+        _audit(ctx, 'create_delivery_order', 'stock.picking', picking_id,
+               {'origin': after['origin'], 'lines': [{'product': l['product'], 'qty': l['qty']} for l in after['lines']]},
+               after['name'])
+        return _ok({'status': 'created', 'message': '已建立草稿交貨單；出貨請用 validate_delivery_order',
+                    'delivery': after})
+    except Exception as e:
+        return _err(e, partner_id=partner_id)
+
+
+def create_delivery_from_order(order_id: int, line_ids: Optional[List[int]] = None,
+                               scheduled_date: Optional[str] = None, note: Optional[str] = None,
+                               dry_run: bool = False, ctx: Context = None) -> str:
+    """Create a delivery order from a confirmed sales order, for the quantities not yet on
+    any delivery. Services are included: Odoo itself never creates deliveries for them.
+    The delivery is linked to the order (it shows under the order's Delivery button), uses
+    the order's delivery address and warehouse, and its source document is the order number.
+    It is created as a draft; nothing leaves stock until validate_delivery_order.
+
+    Args:
+        order_id: Sales order ID (state "sale")
+        line_ids: Only these order line IDs (default: every product line still to deliver)
+        scheduled_date: Local time, YYYY-MM-DD or YYYY-MM-DD HH:MM (default: now)
+        note: Note on the delivery; plain text keeps its line breaks
+        dry_run: Show what would be created, without writing
+
+    Lines already fully on other (not cancelled) deliveries are skipped and listed.
+    Returns:
+        The delivery as read back, plus `skipped` lines and warnings.
+    """
+    try:
+        so = _wcall('sale.order', 'read', [[order_id]],
+                    {'fields': ['name', 'state', 'company_id', 'partner_shipping_id', 'warehouse_id',
+                                'client_order_ref', 'order_line']})
+        if not so:
+            return _err(ValueError(f"訂單 {order_id} 不存在"))
+        so = so[0]
+        if so['state'] != 'sale':
+            return _err(ValueError(f"{so['name']} 狀態是 {so['state']}，只有已確認的訂單（sale）能產生交貨單"))
+        company_id = so['company_id'][0]
+        sol = _wcall('sale.order.line', 'read', [so['order_line']],
+                     {'fields': ['product_id', 'name', 'product_uom_qty', 'product_uom', 'display_type', 'sequence']})
+        sol = [l for l in sol if not l['display_type'] and l['product_id']]
+        if line_ids:
+            missing = set(line_ids) - {l['id'] for l in sol}
+            if missing:
+                return _err(ValueError(f"明細 {sorted(missing)} 不是 {so['name']} 的產品明細"))
+            sol = [l for l in sol if l['id'] in line_ids]
+        existing = _wcall('stock.move', 'search_read',
+                          [[['sale_line_id', 'in', [l['id'] for l in sol]], ['state', '!=', 'cancel'],
+                            ['picking_code', '=', 'outgoing']]],
+                          {'fields': ['sale_line_id', 'product_uom_qty', 'picking_id']})
+        on_delivery = {}
+        for m in existing:
+            on_delivery[m['sale_line_id'][0]] = on_delivery.get(m['sale_line_id'][0], 0) + m['product_uom_qty']
+        t = None
+        if so['warehouse_id']:
+            wh = _wcall('stock.warehouse', 'read', [[so['warehouse_id'][0]]], {'fields': ['out_type_id']})
+            if wh and wh[0]['out_type_id']:
+                t = _outgoing_type(company_id, wh[0]['out_type_id'][0])
+        t = t or _outgoing_type(company_id, None)
+        prods = {p['id']: p for p in _wcall('product.product', 'read', [sorted({l['product_id'][0] for l in sol})],
+                                            {'fields': ['display_name', 'uom_id', 'type']})} if sol else {}
+        moves, skipped = [], []
+        for l in sorted(sol, key=lambda l: (l['sequence'], l['id'])):
+            remaining = round(l['product_uom_qty'] - on_delivery.get(l['id'], 0), 6)
+            if remaining <= 0:
+                skipped.append({'line_id': l['id'], 'product': l['product_id'][1], 'reason': '已全部在其他交貨單上'})
+                continue
+            prod = prods[l['product_id'][0]]
+            if l['product_uom'] and l['product_uom'][0] != prod['uom_id'][0]:
+                prod = {**prod, 'uom_id': l['product_uom']}
+            vals = _move_vals(prod, remaining, l['name'].strip() or None, t, company_id, len(moves) + 1)
+            vals['sale_line_id'] = l['id']
+            moves.append(vals)
+        if not moves:
+            return _ok({'status': 'nothing_to_deliver', 'order': so['name'], 'skipped': skipped,
+                        'message': '沒有要出貨的明細，未建立交貨單'})
+        header = {'partner_id': so['partner_shipping_id'][0], 'picking_type_id': t['id'], 'company_id': company_id,
+                  'location_id': t['default_location_src_id'][0], 'location_dest_id': t['default_location_dest_id'][0],
+                  'origin': so['name'], 'sale_id': order_id}
+        if scheduled_date:
+            header['scheduled_date'] = _local_to_utc(scheduled_date, None, 'scheduled_date')
+        if note:
+            header['note'] = _note_html(note)
+        warnings = []
+        if existing:
+            names = sorted({m['picking_id'][1] for m in existing if m['picking_id']})
+            warnings.append(f"{so['name']} 已有交貨單 {'、'.join(names)}；只帶入尚未出貨的數量")
+        if dry_run:
+            return _ok({'status': 'dry_run', 'message': '檢查通過；未寫入', 'order': so['name'],
+                        'partner': so['partner_shipping_id'][1], 'picking_type': t['name'], 'warnings': warnings,
+                        'lines': [{'sale_line_id': m['sale_line_id'], 'product': m['name'], 'qty': m['product_uom_qty'],
+                                   'description': m.get('description_picking')} for m in moves],
+                        'skipped': skipped})
+        picking_id = _new_delivery(header, moves, company_id)
+        cache.clear()
+        after = _read_delivery(picking_id)
+        _audit(ctx, 'create_delivery_from_order', 'stock.picking', picking_id,
+               {'order': so['name'], 'lines': [{'product': l['product'], 'qty': l['qty']} for l in after['lines']]},
+               after['name'])
+        return _ok({'status': 'created', 'message': '已建立草稿交貨單；出貨請用 validate_delivery_order',
+                    'warnings': warnings, 'skipped': skipped, 'delivery': after})
+    except Exception as e:
+        return _err(e, order_id=order_id)
+
+
+def validate_delivery_order(delivery_id: int, quantities: Optional[List[Dict]] = None,
+                            backorder: Optional[bool] = None, confirm: bool = False,
+                            ctx: Context = None) -> str:
+    """Validate a delivery order (Odoo's "Validate" button): the goods leave stock and the
+    delivery becomes Done, which is what the delivery slip PDF then shows. This cannot be
+    undone from here (only by a return in Odoo).
+
+    Without confirm=True it only shows what would happen. A draft delivery is marked as to
+    do first. Every line is delivered in full unless `quantities` says otherwise.
+
+    Args:
+        delivery_id: Delivery order ID
+        quantities: Done quantities for some lines: [{"line_id": 216, "quantity": 1}, ...]
+            (line_id from get_delivery_order_details or the create tools). Others = demand.
+        backorder: Needed only when a quantity is below the demand. True keeps the rest on
+            a new backorder delivery; False drops the rest.
+        confirm: Must be True to validate
+
+    Returns:
+        The delivery as read back (state "done"), plus warnings.
+    """
+    try:
+        p = _editable_delivery(delivery_id)
+        if p['state'] == 'done':
+            return _err(ValueError(f"{p['name']} 已經是完成狀態"))
+        company_id = p['company_id'][0]
+        moves = _wcall('stock.move', 'search_read', [[['picking_id', '=', delivery_id], ['state', '!=', 'cancel']]],
+                       {'fields': _DELIVERY_MOVE_FIELDS})
+        if not moves:
+            return _err(ValueError(f"{p['name']} 沒有明細，不能驗證"))
+        by_id = {m['id']: m for m in moves}
+        done = {m['id']: m['product_uom_qty'] for m in moves}
+        for n, q in enumerate(quantities or [], 1):
+            q = dict(q)
+            if 'line_id' not in q and 'id' in q:
+                q['line_id'] = q.pop('id')
+            unknown = [k for k in q if k not in ('line_id', 'quantity')]
+            if unknown or 'line_id' not in q or 'quantity' not in q:
+                return _err(ValueError(f"quantities 第 {n} 筆要是 {{\"line_id\": ..., \"quantity\": ...}}，收到 {q}"))
+            if q['line_id'] not in by_id:
+                return _err(ValueError(f"quantities 第 {n} 筆：明細 {q['line_id']} 不屬於 {p['name']}"))
+            done[q['line_id']] = _delivery_qty(q['quantity'], f"quantities 第 {n} 筆的 quantity")
+        if not any(done.values()):
+            return _err(ValueError('每一行的完成數量都是 0，不能驗證'))
+        short = [m for m in moves if done[m['id']] < m['product_uom_qty']]
+        warnings = []
+        prods = {x['id']: x for x in _wcall('product.product', 'read', [sorted({m['product_id'][0] for m in moves})],
+                                            {'fields': ['display_name', 'is_storable', 'free_qty']})}
+        for m in moves:
+            pr = prods[m['product_id'][0]]
+            if pr['is_storable'] and done[m['id']] > pr['free_qty']:
+                warnings.append(f"{pr['display_name']} 可用庫存只有 {pr['free_qty']}，出貨 {done[m['id']]} 會變成負庫存")
+        plan = [{'line_id': m['id'], 'product': m['product_id'][1], 'demand': m['product_uom_qty'],
+                 'quantity': done[m['id']]} for m in moves]
+        if short and backorder is None:
+            return _err(ValueError('有明細的完成數量少於需求：剩下的要另開欠單（backorder=True）還是不出了'
+                                   '（backorder=False）？請指定 backorder。未寫入任何資料'), lines=plan)
+        if not confirm:
+            return _ok({'status': 'preview', 'delivery': p['name'], 'state': p['state'],
+                        'message': '確認無誤後以 confirm=True 驗證；驗證後無法從這裡復原', 'lines': plan,
+                        'backorder': backorder if short else None, 'warnings': warnings})
+        if p['state'] == 'draft':
+            _wcall('stock.picking', 'action_confirm', [[delivery_id]], company_id=company_id)
+        for m in moves:
+            _wcall('stock.move', 'write', [[m['id']], {'quantity': done[m['id']], 'picked': True}], company_id=company_id)
+        # skip_backorder: no wizard; picking_ids_not_to_backorder: drop the rest instead of a backorder
+        vctx = {'skip_sms': True, 'skip_backorder': True}
+        if short and not backorder:
+            vctx['picking_ids_not_to_backorder'] = [delivery_id]
+        res = _wcall('stock.picking', 'button_validate', [[delivery_id]], {'context': vctx}, company_id=company_id)
+        if isinstance(res, dict) and res.get('res_model') == 'stock.backorder.confirmation':
+            wiz = _wcall('stock.backorder.confirmation', 'create',
+                         [{'pick_ids': [(6, 0, [delivery_id])],
+                           'backorder_confirmation_line_ids': [(0, 0, {'picking_id': delivery_id,
+                                                                       'to_backorder': bool(backorder)})]}],
+                         {'context': res.get('context') or {}}, company_id=company_id)
+            wiz = wiz[0] if isinstance(wiz, list) else wiz
+            _wcall('stock.backorder.confirmation', 'process' if backorder else 'process_cancel_backorder', [[wiz]],
+                   {'context': res.get('context') or {}}, company_id=company_id)
+        elif isinstance(res, dict):
+            cache.clear()
+            return _err(ValueError(f"Odoo 要求另外確認（{res.get('res_model') or res.get('name')}），這支工具無法處理；"
+                                   f"請到 Odoo 按驗證"), delivery=_read_delivery(delivery_id))
+        cache.clear()
+        after = _read_delivery(delivery_id)
+        if after['state'] != 'done':
+            return _err(ValueError(f"驗證後狀態是 {after['state']}，不是 done；請到 Odoo 檢查"), delivery=after)
+        backorders = _wcall('stock.picking', 'search_read', [[['backorder_id', '=', delivery_id]]], {'fields': ['name']})
+        _audit(ctx, 'validate_delivery_order', 'stock.picking', delivery_id,
+               {'from': p['state'], 'to': 'done', 'lines': plan, 'backorders': [b['name'] for b in backorders]},
+               after['name'])
+        return _ok({'status': 'validated', 'warnings': warnings, 'backorders': [b['name'] for b in backorders],
+                    'delivery': after})
+    except Exception as e:
+        return _err(e, delivery_id=delivery_id)
+
+
 WRITE_TOOLS = [
     create_quotation, update_quotation, update_quotation_lines,
     preview_quotation_copy, copy_quotation, confirm_quotation,
@@ -7713,6 +8062,7 @@ WRITE_TOOLS = [
     create_product, update_product,
     duplicate_invoice, create_invoice, post_invoice, draft_invoice,
     update_delivery_order, update_delivery_lines, download_delivery_pdf,
+    create_delivery_order, create_delivery_from_order, validate_delivery_order,
 ]
 
 
