@@ -1,10 +1,10 @@
 # Graylog MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **23 tools** (21 analysis/management + 2 debug), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **28 tools** (26 analysis/management + 2 debug), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.9.44
+- **Version:** 1.10.2
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 
 ---
@@ -144,7 +144,7 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 ---
 
-## Tools (23)
+## Tools (28)
 
 ### Log statistics & analysis
 
@@ -176,6 +176,16 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 | `list_index_sets` | Index sets with rotation/retention policy, shards/replicas, writable/default flags |
 | `list_indices` | Cluster health, total event count, active write target, per-index size/doc-count/time-range |
 | `list_fields` | Available message field names for query building (optional `prefix` filter + `limit`) |
+
+### Health and performance (read-only)
+
+| Tool | Description |
+|---|---|
+| `get_cluster_health` | One-call verdict for the whole cluster: per node heap %, journal backlog and age, buffer usage, throughput; OpenSearch status, processing lag, indexer failures (24 h), notifications; `findings` with severity and an overall `status` |
+| `get_node_metrics` | Raw per-node numbers: journal (with its size/age limits), JVM memory, input/process/output buffers, throughput |
+| `list_indexer_failures` | Messages OpenSearch refused to index in the last N hours, grouped by error type and field, with a sample value and a fix hint for date-mapping errors |
+| `list_system_notifications` | Graylog system notifications grouped by type and title, with counts, severity, latest time and nodes |
+| `find_silent_sources` | Sources that sent logs inside the lookback window but have been silent for at least N minutes (one aggregation query, no message sampling) |
 
 ### Content packs & dashboards
 
@@ -210,6 +220,10 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 ## Changelog (recent)
 
+- **v1.10.2** — Loads on Python 3.10 and 3.11 again (1.9.44 to 1.10.1 needed 3.12 because of a backslash inside an f-string expression). Counts stop at the first non-zero result, and an endpoint the server rejects with 404/405/415 (on Graylog 7.2, `POST /views/search/messages` gives 415) is skipped from then on, so a count no longer sends requests that always fail.
+- **v1.10.1** — `analyze_field_distribution` and `analyze_time_patterns` now aggregate in OpenSearch over the whole range (exact counts) instead of sampling a few thousand messages, so parsed fields no longer come back empty and hourly counts add up to the total; messages without the field are reported as `missing_field_count`. Falls back to sampling if the aggregation fails. Output is about 8x smaller.
+- **v1.10.0** — Added 5 read-only health and performance tools (`get_cluster_health`, `get_node_metrics`, `list_indexer_failures`, `list_system_notifications`, `find_silent_sources`) so an AI agent can check whether Graylog is healthy, what is slow, and which sources stopped sending. Per-node data goes through `/cluster/{nodeId}/…`, so one API token covers every node.
+- **v1.9.45** — Free-text queries on indices with more than 2048 fields are retried with their bare terms scoped to `message`; the count path no longer reports a misleading HTTP 405; OpenSearch errors returned as CSV by the export endpoint are raised as errors.
 - **v1.9.44** — SSE mode also serves Streamable HTTP at `/mcp` (stateless), so clients no longer get stuck on an uninitialized session after an SSE reconnect (all calls failing with `-32602`); API-key check moved to plain ASGI middleware (constant-time compare), ending the `AssertionError` logged on every SSE disconnect.
 - **v1.9.43** — Fixed bare numeric/IPv4 query terms failing with a generic error on streams with index field-mapping conflicts: auto-quote numeric/IP tokens, and surface the underlying OpenSearch error instead of swallowing it.
 - **v1.9.42** — Added 5 read-only infrastructure tools (`get_current_time`, `list_inputs`, `list_index_sets`, `list_indices`, `list_fields`) for parity with the official Graylog MCP.
