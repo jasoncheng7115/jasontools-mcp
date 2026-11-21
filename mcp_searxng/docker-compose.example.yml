@@ -1,0 +1,19 @@
+# Add this service next to your SearXNG service (same compose file / network).
+# SearXNG must have the JSON output format enabled (settings.yml: search.formats: [html, json]).
+services:
+  searxng-mcp:
+    build: ./searxng-mcp          # directory containing Dockerfile + mcp_searxng.py
+    container_name: searxng-mcp
+    restart: unless-stopped
+    networks: [searxng]
+    ports:
+      - "8021:8021"
+    environment:
+      - SEARXNG_URL=http://searxng:8080
+      # Optional: uncomment when the general web engines are blocked upstream.
+      # web_search then falls back to Wikipedia + DuckDuckGo Instant Answer, Stack Exchange and HN.
+      # - WEB_SEARCH_PAUSED=upstream engines blocked
+    depends_on: [searxng]
+
+networks:
+  searxng:

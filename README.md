@@ -6,6 +6,7 @@
 * OPNsense
 * phpIPAM
 * Proxmox VE
+* SearXNG
 * Wazuh
 * Zimbra
 
