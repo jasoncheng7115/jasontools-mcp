@@ -8,6 +8,7 @@ It is built to keep small models from hammering the search engines: answers are 
 - **License:** MIT
 - **Version:** 1.0.0
 - **Transport:** `streamable-http` at `/mcp` (port 8021)
+- **Languages:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
 ---
 

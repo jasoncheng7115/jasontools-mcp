@@ -1,6 +1,9 @@
-# LibreNMS MCP Server v4.5.1
+# LibreNMS MCP Server v4.5.2
 
 FastMCP-based LibreNMS API integration, optimized for weak/small LLMs (gpt-oss:120b etc.).
+
+- Languages: [English](README.md) · [繁體中文](README_zh-TW.md)
+
 
 ## Features
 

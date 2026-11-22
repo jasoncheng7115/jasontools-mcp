@@ -6,6 +6,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 - **License:** MIT
 - **Version:** 2.5.0
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
+- **Languages:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
 > Tested against **OPNsense 26.1.2 and 26.1.10**. Reads use the native API where one exists and fall back to `config.xml`, so older releases degrade instead of breaking — see [Minimum OPNsense version per data source](#minimum-opnsense-version-per-data-source). **Port forward needs 26.1+** for the API path; **firewall rules need 26.1+** to be complete (below that, see the cutover note).
 

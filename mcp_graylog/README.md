@@ -6,6 +6,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **G
 - **License:** MIT
 - **Version:** 1.10.2
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
+- **Languages:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
 ---
 

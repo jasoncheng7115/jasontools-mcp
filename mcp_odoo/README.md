@@ -7,6 +7,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **O
 - **Version:** 1.16.0
 - **Tested:** Odoo 13 and 18 Community Edition (write tools: Odoo 18)
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
+- **Languages:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
 ---
 
