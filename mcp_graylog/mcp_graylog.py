@@ -26,9 +26,15 @@ Technical Capabilities:
 - Time snapshot for batch queries to prevent time drift
 
 Author: Jason Cheng (Jason Tools)
-Version: 1.10.2
+Version: 1.11.0
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
+
+Changes in 1.11.0:
+- Added five read-only event/alert tools: list_event_definitions, get_event_definition,
+  search_events, get_event_source_messages and list_event_notifications.
+- Notifications never return recipients, URLs, tokens, passwords, headers or templates;
+  only which settings are set. Emails, URLs and IPs in their descriptions are masked.
 
 Changes in 1.10.2:
 - Fixed: the file did not load on Python 3.10/3.11 (backslash inside an f-string
@@ -213,7 +219,7 @@ from mcp.types import Resource, Tool, TextContent, ImageContent, EmbeddedResourc
 import mcp.types as types
 
 # Version information
-__version__ = "1.10.2"
+__version__ = "1.11.0"
 __author__ = "Jason Cheng (Jason Tools) - AI Collaboration"
 __license__ = "MIT"
 
@@ -2414,6 +2420,72 @@ async def handle_list_tools() -> List[Tool]:
                 "additionalProperties": False
             }
         ),
+        # === Events & alerts (read-only) ===
+        Tool(
+            name="list_event_definitions",
+            description="Read-only list of event definitions (alert rules): id, title, priority, state, query, streams, search window, schedule (last/next run) and bound notifications. Filter by title text, state or priority; paginated. Use for 'which alert rules exist / are enabled'.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Case-insensitive text matched against title and description", "default": ""},
+                    "state": {"type": "string", "enum": ["all", "enabled", "disabled"], "default": "all"},
+                    "priority": {"type": "integer", "description": "1=low, 2=normal, 3=high, 4=critical; omit for all"},
+                    "page": {"type": "integer", "default": 1, "minimum": 1},
+                    "per_page": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200}
+                },
+                "additionalProperties": False
+            }
+        ),
+        Tool(
+            name="get_event_definition",
+            description="Read-only full configuration of one event definition by id: query, filters, streams, group-by, aggregation conditions, search window/interval or cron, event fields, notifications (names only) and scheduler status.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_definition_id": {"type": "string", "description": "Event definition id (from list_event_definitions or search_events)"}
+                },
+                "required": ["event_definition_id"],
+                "additionalProperties": False
+            }
+        ),
+        Tool(
+            name="search_events",
+            description="Read-only search of triggered events/alerts in a time range. Filter by event definition ids, priority, alert flag or a query on event fields. Returns each event (time, definition, priority, message, key, group-by values, source streams) plus counts per definition. Use for 'which alerts fired in the last 24h'.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "range_from": {"type": "string", "description": "Start time, e.g. 'now-24h' or UTC '2026-01-01T00:00:00Z'", "default": "now-24h"},
+                    "range_to": {"type": "string", "default": "now"},
+                    "event_definition_ids": {"type": "array", "items": {"type": "string"}, "description": "Only these definitions"},
+                    "priority": {"type": "integer", "description": "Only this priority (1-4)"},
+                    "alerts": {"type": "string", "enum": ["include", "only", "exclude"], "default": "include", "description": "include=all events, only=alerts only, exclude=non-alert events only"},
+                    "query": {"type": "string", "description": "Optional Lucene query on event fields, e.g. 'source:mg1'", "default": ""},
+                    "page": {"type": "integer", "default": 1, "minimum": 1},
+                    "per_page": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200}
+                },
+                "additionalProperties": False
+            }
+        ),
+        Tool(
+            name="get_event_source_messages",
+            description="Read-only: fetch the log messages that triggered one event, using the event's replay info (time window, query, streams, group-by values). Use after search_events to investigate an alert.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "Event id from search_events"},
+                    "lookback_days": {"type": "integer", "description": "How far back to look for the event", "default": 30, "minimum": 1, "maximum": 365},
+                    "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": 200},
+                    "fields": {"type": "array", "items": {"type": "string"}, "description": "Fields to return; omit for all fields (values truncated)"}
+                },
+                "required": ["event_id"],
+                "additionalProperties": False
+            }
+        ),
+        Tool(
+            name="list_event_notifications",
+            description="Read-only list of event notifications: id, title, type and which event definitions use each. Recipients, URLs, tokens, passwords and headers are never returned; only whether they are set.",
+            inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+        ),
         Tool(
             name="list_fields",
             description="List available message field names for building queries. Optional 'prefix' substring filter (case-insensitive) and 'limit'. Returns names only; use analyze_field_distribution for value stats.",
@@ -2820,6 +2892,153 @@ def _aggregate_time_patterns(rows: List[Dict], five_minute: bool) -> Dict:
             for start, count in sorted(series.items())
         ]
     return result
+
+
+_EVENT_PRIORITY = {1: "low", 2: "normal", 3: "high", 4: "critical"}
+_EVENT_TEXT_MAX = 300
+
+
+def _clip(value, limit=_EVENT_TEXT_MAX):
+    """Truncate long strings so tool output stays small."""
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit] + "..."
+    return value
+
+
+async def _fetch_all_pages(client, path, key, per_page=500, max_pages=20, params=None):
+    """Read a paginated Graylog list endpoint completely (bounded). Returns (items, total, merged scheduler context)."""
+    items, total, scheduler = [], None, {}
+    for page in range(1, max_pages + 1):
+        query = dict(params or {})
+        query.update({"page": page, "per_page": per_page})
+        response = await client.get(path, params=query)
+        if not isinstance(response, dict):
+            break
+        batch = response.get(key, [])
+        total = response.get("total", total)
+        items.extend(batch)
+        scheduler.update(((response.get("context") or {}).get("scheduler")) or {})
+        if len(batch) < per_page or (total is not None and len(items) >= total):
+            break
+    return items, total, {"scheduler": scheduler}
+
+
+async def _event_lookup_names(client):
+    """Map stream and notification ids to titles."""
+    streams = {}
+    try:
+        for stream in (await client.get("/streams")).get("streams", []):
+            streams[stream.get("id")] = stream.get("title")
+    except Exception as e:
+        logger.warning(f"Stream lookup failed: {e}")
+    notifications = {}
+    try:
+        items, _, _ = await _fetch_all_pages(client, "/events/notifications", "notifications")
+        for item in items:
+            notifications[item.get("id")] = {"title": item.get("title"), "type": (item.get("config") or {}).get("type")}
+    except Exception as e:
+        logger.warning(f"Notification lookup failed: {e}")
+    return streams, notifications
+
+
+def _event_definition_summary(definition, streams, notifications, scheduler):
+    """Compact view of an event definition for list output."""
+    config = definition.get("config") or {}
+    sched = scheduler.get(definition.get("id")) or {}
+    item = {
+        "id": definition.get("id"),
+        "title": definition.get("title"),
+        "priority": definition.get("priority"),
+        "priority_label": _EVENT_PRIORITY.get(definition.get("priority")),
+        "state": definition.get("state"),
+        "alert": definition.get("alert"),
+        "type": config.get("type"),
+        "query": _clip(config.get("query"), 200),
+        "streams": [streams.get(sid, sid) for sid in config.get("streams") or []],
+        "last_matched": definition.get("matched_at"),
+        "notifications": [(notifications.get(n.get("notification_id")) or {}).get("title") or n.get("notification_id")
+                          for n in definition.get("notifications") or []],
+    }
+    if config.get("search_within_ms") is not None:
+        item["search_within_min"] = round(config["search_within_ms"] / 60000, 2)
+    if config.get("use_cron_scheduling"):
+        item["cron"] = f"{config.get('cron_expression')} ({config.get('cron_timezone')})"
+    elif config.get("execute_every_ms") is not None:
+        item["execute_every_min"] = round(config["execute_every_ms"] / 60000, 2)
+    if sched:
+        item["scheduler"] = {"status": sched.get("status"), "last_run": sched.get("triggered_at"),
+                             "next_run": sched.get("next_time")}
+    return {k: v for k, v in item.items() if v not in (None, [], "")}
+
+
+def _event_summary(document, definitions, streams):
+    """Compact view of one triggered event."""
+    event = document.get("event", document)
+    definition_id = event.get("event_definition_id")
+    item = {
+        "id": event.get("id"),
+        "timestamp": event.get("timestamp"),
+        "event_definition_id": definition_id,
+        "event_definition": (definitions.get(definition_id) or {}).get("title"),
+        "priority": event.get("priority"),
+        "priority_label": _EVENT_PRIORITY.get(event.get("priority")),
+        "alert": event.get("alert"),
+        "message": _clip(event.get("message")),
+        "key": event.get("key"),
+        "group_by": event.get("group_by_fields") or None,
+        "aggregation": event.get("aggregation_conditions") or None,
+        "fields": {k: _clip(v, 200) for k, v in (event.get("fields") or {}).items()} or None,
+        "source_streams": [streams.get(sid, sid) for sid in event.get("source_streams") or []],
+        "window": f"{event.get('timerange_start')} .. {event.get('timerange_end')}" if event.get("timerange_start") else None,
+        "index": document.get("index_name"),
+    }
+    return {k: v for k, v in item.items() if v not in (None, [], "")}
+
+
+_SECRET_KEY_HINTS = ("password", "secret", "token", "api_key", "apikey", "auth", "header", "url",
+                     "recipient", "email", "user", "sender", "reply_to", "cc", "bcc", "webhook",
+                     "channel", "body", "template", "subject", "key")
+
+
+def _notification_safe_config(config):
+    """Report only which notification settings are set, never their values."""
+    safe = {"type": config.get("type")}
+    configured, counts = [], {}
+    for key, value in config.items():
+        if isinstance(value, dict) and "is_set" in value:
+            value = bool(value.get("is_set"))
+        if key == "type" or value in (None, "", [], {}, False):
+            continue
+        if value is True and any(h in key.lower() for h in _SECRET_KEY_HINTS):
+            configured.append(key)
+            continue
+        if isinstance(value, bool) and not any(h in key.lower() for h in _SECRET_KEY_HINTS):
+            safe[key] = value
+        elif isinstance(value, list) and any(h in key.lower() for h in ("recipient", "email", "user", "cc")):
+            counts[key] = len(value)
+        else:
+            configured.append(key)
+    safe["configured"] = sorted(configured)
+    if counts:
+        safe["recipient_counts"] = counts
+    return safe
+
+
+_REDACT_PATTERNS = [
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[email]"),
+    (re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.I), "[url]"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[ip]"),
+    (re.compile(r"\b[A-Za-z0-9_-]{32,}\b"), "[secret]"),
+]
+
+
+def _redact_text(value):
+    """Mask emails, URLs, IP addresses and token-like strings in free text."""
+    if not isinstance(value, str):
+        return value
+    for pattern, replacement in _REDACT_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
 
 
 def _health_timestamp(value):
@@ -4043,6 +4262,196 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                         "note": "A source only appears if it sent anything inside the lookback window; pivot returns at most 1000 sources."}
             except Exception as e:
                 raise GraylogError(f"Failed to find silent sources: {e}")
+
+        elif name == "list_event_definitions":
+            try:
+                text = str(arguments.get("query", "") or "").strip().lower()
+                state = str(arguments.get("state", "all")).lower()
+                priority = arguments.get("priority")
+                page = max(1, int(arguments.get("page", 1)))
+                per_page = min(max(1, int(arguments.get("per_page", 50))), 200)
+                items, total, context = await _fetch_all_pages(client, "/events/definitions", "event_definitions")
+                scheduler = (context or {}).get("scheduler") or {}
+                streams, notifications = await _event_lookup_names(client)
+                selected = []
+                for definition in items:
+                    if state != "all" and str(definition.get("state", "")).lower() != state:
+                        continue
+                    if priority is not None and definition.get("priority") != int(priority):
+                        continue
+                    if text and text not in f"{definition.get('title', '')} {definition.get('description', '')}".lower():
+                        continue
+                    selected.append(definition)
+                selected.sort(key=lambda d: str(d.get("title", "")).lower())
+                start = (page - 1) * per_page
+                rows = [_event_definition_summary(d, streams, notifications, scheduler) for d in selected[start:start + per_page]]
+                by_state = Counter(str(d.get("state")) for d in items)
+                return {"total_definitions": total if total is not None else len(items), "by_state": dict(by_state),
+                        "matched": len(selected), "page": page, "per_page": per_page,
+                        "has_more": start + per_page < len(selected), "event_definitions": rows}
+            except Exception as e:
+                raise GraylogError(f"Failed to list event definitions: {e}")
+
+        elif name == "get_event_definition":
+            try:
+                definition_id = str(arguments["event_definition_id"]).strip()
+                definition = await client.get(f"/events/definitions/{definition_id}")
+                streams, notifications = await _event_lookup_names(client)
+                scheduler = {}
+                try:
+                    listing = await client.get("/events/definitions", params={"query": definition.get("title", ""), "per_page": 50})
+                    scheduler = (listing.get("context") or {}).get("scheduler") or {}
+                except Exception as e:
+                    logger.warning(f"Scheduler lookup failed: {e}")
+                config = dict(definition.get("config") or {})
+                config["streams"] = [streams.get(sid, sid) for sid in config.get("streams") or []]
+                if isinstance(config.get("query"), str):
+                    config["query"] = _clip(config["query"], 2000)
+                result = {
+                    "id": definition.get("id"),
+                    "title": definition.get("title"),
+                    "description": _clip(definition.get("description"), 1000),
+                    "priority": definition.get("priority"),
+                    "priority_label": _EVENT_PRIORITY.get(definition.get("priority")),
+                    "state": definition.get("state"),
+                    "alert": definition.get("alert"),
+                    "updated_at": definition.get("updated_at"),
+                    "last_matched": definition.get("matched_at"),
+                    "config": config,
+                    "key_spec": definition.get("key_spec"),
+                    "field_spec": {k: {"type": (v or {}).get("data_type"), "provider": [(p or {}).get("type") for p in (v or {}).get("providers") or []]}
+                                   for k, v in (definition.get("field_spec") or {}).items()},
+                    "notification_settings": definition.get("notification_settings"),
+                    "notifications": [{"id": n.get("notification_id"),
+                                       "title": (notifications.get(n.get("notification_id")) or {}).get("title"),
+                                       "type": (notifications.get(n.get("notification_id")) or {}).get("type")}
+                                      for n in definition.get("notifications") or []],
+                    "tags": definition.get("tags") or None,
+                    "tactics_techniques": definition.get("tactics_techniques") or None,
+                }
+                sched = scheduler.get(definition.get("id"))
+                if sched:
+                    result["scheduler"] = {"status": sched.get("status"), "last_run": sched.get("triggered_at"),
+                                           "next_run": sched.get("next_time"), "queued_notifications": sched.get("queued_notifications")}
+                return {k: v for k, v in result.items() if v not in (None, [], "", {})}
+            except Exception as e:
+                raise GraylogError(f"Failed to get event definition: {e}")
+
+        elif name == "search_events":
+            try:
+                range_from = arguments.get("range_from", "now-24h")
+                range_to = arguments.get("range_to", "now")
+                tr = client._build_timerange(range_from, range_to)
+                timerange = ({"type": "relative", "range": tr["range"]} if tr["type"] == "relative"
+                             else {"type": "absolute", "from": tr["from"], "to": tr["to"]})
+                page = max(1, int(arguments.get("page", 1)))
+                per_page = min(max(1, int(arguments.get("per_page", 50))), 200)
+                query = str(arguments.get("query", "") or "").strip()
+                if arguments.get("priority") is not None:
+                    clause = f"priority:{int(arguments['priority'])}"
+                    query = f"({query}) AND {clause}" if query else clause
+                event_filter = {"alerts": arguments.get("alerts", "include")}
+                if arguments.get("event_definition_ids"):
+                    event_filter["event_definitions"] = list(arguments["event_definition_ids"])
+                body = {"query": query, "page": page, "per_page": per_page, "filter": event_filter,
+                        "timerange": timerange, "sort_by": "timestamp", "sort_direction": "desc"}
+                response = await client.post("/events/search", data=body)
+                context = response.get("context") or {}
+                definitions = context.get("event_definitions") or {}
+                streams = {sid: (info or {}).get("title") for sid, info in (context.get("streams") or {}).items()}
+                missing = set()
+                for document in response.get("events", []):
+                    missing.update(sid for sid in (document.get("event") or {}).get("source_streams") or [] if sid not in streams)
+                if missing:
+                    try:
+                        for stream in (await client.get("/streams")).get("streams", []):
+                            streams.setdefault(stream.get("id"), stream.get("title"))
+                    except Exception as e:
+                        logger.warning(f"Stream lookup failed: {e}")
+                events = [_event_summary(document, definitions, streams) for document in response.get("events", [])]
+                total = response.get("total_events", len(events))
+                per_definition = Counter((e.get("event_definition") or e.get("event_definition_id")) for e in events)
+                return {"time_range": {"from": range_from, "to": range_to}, "total_events": total,
+                        "page": page, "per_page": per_page, "has_more": page * per_page < total,
+                        "page_counts_by_definition": dict(per_definition.most_common()),
+                        "events": events}
+            except Exception as e:
+                raise GraylogError(f"Failed to search events: {e}")
+
+        elif name == "get_event_source_messages":
+            try:
+                event_id = str(arguments["event_id"]).strip()
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", event_id):
+                    raise GraylogError("event_id must be the id returned by search_events")
+                lookback = min(max(1, int(arguments.get("lookback_days", 30))), 365)
+                limit = min(max(1, int(arguments.get("limit", 20))), 200)
+                fields = arguments.get("fields") or []
+                found = await client.post("/events/search", data={
+                    "query": f"id:{event_id}", "page": 1, "per_page": 1, "filter": {"alerts": "include"},
+                    "timerange": {"type": "relative", "range": lookback * 86400}})
+                documents = found.get("events", []) if isinstance(found, dict) else []
+                if not documents:
+                    return {"event_id": event_id, "found": False,
+                            "note": f"No event with this id in the last {lookback} days. Increase lookback_days or check the id."}
+                event = documents[0].get("event", {})
+                replay = event.get("replay_info") or {}
+                if not replay.get("timerange_start"):
+                    return {"event_id": event_id, "found": True, "event": _event_summary(documents[0], {}, {}),
+                            "note": "This event has no replay info (e.g. a system event), so its source messages cannot be looked up."}
+                base_query = (replay.get("query") or "").strip() or "*"
+                clauses = []
+                for field, value in (event.get("group_by_fields") or {}).items():
+                    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+                    clauses.append(f'{field}:"{escaped}"')
+                query = base_query if not clauses else (f"({base_query}) AND " if base_query != "*" else "") + " AND ".join(clauses)
+                params = {"query": query, "from": replay["timerange_start"], "to": replay["timerange_end"],
+                          "limit": limit, "sort": "timestamp:desc"}
+                stream_ids = replay.get("streams") or []
+                if stream_ids:
+                    params["filter"] = "streams:" + ",".join(stream_ids)
+                if fields:
+                    params["fields"] = ",".join(fields)
+                response = await client.get("/search/universal/absolute", params=params)
+                messages = []
+                for item in response.get("messages", []) if isinstance(response, dict) else []:
+                    message = item.get("message", {})
+                    if fields:
+                        message = {k: message.get(k) for k in fields if k in message}
+                    else:
+                        message = {k: v for k, v in message.items() if not k.startswith("gl2_") and k != "streams"}
+                    messages.append({k: _clip(v) for k, v in message.items()})
+                streams, _ = await _event_lookup_names(client)
+                return {"event": _event_summary(documents[0], {}, streams),
+                        "replay": {"query": query, "from": replay["timerange_start"], "to": replay["timerange_end"],
+                                   "streams": [streams.get(sid, sid) for sid in stream_ids]},
+                        "total_results": response.get("total_results") if isinstance(response, dict) else None,
+                        "returned": len(messages), "messages": messages}
+            except GraylogError:
+                raise
+            except Exception as e:
+                raise GraylogError(f"Failed to get event source messages: {e}")
+
+        elif name == "list_event_notifications":
+            try:
+                notifications, total, _ = await _fetch_all_pages(client, "/events/notifications", "notifications")
+                definitions, _, _ = await _fetch_all_pages(client, "/events/definitions", "event_definitions")
+                used_by = defaultdict(list)
+                for definition in definitions:
+                    for n in definition.get("notifications") or []:
+                        used_by[n.get("notification_id")].append(definition.get("title"))
+                rows = []
+                for item in notifications:
+                    users = sorted(t for t in used_by.get(item.get("id"), []) if t)
+                    rows.append({"id": item.get("id"), "title": item.get("title"),
+                                 "description": _clip(_redact_text(item.get("description")), 200) or None,
+                                 **_notification_safe_config(item.get("config") or {}),
+                                 "used_by_count": len(users), "used_by": users[:20]})
+                rows.sort(key=lambda r: str(r.get("title", "")).lower())
+                return {"total": total if total is not None else len(rows),
+                        "note": "Recipients, URLs, tokens, passwords, headers and templates are never returned; 'configured' lists only which settings are set. Emails, URLs and IPs in descriptions are masked.",
+                        "notifications": [{k: v for k, v in r.items() if v is not None} for r in rows]}
+            except Exception as e:
+                raise GraylogError(f"Failed to list event notifications: {e}")
 
         elif name == "list_fields":
             prefix = str(arguments.get("prefix", "") or "").lower()

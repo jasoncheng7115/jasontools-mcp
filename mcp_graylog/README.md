@@ -1,10 +1,10 @@
 # Graylog MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **28 tools** (26 analysis/management + 2 debug), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **33 tools** (31 analysis/management + 2 debug), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.10.2
+- **Version:** 1.11.0
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 - **Languages:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -16,6 +16,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **G
 - **Analysis** — temporal patterns (peaks/spikes), source ranking, error-pattern extraction, log-level distribution (with error/warning rates), and arbitrary field value distribution.
 - **Search & export** — paginated search, raw log sampling, and high-volume export/analysis.
 - **Streams & system** — list streams, server version / cluster / node info.
+- **Events & alerts** — event definitions, triggered events with their source messages, and notifications (secrets never returned).
 - **Content packs & dashboards** — list/inspect content packs (incl. extracted dashboards/widgets from a revision) and dashboards.
 - **Robust operations** — time-snapshot for batch queries (prevents time drift), adaptive timeouts, partial-result fallback, query-string normalization following Graylog escaping rules.
 - **Token-efficient output** — compact JSON, flattened returns, trimmed metadata for smaller LLM context.
@@ -145,7 +146,7 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 ---
 
-## Tools (28)
+## Tools (33)
 
 ### Log statistics & analysis
 
@@ -188,6 +189,18 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 | `list_system_notifications` | Graylog system notifications grouped by type and title, with counts, severity, latest time and nodes |
 | `find_silent_sources` | Sources that sent logs inside the lookback window but have been silent for at least N minutes (one aggregation query, no message sampling) |
 
+### Events & alerts (read-only)
+
+| Tool | Description |
+|---|---|
+| `list_event_definitions` | Event definitions (alert rules) with priority, state, query, streams, search window, last/next run and notifications; filter by text, state or priority; paginated |
+| `get_event_definition` | Full configuration of one definition: query, filters, group-by, conditions, schedule (interval or cron), event fields, notification names, scheduler status |
+| `search_events` | Triggered events/alerts in a time range, filtered by definition, priority, alert flag or a query on event fields; includes counts per definition; paginated |
+| `get_event_source_messages` | The log messages behind one event, rebuilt from its replay info (window, query, streams, group-by values) |
+| `list_event_notifications` | Notifications with type and the definitions that use them; recipients, URLs, tokens, passwords, headers and templates are never returned (only which settings are set), and emails/URLs/IPs in descriptions are masked |
+
+Graylog permissions needed: `eventdefinitions:read` (definitions), `eventnotifications:read` (notifications), read access to the **All events** stream for `search_events`, and read access to the source streams for `get_event_source_messages`. A token of a user without these gets HTTP 403 for that tool only.
+
 ### Content packs & dashboards
 
 | Tool | Description |
@@ -221,6 +234,7 @@ Each tool is then available at `POST http://host:8001/<tool_name>` with `Authori
 
 ## Changelog (recent)
 
+- **v1.11.0** — Added 5 read-only event/alert tools (`list_event_definitions`, `get_event_definition`, `search_events`, `get_event_source_messages`, `list_event_notifications`). Notifications never return recipients, URLs, tokens, passwords, headers or templates, and emails/URLs/IPs in their descriptions are masked.
 - **v1.10.2** — Loads on Python 3.10 and 3.11 again (1.9.44 to 1.10.1 needed 3.12 because of a backslash inside an f-string expression). Counts stop at the first non-zero result, and an endpoint the server rejects with 404/405/415 (on Graylog 7.2, `POST /views/search/messages` gives 415) is skipped from then on, so a count no longer sends requests that always fail.
 - **v1.10.1** — `analyze_field_distribution` and `analyze_time_patterns` now aggregate in OpenSearch over the whole range (exact counts) instead of sampling a few thousand messages, so parsed fields no longer come back empty and hourly counts add up to the total; messages without the field are reported as `missing_field_count`. Falls back to sampling if the aggregation fails. Output is about 8x smaller.
 - **v1.10.0** — Added 5 read-only health and performance tools (`get_cluster_health`, `get_node_metrics`, `list_indexer_failures`, `list_system_notifications`, `find_silent_sources`) so an AI agent can check whether Graylog is healthy, what is slow, and which sources stopped sending. Per-node data goes through `/cluster/{nodeId}/…`, so one API token covers every node.

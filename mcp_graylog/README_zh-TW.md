@@ -1,10 +1,10 @@
 # Graylog MCP Server
 
-這是 **Graylog** 的 [Model Context Protocol](https://modelcontextprotocol.io) (MCP) 伺服器，以單一檔案提供進階的記錄分析、統計與匯出功能。共提供 **28 個工具** (26 個分析／管理工具 + 2 個除錯工具)，並運用多種技巧突破 Graylog 標準 API 的結果數量限制 (Export API、時間切片、智慧分頁)，讓資料量非常大時的計數與分布依然準確。
+這是 **Graylog** 的 [Model Context Protocol](https://modelcontextprotocol.io) (MCP) 伺服器，以單一檔案提供進階的記錄分析、統計與匯出功能。共提供 **33 個工具** (31 個分析／管理工具 + 2 個除錯工具)，並運用多種技巧突破 Graylog 標準 API 的結果數量限制 (Export API、時間切片、智慧分頁)，讓資料量非常大時的計數與分布依然準確。
 
 - 作者：Jason Cheng (Jason Tools)
 - 授權：MIT
-- 版本：1.10.2
+- 版本：1.11.0
 - 傳輸方式：`stdio` (預設)、`sse`、`streamable-http`
 - 語言：[English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -16,6 +16,7 @@
 - **分析**：時間模式 (尖峰／暴增)、來源排名、錯誤模式擷取、記錄層級分布 (含錯誤率／警告率)，以及任意欄位的值分布。
 - **搜尋與匯出**：分頁搜尋、原始記錄取樣，以及大量匯出／分析。
 - **串流與系統**：列出串流、伺服器版本／叢集／節點資訊。
+- **事件與告警**：事件定義、觸發的事件與其原始記錄、通知 (機密一律不回傳)。
 - **內容套件與看板**：列出／檢視內容套件 (包含從修訂版本擷取出的看板／小工具) 與看板。
 - **穩健的運作**：批次查詢使用時間快照 (避免時間漂移)、自動調整逾時、部分結果備援、依照 Graylog 跳脫規則正規化查詢字串。
 - **節省 Token 的輸出**：精簡 JSON、扁平化回傳、精簡中繼資料，讓 LLM 的上下文更小。
@@ -144,7 +145,7 @@ uvx mcpo --port 8001 --api-key "YOUR_MCPO_KEY" -- \
 
 ---
 
-## 工具 (28)
+## 工具 (33)
 
 ### 記錄統計與分析
 
@@ -187,6 +188,18 @@ uvx mcpo --port 8001 --api-key "YOUR_MCPO_KEY" -- \
 | `list_system_notifications` | Graylog 系統通知，依類型與標題分組，含次數、嚴重程度、最新時間與節點 |
 | `find_silent_sources` | 在回溯時間範圍內有送出記錄、但已至少 N 分鐘沒有動靜的來源 (一次彙總查詢，不取樣訊息) |
 
+### 事件與告警 (唯讀)
+
+| 工具 | 說明 |
+|---|---|
+| `list_event_definitions` | 事件定義 (告警規則)：優先度、狀態、查詢、串流、搜尋時間窗、上次／下次執行與通知；可依文字、狀態或優先度篩選並分頁 |
+| `get_event_definition` | 單一事件定義的完整設定：查詢、篩選、分組欄位、條件、排程 (間隔或 cron)、事件欄位、通知名稱與排程狀態 |
+| `search_events` | 指定時間範圍內觸發的事件／告警，可依事件定義、優先度、是否為告警或事件欄位查詢篩選；附每個事件定義的筆數並分頁 |
+| `get_event_source_messages` | 用事件的重播資訊 (時間窗、查詢、串流、分組值) 找出觸發這筆事件的原始記錄 |
+| `list_event_notifications` | 通知的類型與使用它的事件定義；收件人、URL、權杖、密碼、標頭與範本一律不回傳 (只標示哪些設定有值)，說明裡的 Email、URL、IP 也會遮蔽 |
+
+需要的 Graylog 權限：`eventdefinitions:read` (事件定義)、`eventnotifications:read` (通知)、`search_events` 需要 **All events** 串流的讀取權限、`get_event_source_messages` 需要來源串流的讀取權限。使用者缺少權限時，只有該工具會收到 HTTP 403。
+
 ### 內容套件與看板
 
 | 工具 | 說明 |
@@ -220,6 +233,7 @@ uvx mcpo --port 8001 --api-key "YOUR_MCPO_KEY" -- \
 
 ## 變更記錄 (近期)
 
+- **v1.11.0** — 新增 5 個唯讀事件／告警工具 (`list_event_definitions`、`get_event_definition`、`search_events`、`get_event_source_messages`、`list_event_notifications`)。通知一律不回傳收件人、URL、權杖、密碼、標頭或範本，說明裡的 Email、URL、IP 也會遮蔽。
 - **v1.10.2** — 又能在 Python 3.10 與 3.11 上載入 (1.9.44 到 1.10.1 因為 f-string 運算式內含反斜線而需要 3.12)。計數在取得第一個非零結果時就停止，而伺服器以 404/405/415 拒絕的端點 (在 Graylog 7.2 上，`POST /views/search/messages` 會回傳 415) 之後會直接略過，因此計數不會再送出注定失敗的請求。
 - **v1.10.1** — `analyze_field_distribution` 與 `analyze_time_patterns` 現在改在 OpenSearch 中對整個範圍做彙總 (精確計數)，而不是只取樣幾千筆訊息，因此已剖析的欄位不會再回傳空值，每小時的計數加總也會等於總數；沒有該欄位的訊息會以 `missing_field_count` 回報。若彙總失敗則改回取樣。輸出大約縮小為 1/8。
 - **v1.10.0** — 新增 5 個唯讀的健康狀態與效能工具 (`get_cluster_health`、`get_node_metrics`、`list_indexer_failures`、`list_system_notifications`、`find_silent_sources`)，讓 AI 代理程式能檢查 Graylog 是否健康、哪裡變慢，以及哪些來源停止傳送。各節點的資料透過 `/cluster/{nodeId}/…` 取得，因此一個 API 權杖即可涵蓋所有節點。
