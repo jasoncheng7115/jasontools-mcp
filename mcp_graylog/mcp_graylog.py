@@ -26,9 +26,27 @@ Technical Capabilities:
 - Time snapshot for batch queries to prevent time drift
 
 Author: Jason Cheng (Jason Tools)
-Version: 1.11.0
+Version: 1.12.0
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
+
+Changes in 1.12.0:
+- get_log_statistics and get_log_level_analysis use server-side aggregation (exact counts
+  over the whole range, a few requests) instead of sampling; sampling is only the fallback.
+  On a busy Graylog 7.2 a 1-hour statistics call went from ~65 s and 52 requests to 0.5 s.
+- Error/warning rates count numeric syslog levels (0-3 error, 4 warning); they were 0 before.
+- Requests are adjusted to what each endpoint accepts: "*"/"*:*"/"" become "" for
+  /views/search (leading wildcard is rejected with 400) and "*" for /search/universal
+  (empty is rejected with 400); universal searches are capped at the 10000 result window
+  (they failed with 500). These were failing on every time slice.
+- An endpoint answering 404/405/415 is skipped for the rest of the process (per host,
+  method, path and response type), instead of being retried.
+- Embedding: no logging setup or log file on import (main() calls configure_logging());
+  call_tool(name, args, config=...) runs one tool with its own URL and credentials;
+  limits via GRAYLOG_MAX_ANALYSIS_MESSAGES, GRAYLOG_MAX_TIME_SLICES, GRAYLOG_MAX_RESULT_WINDOW;
+  log file via GRAYLOG_MCP_LOG_FILE ("off" disables it), now rotated at 20 MB (3 kept).
+- Debug tools test_accurate_counting and test_source_analysis_fix are hidden unless
+  GRAYLOG_ENABLE_DEBUG_TOOLS=1.
 
 Changes in 1.11.0:
 - Added five read-only event/alert tools: list_event_definitions, get_event_definition,
@@ -199,6 +217,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import time
@@ -219,20 +238,43 @@ from mcp.types import Resource, Tool, TextContent, ImageContent, EmbeddedResourc
 import mcp.types as types
 
 # Version information
-__version__ = "1.11.0"
+__version__ = "1.12.0"
 __author__ = "Jason Cheng (Jason Tools) - AI Collaboration"
 __license__ = "MIT"
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("graylog-mcp-server")
 
-# File logging — always captures DEBUG+ for troubleshooting
-_log_file = os.path.join(os.path.expanduser("~"), ".mcp_graylog.log")
-_file_handler = logging.FileHandler(_log_file, encoding="utf-8")
-_file_handler.setLevel(logging.DEBUG)
-_file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-logger.addHandler(_file_handler)
+
+def _env_int(name: str, default: int) -> int:
+    """Integer limit from the environment, falling back to the default on bad input."""
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Limits (override with environment variables when embedding or on very large clusters)
+MAX_ANALYSIS_MESSAGES = _env_int("GRAYLOG_MAX_ANALYSIS_MESSAGES", 30000)
+MAX_TIME_SLICES = _env_int("GRAYLOG_MAX_TIME_SLICES", 100)
+ENABLE_DEBUG_TOOLS = os.environ.get("GRAYLOG_ENABLE_DEBUG_TOOLS", "").strip().lower() in ("1", "true", "yes")
+_DEBUG_TOOLS = {"test_accurate_counting", "test_source_analysis_fix"}
+
+
+def configure_logging(log_file: Optional[str] = None) -> None:
+    """Console + file logging for the standalone server. Not run on import, so embedding
+    applications keep their own logging setup; main() calls it."""
+    logging.basicConfig(level=logging.INFO)
+    path = log_file or os.environ.get("GRAYLOG_MCP_LOG_FILE") or os.path.join(os.path.expanduser("~"), ".mcp_graylog.log")
+    if path.lower() in ("", "none", "off"):
+        return
+    try:
+        handler = logging.handlers.RotatingFileHandler(path, maxBytes=20 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    except OSError as e:
+        logger.warning(f"File logging disabled ({path}): {e}")
+        return
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
 
 class GraylogError(Exception):
     """Custom exception for Graylog related errors"""
@@ -351,10 +393,10 @@ class LogAnalyzer:
             if timestamp:
                 level_timeline[level].append(timestamp)
         
-        # Calculate error rate
+        # Calculate error rate (string levels and numeric syslog levels 0-4)
         total = len(messages)
-        error_count = level_counts.get('error', 0) + level_counts.get('critical', 0) + level_counts.get('fatal', 0)
-        warning_count = level_counts.get('warning', 0) + level_counts.get('warn', 0)
+        error_count = sum(c for lv, c in level_counts.items() if _level_class(lv) == "error")
+        warning_count = sum(c for lv, c in level_counts.items() if _level_class(lv) == "warning")
         
         return {
             "level_distribution": dict(level_counts),
@@ -501,6 +543,46 @@ class LogAnalyzer:
 
 # (host, count strategy) pairs the server answered 404/405/415 for; skipped afterwards.
 _UNSUPPORTED_COUNT_STRATEGIES = set()
+# (host, method, path, wants_csv) answered 404/405/415: the server does not offer it, skip for the rest of the process.
+_UNSUPPORTED_ENDPOINTS = set()
+_UNSUPPORTED_ENDPOINT_RE = re.compile(r"^(?:HTTP (?:404|405|415)\b|API endpoint not found)")
+# OpenSearch rejects from + size above index.max_result_window (default 10000) with HTTP 500.
+MAX_RESULT_WINDOW = int(os.environ.get("GRAYLOG_MAX_RESULT_WINDOW", "10000"))
+_MATCH_ALL_QUERIES = {"", "*", "*:*"}
+
+
+def _normalize_request_query(method: str, path: str, params: Optional[Dict], data: Optional[Dict]):
+    """Adjust queries and limits to what each endpoint accepts (copies, never mutates).
+
+    - /search/universal/* (GET) rejects an empty query with 400 "must not be empty": send "*".
+    - /views/search/* rejects a leading wildcard ("*", "*:*") with 400: send "" (match all).
+    - /search/universal/* with offset + limit above the result window fails with 500: cap limit.
+    """
+    if params and path.startswith("/search/universal/"):
+        params = dict(params)
+        query = params.get("query")
+        if query is None or (isinstance(query, str) and query.strip() in _MATCH_ALL_QUERIES):
+            params["query"] = "*"
+        try:
+            offset = int(params.get("offset") or 0)
+            limit = int(params.get("limit") or 0)
+        except (TypeError, ValueError):
+            offset = limit = 0
+        if limit and offset + limit > MAX_RESULT_WINDOW:
+            if offset >= MAX_RESULT_WINDOW:
+                raise GraylogError(f"offset {offset} is beyond the server result window ({MAX_RESULT_WINDOW}); "
+                                   "narrow the time range instead of paging further")
+            params["limit"] = MAX_RESULT_WINDOW - offset
+    if data and path.startswith("/views/search"):
+        data = json.loads(json.dumps(data))
+        qs = data.get("query_string")
+        if isinstance(qs, dict) and isinstance(qs.get("query_string"), str) and qs["query_string"].strip() in _MATCH_ALL_QUERIES:
+            qs["query_string"] = ""
+        for query in data.get("queries") or []:
+            inner = (query or {}).get("query") or {}
+            if isinstance(inner.get("query_string"), str) and inner["query_string"].strip() in _MATCH_ALL_QUERIES:
+                inner["query_string"] = ""
+    return params, data
 
 
 class GraylogClient:
@@ -559,12 +641,20 @@ class GraylogClient:
                                      max_retries: int = 3) -> Union[Dict, str]:
         """Request method with retry mechanism"""
         last_exception = None
+        params, data = _normalize_request_query(method, path, params, data)
+        endpoint_key = (self.host, method.upper(), path, bool(expect_csv))
+        if endpoint_key in _UNSUPPORTED_ENDPOINTS:
+            raise GraylogError(f"Endpoint not available on this Graylog (skipped): {method} {path}")
         
         for attempt in range(max_retries):
             try:
                 return await self._make_request(method, path, params, data, expect_csv)
             except Exception as e:
                 last_exception = e
+                if _UNSUPPORTED_ENDPOINT_RE.match(str(e)) and "{" not in path and not re.search(r"/[0-9a-f]{24}\b|/[0-9A-Z]{26}\b", path):
+                    _UNSUPPORTED_ENDPOINTS.add(endpoint_key)
+                    logger.info(f"Endpoint unsupported, skipping from now on: {method} {path} ({str(e)[:60]})")
+                    raise
                 if _is_field_limit_error(str(e)):
                     scoped = self._with_scoped_query(params, data)
                     if scoped:
@@ -1967,13 +2057,13 @@ class GraylogClient:
         # Balance between performance and completeness
         # Adaptive slicing based on dataset size
         if total_count > 10000000:  # Very large dataset
-            MAX_SLICES = 100  # Allow more slices for very large datasets
+            MAX_SLICES = MAX_TIME_SLICES  # Allow more slices for very large datasets
             MIN_SLICE_DURATION = 30  # 30 seconds minimum per slice
         elif total_count > 1000000:  # Large dataset
-            MAX_SLICES = 50  # Moderate number of slices
+            MAX_SLICES = min(50, MAX_TIME_SLICES)  # Moderate number of slices
             MIN_SLICE_DURATION = 60  # 1 minute minimum per slice
         else:  # Normal dataset
-            MAX_SLICES = 30  # Fewer slices for smaller datasets
+            MAX_SLICES = min(30, MAX_TIME_SLICES)  # Fewer slices for smaller datasets
             MIN_SLICE_DURATION = 120  # 2 minutes minimum per slice
         
         # Calculate optimal number of slices
@@ -2174,28 +2264,55 @@ class GraylogClient:
 # Global client instance and config
 graylog_config = None
 
+# Per-call connection settings for embedding: call_tool(..., config={...}) sets this for one call.
+_graylog_config_override = contextvars.ContextVar("graylog_config_override", default=None)
+
+
 def get_graylog_client():
-    """Get Graylog client from global config"""
-    global graylog_config
+    """Get a Graylog client from the per-call config (if set) or the global config"""
+    config = _graylog_config_override.get() or graylog_config
     
-    if graylog_config is None:
+    if config is None:
         raise GraylogError("Graylog configuration not available")
     
     return GraylogClient(
-        host=graylog_config['host'],
-        username=graylog_config.get('username'),
-        password=graylog_config.get('password'),
-        api_token=graylog_config.get('api_token'),
-        verify_ssl=graylog_config['verify_ssl'],
-        timeout=graylog_config['timeout']
+        host=config['host'],
+        username=config.get('username'),
+        password=config.get('password'),
+        api_token=config.get('api_token'),
+        verify_ssl=config.get('verify_ssl', True),
+        timeout=config.get('timeout', 30.0)
     )
+
+
+async def call_tool(name: str, arguments: Optional[Dict] = None, config: Optional[Dict] = None) -> str:
+    """Embedding entry point: run one tool and return its text result.
+
+    config overrides the connection for this call only, e.g.
+    {"host": "https://graylog.example.com", "api_token": "...", "verify_ssl": True, "timeout": 30}
+    (or username/password instead of api_token). Without it the global graylog_config is used.
+    """
+    token = _graylog_config_override.set(config) if config else None
+    try:
+        result = await handle_call_tool(name, arguments or {})
+        return result[0].text if result else ""
+    finally:
+        if token is not None:
+            _graylog_config_override.reset(token)
 
 # Create MCP server
 server = Server("graylog-mcp")
 
 @server.list_tools()
 async def handle_list_tools() -> List[Tool]:
-    """List all available Graylog management tools - Complete version"""
+    """List all available Graylog management tools (debug tools only with GRAYLOG_ENABLE_DEBUG_TOOLS=1)"""
+    tools = _all_tools()
+    if not ENABLE_DEBUG_TOOLS:
+        tools = [tool for tool in tools if tool.name not in _DEBUG_TOOLS]
+    return tools
+
+
+def _all_tools() -> List[Tool]:
     return [
         # === Analysis tools (return aggregated stats, NOT raw messages) ===
         Tool(
@@ -2854,6 +2971,83 @@ def normalize_query_string(query: str, auto_fix_escaping: bool = False) -> str:
 
     return normalized
 
+_ERROR_LEVELS = {"0", "1", "2", "3", "emerg", "emergency", "alert", "crit", "critical", "err", "error", "fatal", "severe"}
+_WARNING_LEVELS = {"4", "warn", "warning"}
+
+
+def _level_class(level) -> str:
+    """Classify a level value (text or numeric syslog severity) as error, warning or other."""
+    text = str(level).strip().lower()
+    if text in _ERROR_LEVELS:
+        return "error"
+    if text in _WARNING_LEVELS:
+        return "warning"
+    return "other"
+
+
+_SYSLOG_LEVEL_NAMES = {"0": "emergency", "1": "alert", "2": "critical", "3": "error", "4": "warning",
+                       "5": "notice", "6": "info", "7": "debug"}
+
+
+async def _aggregate_level_analysis(client, query: str, timerange: Dict, streams: List[str]) -> tuple:
+    """Exact level distribution via one server-side pivot."""
+    grouped, total = await client._aggregate_counts(query, timerange, [{
+        "type": "values", "fields": ["level"], "limit": 50}], streams)
+    counts = {}
+    for row in grouped["rows"]:
+        if row.get("source") == "leaf":
+            counts[str(row["key"][0])] = _pivot_count(row)
+    missing = counts.pop("(Empty Value)", 0)
+    errors = sum(c for lv, c in counts.items() if _level_class(lv) == "error")
+    warnings = sum(c for lv, c in counts.items() if _level_class(lv) == "warning")
+    ordered = dict(sorted(counts.items(), key=lambda item: item[1], reverse=True))
+    analysis = {
+        "level_distribution": ordered,
+        "level_names": {lv: _SYSLOG_LEVEL_NAMES[lv] for lv in ordered if lv in _SYSLOG_LEVEL_NAMES} or None,
+        "error_rate": round(errors / total * 100, 2) if total else 0,
+        "warning_rate": round(warnings / total * 100, 2) if total else 0,
+        "total_errors": errors,
+        "total_warnings": warnings,
+        "no_level_count": missing,
+        "most_common_level": next(iter(ordered.items()), ("info", 0)),
+        "note": "Errors are syslog levels 0-3 or text error/critical/fatal; warnings are level 4 or warn/warning.",
+    }
+    return {k: v for k, v in analysis.items() if v is not None}, total
+
+
+async def _aggregate_overview(client, query: str, timerange: Dict, streams: List[str], top_sources: int = 20) -> Dict:
+    """get_log_statistics from three server-side pivots: exact totals, sources, levels and time pattern."""
+    five_minute = 0 < timerange["range_seconds"] <= 3 * 3600
+    source_task = client._aggregate_counts(query, timerange, [{
+        "type": "values", "fields": ["source"], "limit": top_sources}], streams)
+    time_task = client._aggregate_counts(query, timerange, [{
+        "type": "time", "fields": ["timestamp"],
+        "interval": {"type": "timeunit", "timeunit": "5m" if five_minute else "1h"}}], streams)
+    (sources, total), (times, _), (levels, _) = await asyncio.gather(
+        source_task, time_task, _aggregate_level_analysis(client, query, timerange, streams))
+    top = [{"source": row["key"][0], "count": _pivot_count(row)} for row in sources["rows"] if row.get("source") == "leaf"]
+    top.sort(key=lambda item: item["count"], reverse=True)
+    for item in top:
+        item["pct"] = round(item["count"] / total * 100, 2) if total else 0
+    minutes = max(timerange["range_seconds"] / 60, 1) if timerange.get("range_seconds") else None
+    return {
+        "summary": {
+            "total_events": total,
+            "time_span_minutes": round(minutes, 1) if minutes else None,
+            "events_per_minute": round(total / minutes, 2) if minutes else None,
+            "sources_shown": len(top),
+            "error_rate": levels["error_rate"],
+            "warning_rate": levels["warning_rate"],
+            "most_active_source": top[0]["source"] if top else "N/A",
+        },
+        "source_analysis": {"top_sources": top, "note": f"Top {top_sources} sources by exact count."},
+        "level_analysis": levels,
+        "time_analysis": _aggregate_time_patterns(times["rows"], five_minute),
+        "method": "aggregation",
+        "note": "Exact counts over the whole range. For error keywords and sample messages use analyze_error_patterns or get_log_sample.",
+    }
+
+
 def _pivot_count(row: Dict) -> int:
     """Read a count series without treating malformed results as zero counts."""
     for value in row["values"]:
@@ -3174,6 +3368,14 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
             analysis_limit = arguments.get("analysis_limit", 15000)
             
             logger.info(f"Processing log statistics with FIXED source analysis for query '{query}' with limit {analysis_limit}")
+
+            try:
+                timerange = client._build_timerange(range_from, range_to)
+                result = await _aggregate_overview(client, query, timerange, streams)
+                result.update({"query": query, "time_range": {"from": range_from, "to": range_to}})
+                return result
+            except Exception as e:
+                logger.warning("Statistics aggregation failed; falling back to sampling: %s", e)
             
             try:
                 # Apply stream filter to query as workaround for API stream parameter issues
@@ -3373,9 +3575,9 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                     )
                     
                     # Limit to reasonable number for analysis
-                    if len(messages) > 30000:
-                        logger.info(f"Limiting error analysis to first 30000 messages out of {len(messages)}")
-                        messages = messages[:30000]
+                    if len(messages) > MAX_ANALYSIS_MESSAGES:
+                        logger.info(f"Limiting error analysis to first {MAX_ANALYSIS_MESSAGES} messages out of {len(messages)}")
+                        messages = messages[:MAX_ANALYSIS_MESSAGES]
                         
                 except GraylogError as e:
                     if "too_many_nested_clauses" in str(e):
@@ -3419,6 +3621,14 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
             range_from = arguments.get("range_from", "now-5m")
             range_to = arguments.get("range_to", "now")
             streams = arguments.get("streams", [])
+
+            try:
+                timerange = client._build_timerange(range_from, range_to)
+                level_analysis, total = await _aggregate_level_analysis(client, query, timerange, streams)
+                return {"level_analysis": level_analysis, "total_count": total, "sample_size": total,
+                        "query": query, "time_range": {"from": range_from, "to": range_to}, "method": "aggregation"}
+            except Exception as e:
+                logger.warning("Level aggregation failed; falling back to sampling: %s", e)
             
             try:
                 # Apply stream filter to query as workaround for API stream parameter issues
@@ -3526,7 +3736,7 @@ async def execute_tool(name: str, arguments: dict) -> Union[dict, str]:
                     to_time=range_to,
                     fields=fields,
                     streams=streams,
-                    target_limit=30000
+                    target_limit=MAX_ANALYSIS_MESSAGES
                 )
                 
                 logger.info(f"Accurate total count: {accurate_total_count}, messages retrieved: {len(messages)}")
@@ -4926,6 +5136,7 @@ def parse_args():
 
 async def main():
     """Main function with comprehensive testing and debugging"""
+    configure_logging()
     try:
         global graylog_config
         

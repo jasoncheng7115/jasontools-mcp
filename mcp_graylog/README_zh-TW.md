@@ -1,10 +1,10 @@
 # Graylog MCP Server
 
-這是 **Graylog** 的 [Model Context Protocol](https://modelcontextprotocol.io) (MCP) 伺服器，以單一檔案提供進階的記錄分析、統計與匯出功能。共提供 **33 個工具** (31 個分析／管理工具 + 2 個除錯工具)，並運用多種技巧突破 Graylog 標準 API 的結果數量限制 (Export API、時間切片、智慧分頁)，讓資料量非常大時的計數與分布依然準確。
+這是 **Graylog** 的 [Model Context Protocol](https://modelcontextprotocol.io) (MCP) 伺服器，以單一檔案提供進階的記錄分析、統計與匯出功能。共提供 **33 個工具** (31 個分析／管理工具 + 2 個預設隱藏的除錯工具)，並運用多種技巧突破 Graylog 標準 API 的結果數量限制 (Export API、時間切片、智慧分頁)，讓資料量非常大時的計數與分布依然準確。
 
 - 作者：Jason Cheng (Jason Tools)
 - 授權：MIT
-- 版本：1.11.0
+- 版本：1.12.0
 - 傳輸方式：`stdio` (預設)、`sse`、`streamable-http`
 - 語言：[English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -12,7 +12,7 @@
 
 ## 功能特色
 
-- **準確的統計**：總筆數、主要來源、層級分布與時間模式，透過多種突破策略 (Export API、時間切片、分頁) 加上智慧去除重複，不受 Graylog API 分頁／數量上限影響。
+- **準確的統計**：總筆數、主要來源、層級分布、時間模式與欄位分布都在 OpenSearch 對整個範圍彙總 (精確、請求數少)；需要原始訊息的工具才用突破策略 (Export API、時間切片、分頁) 並去除重複。
 - **分析**：時間模式 (尖峰／暴增)、來源排名、錯誤模式擷取、記錄層級分布 (含錯誤率／警告率)，以及任意欄位的值分布。
 - **搜尋與匯出**：分頁搜尋、原始記錄取樣，以及大量匯出／分析。
 - **串流與系統**：列出串流、伺服器版本／叢集／節點資訊。
@@ -61,8 +61,24 @@ uvx --with httpx --with mcp --with uvicorn --with starlette \
 | `MCP_HTTP_HOST` | `--http-host` | `0.0.0.0` | HTTP 繫結位址 |
 | `MCP_HTTP_PORT` | `--http-port` | `8000` | HTTP 連接埠 |
 | `MCP_API_KEY` | `--api-key` | — | 保護 HTTP/SSE 端點用的 Bearer 權杖 |
+| `GRAYLOG_MAX_ANALYSIS_MESSAGES` | — | `30000` | 仍需原始訊息的工具 (錯誤模式、匯出) 最多取樣幾筆 |
+| `GRAYLOG_MAX_TIME_SLICES` | — | `100` | 長時間範圍取樣時最多切幾段 |
+| `GRAYLOG_MAX_RESULT_WINDOW` | — | `10000` | OpenSearch 的 `index.max_result_window`；universal 搜尋會限制在這個筆數內 |
+| `GRAYLOG_MCP_LOG_FILE` | — | `~/.mcp_graylog.log` | 獨立執行時的記錄檔 (每 20 MB 輪替，保留 3 份)；設 `off` 停用 |
+| `GRAYLOG_ENABLE_DEBUG_TOOLS` | — | 關閉 | 設 `1` 才列出兩個除錯工具 |
 
 診斷：`--test` 執行連線／自我測試，`--debug` 提高記錄詳細程度，`--help` 顯示用法。
+
+### 嵌入其他 Python 程式
+
+匯入模組不會有副作用 (不設定 logging、不開記錄檔)。每次呼叫可以帶自己的連線設定：
+
+```python
+import mcp_graylog
+text = await mcp_graylog.call_tool(
+    "search_events", {"range_from": "now-24h"},
+    config={"host": "https://graylog.example.com", "api_token": "...", "verify_ssl": True, "timeout": 30})
+```
 
 ---
 
@@ -212,6 +228,8 @@ uvx mcpo --port 8001 --api-key "YOUR_MCPO_KEY" -- \
 
 ### 除錯／診斷
 
+預設不列在工具清單裡，設 `GRAYLOG_ENABLE_DEBUG_TOOLS=1` 才會出現。
+
 | 工具 | 說明 |
 |---|---|
 | `test_accurate_counting` | 比較不同的訊息計數策略 |
@@ -233,6 +251,7 @@ uvx mcpo --port 8001 --api-key "YOUR_MCPO_KEY" -- \
 
 ## 變更記錄 (近期)
 
+- **v1.12.0** — `get_log_statistics` 與 `get_log_level_analysis` 改在 OpenSearch 彙總 (整個範圍、精確計數)，不再取樣：在忙碌的 Graylog 7.2 上，1 小時的查詢從約 65 秒、52 個請求降到 0.5 秒、3 個請求。錯誤／警告比率會計入數字型 syslog 等級。`*`、`*:*` 與空查詢會依各端點接受的格式送出，universal 搜尋不超過 10000 筆的結果上限，回 404/405/415 的端點直接略過不再重試。嵌入使用：匯入時沒有副作用，可用 `call_tool(..., config=...)` 逐次指定連線，上限可用環境變數調整。除錯工具預設不列出，設 `GRAYLOG_ENABLE_DEBUG_TOOLS=1` 才會出現。
 - **v1.11.0** — 新增 5 個唯讀事件／告警工具 (`list_event_definitions`、`get_event_definition`、`search_events`、`get_event_source_messages`、`list_event_notifications`)。通知一律不回傳收件人、URL、權杖、密碼、標頭或範本，說明裡的 Email、URL、IP 也會遮蔽。
 - **v1.10.2** — 又能在 Python 3.10 與 3.11 上載入 (1.9.44 到 1.10.1 因為 f-string 運算式內含反斜線而需要 3.12)。計數在取得第一個非零結果時就停止，而伺服器以 404/405/415 拒絕的端點 (在 Graylog 7.2 上，`POST /views/search/messages` 會回傳 415) 之後會直接略過，因此計數不會再送出注定失敗的請求。
 - **v1.10.1** — `analyze_field_distribution` 與 `analyze_time_patterns` 現在改在 OpenSearch 中對整個範圍做彙總 (精確計數)，而不是只取樣幾千筆訊息，因此已剖析的欄位不會再回傳空值，每小時的計數加總也會等於總數；沒有該欄位的訊息會以 `missing_field_count` 回報。若彙總失敗則改回取樣。輸出大約縮小為 1/8。

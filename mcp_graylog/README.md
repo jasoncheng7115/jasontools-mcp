@@ -1,10 +1,10 @@
 # Graylog MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **33 tools** (31 analysis/management + 2 debug), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
+A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **Graylog**, providing advanced log analysis, statistics and export through a single file. It exposes **33 tools** (31 analysis/management + 2 debug, hidden by default), with techniques to break through Graylog's standard API result limits (Export API, time slicing, smart pagination) so counts and distributions stay accurate on very large datasets.
 
 - **Author:** Jason Cheng (Jason Tools)
 - **License:** MIT
-- **Version:** 1.11.0
+- **Version:** 1.12.0
 - **Transports:** `stdio` (default), `sse`, `streamable-http`
 - **Languages:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -12,7 +12,7 @@ A [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server for **G
 
 ## Features
 
-- **Accurate statistics** — total counts, top sources, level breakdown and time patterns that survive Graylog's API paging/limit caps via multiple breakthrough strategies (Export API, time slicing, pagination) plus intelligent deduplication.
+- **Accurate statistics** — total counts, top sources, level breakdown, time patterns and field distributions are aggregated in OpenSearch over the whole range (exact, few requests); tools that need raw messages use breakthrough strategies (Export API, time slicing, pagination) plus deduplication.
 - **Analysis** — temporal patterns (peaks/spikes), source ranking, error-pattern extraction, log-level distribution (with error/warning rates), and arbitrary field value distribution.
 - **Search & export** — paginated search, raw log sampling, and high-volume export/analysis.
 - **Streams & system** — list streams, server version / cluster / node info.
@@ -61,8 +61,24 @@ Settings are resolved in this order: **CLI args > environment variables > defaul
 | `MCP_HTTP_HOST` | `--http-host` | `0.0.0.0` | HTTP bind address |
 | `MCP_HTTP_PORT` | `--http-port` | `8000` | HTTP port |
 | `MCP_API_KEY` | `--api-key` | — | Bearer token to protect the HTTP/SSE endpoint |
+| `GRAYLOG_MAX_ANALYSIS_MESSAGES` | — | `30000` | Max messages sampled by tools that still need raw messages (error patterns, export) |
+| `GRAYLOG_MAX_TIME_SLICES` | — | `100` | Max time slices when sampling a long range |
+| `GRAYLOG_MAX_RESULT_WINDOW` | — | `10000` | OpenSearch `index.max_result_window`; universal searches are capped to it |
+| `GRAYLOG_MCP_LOG_FILE` | — | `~/.mcp_graylog.log` | Log file of the standalone server (rotated at 20 MB, 3 kept); `off` disables it |
+| `GRAYLOG_ENABLE_DEBUG_TOOLS` | — | off | `1` lists the two debug tools |
 
 Diagnostics: `--test` runs a connectivity/self test, `--debug` raises log verbosity, `--help` prints usage.
+
+### Embedding in another Python application
+
+Importing the module has no side effects (no logging setup, no log file). Run a tool with its own connection per call:
+
+```python
+import mcp_graylog
+text = await mcp_graylog.call_tool(
+    "search_events", {"range_from": "now-24h"},
+    config={"host": "https://graylog.example.com", "api_token": "...", "verify_ssl": True, "timeout": 30})
+```
 
 ---
 
@@ -213,6 +229,8 @@ Graylog permissions needed: `eventdefinitions:read` (definitions), `eventnotific
 
 ### Debug / diagnostics
 
+Hidden from the tool list unless `GRAYLOG_ENABLE_DEBUG_TOOLS=1`.
+
 | Tool | Description |
 |---|---|
 | `test_accurate_counting` | Compare different message-counting strategies |
@@ -234,6 +252,7 @@ Graylog permissions needed: `eventdefinitions:read` (definitions), `eventnotific
 
 ## Changelog (recent)
 
+- **v1.12.0** — `get_log_statistics` and `get_log_level_analysis` aggregate in OpenSearch (exact, whole range) instead of sampling: a 1-hour call on a busy Graylog 7.2 went from ~65 s / 52 requests to 0.5 s / 3. Error/warning rates now count numeric syslog levels. Queries `*`, `*:*` and empty are sent in the form each endpoint accepts, universal searches stay within the 10000 result window, and endpoints answering 404/405/415 are skipped instead of retried. Embedding: no side effects on import, `call_tool(..., config=...)` per call, limits via environment variables. Debug tools hidden unless `GRAYLOG_ENABLE_DEBUG_TOOLS=1`.
 - **v1.11.0** — Added 5 read-only event/alert tools (`list_event_definitions`, `get_event_definition`, `search_events`, `get_event_source_messages`, `list_event_notifications`). Notifications never return recipients, URLs, tokens, passwords, headers or templates, and emails/URLs/IPs in their descriptions are masked.
 - **v1.10.2** — Loads on Python 3.10 and 3.11 again (1.9.44 to 1.10.1 needed 3.12 because of a backslash inside an f-string expression). Counts stop at the first non-zero result, and an endpoint the server rejects with 404/405/415 (on Graylog 7.2, `POST /views/search/messages` gives 415) is skipped from then on, so a count no longer sends requests that always fail.
 - **v1.10.1** — `analyze_field_distribution` and `analyze_time_patterns` now aggregate in OpenSearch over the whole range (exact counts) instead of sampling a few thousand messages, so parsed fields no longer come back empty and hourly counts add up to the total; messages without the field are reported as `missing_field_count`. Falls back to sampling if the aggregation fails. Output is about 8x smaller.
