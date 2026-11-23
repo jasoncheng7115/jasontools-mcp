@@ -1,9 +1,9 @@
 # Zimbra MCP Server
 
-**版本：** 1.12.0
+**版本：** 1.14.0
 **作者：** Jason Cheng (與 Claude Code 共同建置)
 **授權：** MIT
-**最後更新：** 2026-10-09
+**最後更新：** 2026-11-23
 **儲存庫：** [github.com/jasoncheng7115/jasontools-mcp](https://github.com/jasoncheng7115/jasontools-mcp)
 **語言：** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -54,7 +54,7 @@
 
 mcp_zimbra 支援兩種認證模式：
 
-### 管理員模式 (44 個基本工具 + 8 個 mail_read 工具)
+### 管理員模式 (44 個基本工具 + 16 個 mail_read 工具)
 
 可完整使用所有 Zimbra 管理工具。信件讀取工具需要 `ZIMBRA_ENABLE_MAIL_READ=true`。
 
@@ -65,7 +65,7 @@ export ZIMBRA_ADMIN_PASS="admin_password"
 export ZIMBRA_ENABLE_MAIL_READ="true"   # Optional: enable mail read tools
 ```
 
-### 使用者模式 (13 個基本工具 + 8 個 mail_read 工具)
+### 使用者模式 (13 個基本工具 + 16 個 mail_read 工具)
 
 只能存取個人信箱。透過網頁用戶端 API 以一般使用者身分認證。
 
@@ -85,7 +85,7 @@ export ZIMBRA_ENABLE_MAIL_READ="true"   # Optional: enable mail read tools
 | `searchMail` | 依主旨／寄件者／收件者／日期／內容搜尋信箱 |
 | `getMailDetail` | 取得完整郵件內容、標頭、附件清單 |
 | `getConversation` | 取得對話串中的所有郵件 |
-| `listFolders` | 列出信箱資料夾 |
+| `listFolders` | 列出信箱資料夾，每個資料夾附直屬子資料夾數 `subfolder_count` |
 | `getMailAttachment` | 以一次性下載連結 (HTTP)、base64 或存檔的方式取得附件；可依 part ID 或檔名樣式挑選 |
 
 **使用者模式工具 (一律可用)：**
@@ -391,9 +391,36 @@ python3 mcp_zimbra.py --transport streamable-http --host 0.0.0.0 --port 8000 --a
 | `getMailAttachment` | **⚡ 更新**：以一次性下載連結 (HTTP 傳輸模式，10 分鐘內有效，用 curl 下載)、base64 (≤10 MB) 或存檔的方式取得附件；可用 `filename_pattern` (例如 `*-A4.pdf`) 取代 part ID；可用 `filename` 重新命名 |
 | `getAttachmentText` | **⚡ 新增**：擷取 PDF (文字層，掃描檔則以 `chi_tra+eng` 進行 OCR)、圖片 (OCR) 或文字附件的文字 |
 | `waitForMail` | **⚡ 新增**：等待指定寄件者／主旨的郵件送達 (輪詢，最長 10 分鐘) |
-| `listFolders` | 列出信箱資料夾，可用關鍵字篩選 |
-| `saveDraft` | 將新郵件或回覆／轉寄存成草稿供檢查 (不會寄出任何郵件)；附件可用 base64 提供，或取自其他郵件 |
+| `listFolders` | 列出信箱資料夾，可用關鍵字篩選；每個資料夾附 `subfolder_count` |
+| `saveDraft` | **⚡ 更新**：將新郵件或回覆／轉寄存成草稿供檢查 (不會寄出任何郵件)；純文字或 HTML (`body_html`)；可插入預設簽名檔 (`include_signature`)；附件可用 base64 提供，或取自其他郵件 |
 | `searchContacts` | 搜尋使用者的個人通訊錄／聯絡人 |
+
+`saveDraft` 沒給 `body_html` 時存成純文字草稿，放在 `body` 的 HTML 標籤會照字面顯示。
+給了 `body_html` 就存成 `multipart/alternative`：HTML 部分用 `body_html`，純文字部分有給
+`body` 就用 `body`，沒有就由 HTML 轉成文字。這時回覆或轉寄會以 HTML 引用原信：先列寄件者、
+收件者、日期、主旨，回覆時原信內容放在 blockquote 裡，轉寄時放在「Forwarded message」
+那一行下面，與 Zimbra 網頁版的樣式相近。純文字草稿仍用 `> ` 引用。
+`include_signature=true` (預設 `false`) 會把帳號的預設簽名檔插在新內文與引用之間；回覆與轉寄
+若帳號另外設了「回覆／轉寄用」簽名檔，就改用那一個。帳號沒有簽名檔時照樣存草稿，結果的
+`signature` 為 `null`。HTML 可以與附件並用，Zimbra 會把 `multipart/alternative` 內文與檔案
+包進 `multipart/mixed`。
+
+自 v1.14.0 起，所有工具遇到沒有宣告的參數會回錯誤並列出可用的參數。之前未知參數會被直接
+丟掉：`createAppointment(description=...)` 會建出一筆沒有內文的約會。現在 `description`
+可當成 `notes` 的別名。
+
+### 信件整理 (2 個工具)
+
+| 工具 | 說明 |
+|------|------|
+| `createFolder` | **⚡ 新增**：在指定的上層資料夾 (精確路徑或 id) 下建立郵件資料夾；同名資料夾已存在時回傳既有的資料夾 (`created=false`)；支援 `dry_run` |
+| `moveMail` | **⚡ 新增**：把一封或多封郵件搬到指定資料夾 (精確路徑或 id)，可選擇自動建立最後一層 (`create_if_missing`)；支援 `dry_run`；結果會向 Zimbra 讀回確認 |
+
+資料夾一律精確指定：完整路徑 (例如 `/Inbox/Projects 2`) 或資料夾 id，不做模糊比對，
+所以郵件不會被放進名稱相近的資料夾。目的地不能是 Trash 或 Junk，也沒有任何刪除工具。
+上層資料夾的子資料夾達到 `ZIMBRA_FOLDER_DISPLAY_LIMIT` 個 (預設 100；Zimbra 網頁版只顯示這麼多，
+其餘收在「顯示剩餘的郵件資料夾」裡) 時，結果會帶 `warning` 建議換一個上層資料夾，但不會擋下。
+兩個工具都會記錄到 `ZIMBRA_AUDIT_LOG`。
 
 ### 行事曆與工作 (6 個工具)
 
@@ -402,8 +429,8 @@ python3 mcp_zimbra.py --transport streamable-http --host 0.0.0.0 --port 8000 --a
 | `searchCalendar` | **⚡ 新增**：查詢日期範圍內的約會，可查所有行事曆或單一資料夾；會展開週期性事件 |
 | `getAppointment` | **⚡ 新增**：取得單一約會的完整內容：描述、參與者與回覆狀態、週期規則、附件 |
 | `searchTasks` | **⚡ 新增**：依資料夾、狀態與到期日篩選 Zimbra 工作 (Tasks) |
-| `createAppointment` | **⚡ 新增**：建立個人約會：主旨、開始／結束時間、地點、備註、行事曆、全天、提醒 |
-| `updateAppointment` | **⚡ 新增**：修改個人約會的主旨、時間、地點、備註或提醒；支援 `dry_run` |
+| `createAppointment` | **⚡ 新增**：建立個人約會：主旨、開始／結束時間、地點、備註 (`notes`，或用 `description`)、行事曆、全天、提醒 |
+| `updateAppointment` | **⚡ 新增**：修改個人約會的主旨、時間、地點、備註 (`notes`，或用 `description`) 或提醒；支援 `dry_run` |
 | `deleteAppointment` | **⚡ 新增**：刪除個人約會 (需 `confirm=true`，否則只會預覽) |
 
 行事曆寫入預設只動主要的 `Calendar`。要修改或刪除其他行事曆 (共用或家人的行事曆) 中的約會，
@@ -462,8 +489,8 @@ jt_zmmsgtrace 服務，而不是 Zimbra 的 SOAP API。
 | `clear_cache` | 清除所有快取的 API 回應 |
 | `cache_stats` | 取得快取使用統計 |
 
-**合計：管理員模式 52 個工具** (44 個基本 + 8 個 mail_read)：6 個帳號 + 3 個通訊群組 + 3 個郵件佇列 + 2 個統計 + 9 個系統 + 3 個權限 + 5 個批次稽核 + 5 個信件讀取† + 3 個行事曆與工作† + 2 個信件寫入 + 1 個目錄 + 1 個進階通訊群組 + 3 個公用工具 + 6 個 jt_zmmsgtrace
-**合計：使用者模式 21 個工具** (13 個基本 + 8 個 mail_read)：5 個信件讀取† + 3 個行事曆與工作† + 2 個信件寫入 + 1 個目錄 + 3 個公用工具 + 1 個版本 + 6 個 jt_zmmsgtrace
+**合計：管理員模式 60 個工具** (44 個基本 + 16 個 mail_read)：6 個帳號 + 3 個通訊群組 + 3 個郵件佇列 + 2 個統計 + 9 個系統 + 3 個權限 + 5 個批次稽核 + 10 個信件搜尋 (8 個† + saveDraft、searchContacts) + 2 個信件整理† + 6 個行事曆與工作† + 1 個目錄 + 1 個進階通訊群組 + 3 個公用工具 + 6 個 jt_zmmsgtrace
+**合計：使用者模式 29 個工具** (13 個基本 + 16 個 mail_read)：10 個信件搜尋 + 2 個信件整理† + 6 個行事曆與工作† + 1 個目錄 + 3 個公用工具 + 1 個版本 + 6 個 jt_zmmsgtrace
 
 †信件讀取工具需要 `ZIMBRA_ENABLE_MAIL_READ=true`
 
@@ -586,7 +613,48 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 
 ## 📜 版本紀錄
 
-### v1.12.0 (2026-10-09) - 目前版本
+### v1.14.0 (2026-11-23) - 目前版本
+
+**新功能：HTML 草稿與簽名檔；修正：未知參數被直接忽略**
+
+- `saveDraft`：新增 `body_html`，存成 HTML 草稿 (`multipart/alternative`；純文字部分用 `body`，
+  沒給就由 HTML 轉換)。有 `body_html` 時 `body` 可省略；沒給 `body_html` 仍是純文字草稿。
+- `saveDraft`：HTML 模式的回覆與轉寄會以 HTML 引用原信，上方列寄件者、收件者、日期、主旨，
+  回覆時原信放在 blockquote 裡。
+- `saveDraft`：新增 `include_signature` (預設 `false`)，把帳號的預設簽名檔 (回覆時若有設定則用
+  回覆／轉寄用簽名檔) 插在新內文與引用之間。結果會回報 `format` (`text`／`html`) 與 `signature`。
+- 所有工具：沒有宣告的參數會回錯誤並列出可用參數。之前 `createAppointment` 收到 `description=`
+  會直接丟掉，建出沒有內文的約會。
+- `createAppointment`／`updateAppointment`：`description` 可當成 `notes` 的別名。
+
+### v1.13.0 (2026-11-11)
+
+**新功能：createFolder、moveMail**
+
+- `createFolder`：在指定的上層資料夾 (精確路徑或資料夾 id，不做模糊比對) 下建立郵件資料夾。
+  名稱可含中文、空白與括號。資料夾已存在時回傳既有的資料夾並標示 `created=false`。
+  回傳 `id`、`path`、`created`、`parent_subfolder_count`。
+- `moveMail`：把一封或多封郵件 (id 用 `searchMail` 回傳的值) 搬到以精確路徑或 id 指定的資料夾；
+  `create_if_missing` 可自動建立最後一層；支援 `dry_run`；每封郵件都會讀回並列出原資料夾與新資料夾。
+  目的地不能是 Trash 或 Junk。
+- 上層資料夾的子資料夾達到 `ZIMBRA_FOLDER_DISPLAY_LIMIT` 個 (預設 100) 時兩者都會提出警告，
+  這是 Zimbra 網頁版開始把其餘資料夾收進「顯示剩餘的郵件資料夾」的數量。
+- `listFolders`：每個資料夾新增 `subfolder_count` (直屬子資料夾數)。
+- 沒有新增任何刪除工具。
+
+### v1.12.1 (2026-10-17)
+
+**修正：searchMail 的結果、附件選取**
+
+- `searchMail`：`to`／`cc` 一直是空的；現在結果會帶收件者。
+- `searchMail`：`total` 原本只是回傳頁面大小。Zimbra 不提供符合筆數，所以 `has_more` 為 true 時
+  `total` 為 `null`，到最後一頁才是精確值。
+- `searchMail`：`sender`／`recipient`／`cc` 給網域 (`example.com`) 時，也會找到子網域的位址，
+  例如 `user@mail.example.com`。每筆結果帶 `is_single_message` (Zimbra 對單封郵件給負數的對話 id)。
+- `getAttachmentText`／`getMailAttachment`：沒有萬用字元的 `filename_pattern` 當成一般字串比對
+  (`.pdf`、`S01055`)。`getAttachmentText` 沒給 `part_id` 時，只有一個附件就用那一個，有多個就列出 part ID。
+
+### v1.12.0 (2026-10-09)
 
 **新功能：附件、文字擷取、搜尋、讀信、行事曆編輯**
 

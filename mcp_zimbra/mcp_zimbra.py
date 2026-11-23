@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MCP server for Zimbra Collaboration Suite - v1.12.0
+MCP server for Zimbra Collaboration Suite - v1.14.0
 ===============================================================================
 Author: Jason Cheng (co-created with Claude Code)
 License: MIT
 Repository: https://github.com/jasoncheng7115/jasontools-mcp
 Created: 2025-01-27
-Updated: 2026-10-09
+Updated: 2026-11-23
 
 Reference:
 This implementation follows design patterns from mcp_wazuh_sample.py
@@ -16,6 +16,33 @@ FastMCP-based Zimbra integration providing comprehensive email system monitoring
 and analysis capabilities through natural language interactions.
 
 Version History:
+- v1.14.0 (2026-11-23): FEATURE - HTML drafts and signatures; FIX - unknown arguments were ignored
+  - saveDraft: body_html builds an HTML draft (multipart/alternative; text/plain from `body`
+    or converted from the HTML). Replies/forwards quote the original as HTML under a
+    From/To/Sent/Subject header (blockquote), like Zimbra web. Without body_html the
+    draft is plain text as before; `body` is optional when body_html is given.
+  - saveDraft: include_signature (default false) inserts the account's default signature
+    (reply/forward signature for replies when set) between the new text and the quote.
+  - Tools refuse arguments they do not declare and list the valid ones (createAppointment
+    silently dropped description=, leaving the appointment empty).
+  - createAppointment / updateAppointment: description is accepted as an alias of notes.
+- v1.13.0 (2026-11-11): FEATURE - createFolder, moveMail; listFolders subfolder_count
+  - createFolder: parent by exact path or folder id (no fuzzy match); returns the existing
+    folder (created=false) when the name is already there.
+  - moveMail: move one or more messages to a folder by exact path or id; optional
+    create_if_missing; dry_run; result read back from Zimbra. Trash/Junk are refused.
+  - Warns when the parent folder reaches ZIMBRA_FOLDER_DISPLAY_LIMIT subfolders (default 100,
+    where Zimbra webmail starts hiding folders behind "Show remaining folders").
+  - No delete tools: folders and mail can only be created and moved.
+- v1.12.1 (2026-10-17): FIX - searchMail recipients/total/domain senders, attachment picking
+  - searchMail: "to"/"cc" were always empty (SearchRequest now asks for recipients, recip=2).
+  - searchMail: "total" echoed the page size; Zimbra gives no match count, so total is now
+    null while has_more is true and exact on the last page.
+  - searchMail: sender/recipient/cc given as a domain ("example.com") also finds subdomain
+    addresses such as user@mail.example.com; each result has is_single_message.
+  - getAttachmentText / getMailAttachment: filename_pattern without wildcards is a plain
+    substring (".pdf" works). getAttachmentText with no part_id uses the only attachment, or
+    lists part_ids when there are several.
 - v1.12.0 (2026-10-09): FEATURE - attachments, text extraction, search, reading, calendar edits
   - getMailAttachment: one-time download link over HTTP (/dl/<token>, 10 min), base64
     (<=10 MB) or saved file; filename override; filename_pattern picks attachments
@@ -335,7 +362,7 @@ import sys
 import time
 import argparse
 import base64
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import logging
@@ -724,6 +751,26 @@ _tool = lambda: mcp_server.tool(structured_output=False)  # noqa: E731
 # Tools return a JSON string. With structured output on, clients received it wrapped as
 # {"result": "<json string>"} and had to decode twice.
 
+# FastMCP drops arguments a tool does not declare without a word, so a model that passes
+# e.g. createAppointment(description=...) gets an appointment with no text and thinks it
+# worked. Refuse unknown arguments and name the valid ones instead.
+_orig_tool_manager_call = mcp_server._tool_manager.call_tool
+
+
+async def _strict_tool_call(name, arguments, *args, **kwargs):
+    tool = mcp_server._tool_manager.get_tool(name)
+    if tool is not None and isinstance(arguments, dict):
+        allowed = set(((tool.parameters or {}).get("properties") or {}).keys())
+        unknown = sorted(k for k in arguments if k not in allowed)
+        if unknown:
+            from mcp.server.fastmcp.exceptions import ToolError
+            raise ToolError(f"{name}: unknown parameter(s) {', '.join(unknown)}. "
+                            f"Valid parameters: {', '.join(sorted(allowed))}.")
+    return await _orig_tool_manager_call(name, arguments, *args, **kwargs)
+
+
+mcp_server._tool_manager.call_tool = _strict_tool_call
+
 
 def admin_only_tool():
     """Decorator factory: registers tool only in admin mode, skips in user mode."""
@@ -1045,6 +1092,8 @@ USAGE_HINTS = {
     "getMailAttachment": "Provide msg_id and part_id from getMailDetail results.",
     # Mail Write & Contacts
     "saveDraft": "Reply/forward auto-quotes original message. Provide only your reply text.",
+    "createFolder": "Pass parent as the exact path from listFolders. Mind the warning when the parent is near the webmail display limit.",
+    "moveMail": "Use ids from searchMail. Check the folder with searchMail(folder=...) afterwards if needed.",
     "searchGal": "Use search_type to filter: account, resource, or all.",
     "searchContacts": "Searches personal address book. Use searchGal for global directory.",
     # Mail Trace (jt_zmmsgtrace)
@@ -4510,7 +4559,8 @@ def _get_account_folders(account: str) -> list:
                 "path": path,
                 "count": int(count) if count else 0,
                 "unread": int(unread) if unread else 0,
-                "view": view
+                "view": view,
+                "subfolder_count": len(folder_elem.findall(f'{{{ns_mail}}}folder'))
             })
             walk_folders(folder_elem, path)
 
@@ -4581,6 +4631,21 @@ def _parse_search_date(value: str):
     return None
 
 
+_SUFFIX_LABELS = {"com", "net", "org", "edu", "gov", "co", "ac", "or", "ne", "go", "idv", "biz", "info",
+                  "tw", "hk", "cn", "jp", "sg", "my", "uk", "us", "io", "mail", "smtp", "mx", "email"}
+
+
+def _address_clause(field: str, value: str) -> str:
+    """from:/to:/cc: clause. Zimbra indexes whole address tokens, so "example.com" misses
+    "user@mail.example.com"; a bare domain also matches on its distinctive label ("example")."""
+    value = value.strip()
+    if '@' not in value and '.' in value and ' ' not in value:
+        labels = [l for l in value.lower().split('.') if l and l not in _SUFFIX_LABELS]
+        if labels:
+            return f'({field}:{value} OR {field}:{labels[-1]})'
+    return f'{field}:({value})'
+
+
 @mail_read_tool()
 def searchMail(account: str,
                query: Optional[str] = None,
@@ -4605,7 +4670,8 @@ def searchMail(account: str,
         account: Target account email. Example: "user@example.com".
         query: Raw Zimbra search query (advanced). Example: "subject:meeting from:boss". Combined (AND) with any other filters given.
         subject: Search in subject line; a single word also matches inside longer tokens (e.g. "DC2026167" finds "採購單-DC2026167-02"). Example: "meeting invitation".
-        sender: Search by sender email (From). Example: "boss@example.com".
+        sender: Search by sender email or domain (From). Example: "boss@example.com", "example.com"
+            (a domain also finds subdomain senders such as user@mail.example.com).
         recipient: Search by recipient email (To). Example: "team@example.com".
         cc: Search by CC recipient email. Example: "manager@example.com".
         content: Search in message body text. Example: "quarterly report".
@@ -4635,11 +4701,11 @@ def searchMail(account: str,
             else:
                 parts.append(f'subject:("{subj}")')
         if sender:
-            parts.append(f'from:({sender})')
+            parts.append(_address_clause('from', sender))
         if recipient:
-            parts.append(f'to:({recipient})')
+            parts.append(_address_clause('to', recipient))
         if cc:
-            parts.append(f'cc:({cc})')
+            parts.append(_address_clause('cc', cc))
         if content:
             parts.append(f'content:("{content}")')
         if attachment_name:
@@ -4710,6 +4776,7 @@ def searchMail(account: str,
         <SearchRequest xmlns="urn:zimbraMail"
                        types="message"
                        sortBy="dateDesc"
+                       recip="2"
                        limit="{limit}"
                        offset="{offset}">
             <query><![CDATA[{search_query}]]></query>
@@ -4768,6 +4835,8 @@ def searchMail(account: str,
             messages.append({
                 "id": msg_id,
                 "conversation_id": conv_id,
+                # Zimbra gives a lone message (no thread yet) a negative conversation id
+                "is_single_message": conv_id.rsplit(':', 1)[-1].startswith('-'),
                 "subject": msg_subject,
                 "from": from_addrs,
                 "to": to_addrs,
@@ -4791,14 +4860,15 @@ def searchMail(account: str,
                 except Exception as att_err:
                     m["attachment_names_error"] = str(att_err)[:100]
 
-        # Parse pagination from SearchResponse
+        # Parse pagination from SearchResponse. Zimbra does not report a total match count,
+        # so "total" is only given once the last page is reached.
         search_response = root.find(f'.//{{{ns_mail}}}SearchResponse')
-        has_more = False
-        total_matches = len(messages)
-        if search_response is not None:
-            if search_response.get('total'):
-                total_matches = int(search_response.get('total'))
-            has_more = search_response.get('more') == '1'
+        has_more = search_response is not None and search_response.get('more') == '1'
+        total_matches = None
+        if search_response is not None and search_response.get('total'):
+            total_matches = int(search_response.get('total'))
+        elif not has_more:
+            total_matches = offset + len(messages)
 
         return tool_response({
             "status": "success",
@@ -4810,8 +4880,8 @@ def searchMail(account: str,
             "has_more": has_more,
             "offset": offset,
             "limit": limit,
-            "display_message": f"Found {total_matches} messages in {account}"
-                              + (f", showing {len(messages)}" if len(messages) < total_matches else "")
+            "display_message": (f"Found {total_matches} messages in {account}" if total_matches is not None
+                                else f"Showing {len(messages)} messages in {account} (total not known)")
                               + (f" - more results available, use offset={offset + limit}" if has_more else ""),
             "usage_hint": "To read a message, call getMailDetail with the 'id' value from a message above. To get conversation thread, use the 'conversation_id' value."
         })
@@ -5595,7 +5665,8 @@ def createAppointment(account: str,
                       all_day: bool = False,
                       reminder_minutes: Optional[int] = None,
                       timezone: str = "Asia/Taipei",
-                      allow_duplicate: bool = False) -> str:
+                      allow_duplicate: bool = False,
+                      description: Optional[str] = None) -> str:
     """Create a personal appointment in an account's calendar. No attendees, so no invitations are sent.
 
     Before creating, the same calendar is checked for an appointment with the same subject and start; if one exists it is returned instead (set allow_duplicate=true to create anyway). The result is read back from Zimbra.
@@ -5612,7 +5683,10 @@ def createAppointment(account: str,
         reminder_minutes: Pop-up reminder this many minutes before start. Default: none.
         timezone: IANA time zone of start/end. Default: "Asia/Taipei".
         allow_duplicate: Create even if the same subject already starts at the same time in that calendar. Default: false.
+        description: Alias of notes (used when notes is not given).
     """
+    if notes is None and description is not None:
+        notes = description
     logger.info(f"Creating appointment for account={account}: {subject} @ {start}")
 
     try:
@@ -5730,6 +5804,252 @@ def createAppointment(account: str,
         return tool_response({"status": "error", "message": f"Failed to create appointment: {str(e)}"})
 
 
+# ======================= v1.13.0: create folders, move mail =======================
+
+_FOLDER_DISPLAY_LIMIT = int(os.getenv('ZIMBRA_FOLDER_DISPLAY_LIMIT', '100') or 100)
+_PROTECTED_FOLDER_IDS = {"3", "4"}   # Trash, Junk
+
+
+def _norm_folder_path(path: str) -> str:
+    return "/".join(p for p in str(path or "").strip().split("/") if p != "").lower()
+
+
+def _resolve_folder_exact(folders: list, ref: str):
+    """Folder by id ('257' or '<uuid>:257') or exact path (case-insensitive, leading '/' optional).
+    No fuzzy matching: a wrong guess here would create or move mail in the wrong place."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return None
+    if ref.replace(":", "").replace("-", "").isalnum() and (ref.isdigit() or ":" in ref):
+        num = _folder_num(ref)
+        for f in folders:
+            if _folder_num(f["id"]) == num:
+                return f
+    wanted = _norm_folder_path(ref)
+    for f in folders:
+        if _norm_folder_path(f["path"]) == wanted:
+            return f
+    return None
+
+
+def _is_protected_folder(folders: list, folder: dict) -> bool:
+    """True for Trash, Junk and anything below them."""
+    if _folder_num(folder["id"]) in _PROTECTED_FOLDER_IDS:
+        return True
+    by_path = {_norm_folder_path(f["path"]): f for f in folders}
+    parts = _norm_folder_path(folder["path"]).split("/")
+    for i in range(1, len(parts)):
+        anc = by_path.get("/".join(parts[:i]))
+        if anc and _folder_num(anc["id"]) in _PROTECTED_FOLDER_IDS:
+            return True
+    return False
+
+
+def _display_limit_warning(parent: dict, count: int):
+    if count < _FOLDER_DISPLAY_LIMIT:
+        return None
+    name = parent["name"]
+    m = re.match(r"^(.*?)(\s*)(\d+)$", name)
+    nxt = f"{m.group(1)}{m.group(2) or ' '}{int(m.group(3)) + 1}" if m else f"{name} 2"
+    return (f"'{parent['path']}' already has {count} subfolders (webmail shows {_FOLDER_DISPLAY_LIMIT} "
+            f"before 'Show remaining folders'); consider creating new folders under '{nxt}'.")
+
+
+def _mailbox_uuid(folders: list) -> str:
+    for f in folders:
+        if ":" in str(f["id"]):
+            return str(f["id"]).split(":")[0]
+    return ""
+
+
+def _create_folder_core(account: str, parent_ref: str, name: str, dry_run: bool) -> dict:
+    name = str(name or "").strip()
+    if not name:
+        return {"status": "error", "message": "name is required."}
+    if "/" in name:
+        return {"status": "error", "message": "name must not contain '/'; create one level at a time."}
+    folders = _get_account_folders(account)
+    parent = _resolve_folder_exact(folders, parent_ref)
+    if parent is None:
+        return {"status": "error", "message": f"Parent folder '{parent_ref}' not found (exact path or id required). "
+                                              "Use listFolders to get the exact path."}
+    if parent.get("view") not in ("", "message", None):
+        return {"status": "error", "message": f"Parent '{parent['path']}' is a {parent.get('view')} folder, not a mail folder."}
+    if _is_protected_folder(folders, parent):
+        return {"status": "error", "message": "Creating folders under Trash or Junk is not allowed."}
+
+    child_path = f"{parent['path']}/{name}"
+    existing = next((f for f in folders if _norm_folder_path(f["path"]) == _norm_folder_path(child_path)), None)
+    count = parent.get("subfolder_count", 0)
+    result = {"status": "success", "account": account}
+    if existing:
+        result.update({"id": existing["id"], "path": existing["path"], "created": False,
+                       "parent_subfolder_count": count,
+                       "display_message": f"Folder '{existing['path']}' already exists"})
+    elif dry_run:
+        result.update({"id": None, "path": child_path, "created": False, "dry_run": True,
+                       "parent_subfolder_count": count,
+                       "display_message": f"Dry run: would create '{child_path}'"})
+    else:
+        root = query_zimbra_mail_api(f"""
+        <CreateFolderRequest xmlns="urn:zimbraMail">
+            <folder name="{_xml_text(name)}" l="{_folder_num(parent['id'])}" view="message" fie="1"/>
+        </CreateFolderRequest>""", account)
+        parse_zimbra_response(root, namespace="urn:zimbraMail")
+        folders = _get_account_folders(account)
+        created = next((f for f in folders if _norm_folder_path(f["path"]) == _norm_folder_path(child_path)), None)
+        if created is None:
+            return {"status": "error", "message": f"Zimbra accepted the request but '{child_path}' was not found on read-back."}
+        parent = _resolve_folder_exact(folders, parent["id"]) or parent
+        count = parent.get("subfolder_count", count + 1)
+        _audit_write("createFolder", account, {"folder_id": created["id"], "path": created["path"]})
+        result.update({"id": created["id"], "path": created["path"], "created": True,
+                       "parent_subfolder_count": count,
+                       "display_message": f"Created folder '{created['path']}'"})
+    warning = _display_limit_warning(parent, result["parent_subfolder_count"])
+    if warning:
+        result["warning"] = warning
+    return result
+
+
+@mail_read_tool()
+def createFolder(account: str, parent: str, name: str, dry_run: bool = False) -> str:
+    """Create a mail folder under an existing folder. If a folder with that name already exists there, it is returned (created=false) instead of creating another.
+
+    Args:
+        account: Mailbox owner email. Example: "user@example.com".
+        parent: Exact full path of the parent folder, or its folder id. No fuzzy matching. Example: "/Inbox/Projects 2".
+        name: New folder name; Chinese, spaces and brackets are fine, '/' is not. Example: "客戶甲 (經銷商乙)".
+        dry_run: Only report what would be created. Default: false.
+    """
+    logger.info(f"createFolder account={account} parent={parent} name={name} dry_run={dry_run}")
+    try:
+        return tool_response(_create_folder_core(account, parent, name, dry_run), "createFolder")
+    except Exception as e:
+        logger.error(f"Failed to create folder: {e}")
+        return tool_response({"status": "error", "message": f"Failed to create folder: {str(e)}"})
+
+
+@mail_read_tool()
+def moveMail(account: str, msg_ids: Union[str, List[str]], target_folder: str,
+             create_if_missing: bool = False, dry_run: bool = False) -> str:
+    """Move one or more messages to a folder. The result is read back from Zimbra. Moving to Trash or Junk is not allowed.
+
+    Args:
+        account: Mailbox owner email. Example: "user@example.com".
+        msg_ids: Message id, comma-separated ids, or a list; the ids searchMail returns ("<uuid>:<n>") or plain numbers. Example: ["a1b2...:12345", "a1b2...:12346"].
+        target_folder: Exact full path of the target folder, or its folder id. No fuzzy matching. Example: "/Inbox/Projects 2/客戶甲 (經銷商乙)".
+        create_if_missing: Create the last level of target_folder when it does not exist (its parent must exist). Default: false.
+        dry_run: Only report what would be moved. Default: false.
+    """
+    logger.info(f"moveMail account={account} ids={msg_ids} target={target_folder} dry_run={dry_run}")
+    try:
+        ids = msg_ids if isinstance(msg_ids, list) else str(msg_ids or "").split(",")
+        ids = [str(i).strip() for i in ids if str(i).strip()]
+        if not ids:
+            return tool_response({"status": "error", "message": "msg_ids is required."})
+        if len(ids) > 500:
+            return tool_response({"status": "error", "message": "At most 500 messages per call."})
+
+        folders = _get_account_folders(account)
+        uuid = _mailbox_uuid(folders)
+        nums = []
+        for i in ids:
+            if ":" in i and uuid and i.split(":")[0] != uuid:
+                return tool_response({"status": "error", "message": f"Message id '{i}' belongs to a different mailbox than {account}."})
+            n = _folder_num(i)
+            if not n.isdigit():
+                return tool_response({"status": "error", "message": f"Invalid message id '{i}'."})
+            nums.append(n)
+
+        target = _resolve_folder_exact(folders, target_folder)
+        warning = None
+        folder_created = False
+        if target is None:
+            if not create_if_missing:
+                return tool_response({"status": "error", "message": f"Target folder '{target_folder}' not found (exact path or id required). "
+                                                                   "Pass create_if_missing=true to create it."})
+            norm = str(target_folder).strip().strip("/")
+            if "/" not in norm:
+                return tool_response({"status": "error", "message": "create_if_missing needs a full path with an existing parent, e.g. '/Inbox/<name>'."})
+            parent_path, leaf = norm.rsplit("/", 1)
+            made = _create_folder_core(account, parent_path, leaf, dry_run)
+            if made.get("status") != "success":
+                return tool_response(made, "moveMail")
+            warning = made.get("warning")
+            folder_created = bool(made.get("created"))
+            if dry_run and not made.get("id"):
+                target = {"id": None, "path": made["path"], "name": leaf}
+            else:
+                folders = _get_account_folders(account)
+                target = _resolve_folder_exact(folders, made["id"])
+        if target.get("id") and _is_protected_folder(folders, target):
+            return tool_response({"status": "error", "message": "Moving mail to Trash or Junk is not allowed."})
+        if target.get("view") not in ("", "message", None):
+            return tool_response({"status": "error", "message": f"Target '{target['path']}' is a {target.get('view')} folder, not a mail folder."})
+
+        paths = {_folder_num(f["id"]): f["path"] for f in folders}
+
+        def read_msgs():
+            out = {}
+            for n in nums:
+                try:
+                    r = query_zimbra_mail_api(f'<GetMsgRequest xmlns="urn:zimbraMail"><m id="{n}"/></GetMsgRequest>', account)
+                    parse_zimbra_response(r, namespace="urn:zimbraMail")
+                    m = r.find('.//{urn:zimbraMail}m')
+                    su = m.find('{urn:zimbraMail}su') if m is not None else None
+                    out[n] = {"subject": su.text if su is not None else "", "folder_num": _folder_num(m.get('l', '')) if m is not None else ""}
+                except Exception as e:
+                    out[n] = {"error": str(e)}
+            return out
+
+        before = read_msgs()
+        missing = [n for n, v in before.items() if "error" in v]
+        if missing:
+            return tool_response({"status": "error", "message": f"Messages not found in {account}: {', '.join(missing)}. Nothing was moved."})
+
+        target_num = _folder_num(target["id"]) if target.get("id") else None
+        results = []
+        if dry_run:
+            for n in nums:
+                results.append({"id": f"{uuid}:{n}" if uuid else n, "subject": before[n]["subject"],
+                                "from_folder": paths.get(before[n]["folder_num"], before[n]["folder_num"]),
+                                "to_folder": target["path"]})
+            resp = {"status": "success", "dry_run": True, "account": account, "target_folder": target["path"],
+                    "messages": results, "count": len(results),
+                    "display_message": f"Dry run: would move {len(results)} message(s) to '{target['path']}'"}
+        else:
+            to_move = [n for n in nums if before[n]["folder_num"] != target_num]
+            if to_move:
+                root = query_zimbra_mail_api(f"""
+                <MsgActionRequest xmlns="urn:zimbraMail">
+                    <action op="move" id="{','.join(to_move)}" l="{target_num}"/>
+                </MsgActionRequest>""", account)
+                parse_zimbra_response(root, namespace="urn:zimbraMail")
+            after = read_msgs()
+            moved_ok = 0
+            for n in nums:
+                now = after.get(n, {})
+                ok = now.get("folder_num") == target_num
+                moved_ok += ok
+                results.append({"id": f"{uuid}:{n}" if uuid else n, "subject": before[n]["subject"],
+                                "from_folder": paths.get(before[n]["folder_num"], before[n]["folder_num"]),
+                                "to_folder": paths.get(now.get("folder_num"), target["path"]) if ok else paths.get(now.get("folder_num"), now.get("folder_num")),
+                                "verified": ok,
+                                **({"note": "already in target"} if n not in to_move else {})})
+            _audit_write("moveMail", account, {"target": target["path"], "ids": to_move, "verified": moved_ok})
+            resp = {"status": "success" if moved_ok == len(nums) else "partial", "account": account,
+                    "target_folder": target["path"], "folder_created": folder_created,
+                    "messages": results, "count": len(results), "verified": moved_ok,
+                    "display_message": f"Moved {moved_ok}/{len(nums)} message(s) to '{target['path']}'"}
+        if warning:
+            resp["warning"] = warning
+        return tool_response(resp, "moveMail")
+    except Exception as e:
+        logger.error(f"Failed to move mail: {e}")
+        return tool_response({"status": "error", "message": f"Failed to move mail: {str(e)}"})
+
+
 # ======================= v1.12.0: attachments, text, reading helpers =======================
 
 import base64 as _b64
@@ -5741,6 +6061,18 @@ import subprocess as _subprocess
 import tempfile as _tempfile
 
 _HTTP_MODE = False          # set in main: attachments are served as one-time links over HTTP
+
+
+def _name_matches(filename: str, pattern: str) -> bool:
+    """Shell pattern when it has wildcards ("*.pdf"); otherwise a plain substring (".pdf", "S01055")."""
+    name, pat = (filename or "").lower(), pattern.lower().strip()
+    if any(ch in pat for ch in "*?["):
+        return _fnmatch.fnmatch(name, pat)
+    return pat in name
+
+
+def _attachment_choices(parts):
+    return [{"part_id": p["part_id"], "filename": p["filename"]} for p in parts]
 _FILE_STORE: dict = {}      # token -> {data, filename, content_type, expires}
 _FILE_TTL = 600
 _BASE64_MAX = 10 * 1024 * 1024
@@ -5932,7 +6264,8 @@ def getMailAttachment(account: str,
         account: Account email. Example: "user@example.com".
         msg_id: Message ID from searchMail "id". ("message_id" is accepted too.)
         part_id: Attachment part ID, e.g. "2". Optional when filename_pattern is given.
-        filename_pattern: Shell pattern on the attachment name, case-insensitive. Example: "*-A4.pdf", "*.pdf".
+        filename_pattern: Pattern on the attachment name, case-insensitive: "*-A4.pdf" style, or plain
+            text matched anywhere in the name (".pdf", "S01055").
         filename: Name to give the file (single attachment only). Example: "FS36743277-A4-Company.pdf".
         return_mode: "url" (one-time link, 10 min, default on HTTP servers; fetch with curl),
                      "base64" (content in the response, up to 10 MB), or "file" (save on the server, default for stdio).
@@ -5949,10 +6282,10 @@ def getMailAttachment(account: str,
             targets = [{"part_id": part_id, "filename": None}]
         else:
             parts = _message_parts(account, msg_id)
-            targets = [p for p in parts if _fnmatch.fnmatch(p["filename"].lower(), filename_pattern.lower())]
+            targets = [p for p in parts if _name_matches(p["filename"], filename_pattern)]
             if not targets:
                 return tool_response({"status": "error", "message": f"No attachment matches '{filename_pattern}'.",
-                                      "attachments": [p["filename"] for p in parts]})
+                                      "attachments": _attachment_choices(parts)})
         if filename and len(targets) > 1:
             return tool_response({"status": "error", "message": f"filename can only be used for one attachment; "
                                   f"pattern matched {len(targets)}: {[t['filename'] for t in targets]}"})
@@ -6011,20 +6344,31 @@ def getAttachmentText(account: str,
     Args:
         account: Account email.
         msg_id: Message ID from searchMail "id". ("message_id" is accepted too.)
-        part_id: Attachment part ID; or use filename_pattern.
-        filename_pattern: Shell pattern on the attachment name, e.g. "*.pdf". First match is used.
+        part_id: Attachment part ID. Optional: with neither part_id nor filename_pattern, a
+            message with one attachment uses it; with several, the error lists their part_ids.
+        filename_pattern: "*.pdf" style pattern, or plain text matched anywhere in the name
+            (".pdf", "S01055"). First match is used.
         ocr: "auto" (only when a PDF has no text layer), "always", or "never". OCR language: Traditional Chinese + English.
         max_chars: Truncate the text to this many characters. Default 30000.
     """
     msg_id = msg_id or message_id
-    if not msg_id or (not part_id and not filename_pattern):
-        return tool_response({"status": "error", "message": "Give msg_id and part_id (or filename_pattern)."})
+    if not msg_id:
+        return tool_response({"status": "error", "message": "msg_id is required (the 'id' from searchMail)."})
     try:
         if not part_id:
-            parts = [p for p in _message_parts(account, msg_id)
-                     if _fnmatch.fnmatch(p["filename"].lower(), filename_pattern.lower())]
+            all_parts = _message_parts(account, msg_id)
+            if filename_pattern:
+                parts = [p for p in all_parts if _name_matches(p["filename"], filename_pattern)]
+            else:
+                # No selector: the only attachment is unambiguous; otherwise say which ones exist
+                parts = all_parts if len(all_parts) == 1 else []
             if not parts:
-                return tool_response({"status": "error", "message": f"No attachment matches '{filename_pattern}'."})
+                if not all_parts:
+                    return tool_response({"status": "error", "message": "This message has no attachments."})
+                return tool_response({"status": "error",
+                                      "message": (f"No attachment matches '{filename_pattern}'." if filename_pattern
+                                                  else "Several attachments - give part_id or filename_pattern."),
+                                      "attachments": _attachment_choices(all_parts)})
             part_id = parts[0]["part_id"]
         data, name, ctype = _download_part(account, msg_id, part_id)
         lname = name.lower()
@@ -6204,7 +6548,8 @@ def updateAppointment(account: str,
                       reminder_minutes: Optional[int] = None,
                       timezone: str = "Asia/Taipei",
                       allow_other_calendar: bool = False,
-                      dry_run: bool = False) -> str:
+                      dry_run: bool = False,
+                      description: Optional[str] = None) -> str:
     """Change a personal appointment (no attendees). Only the arguments you pass change.
 
     Appointments outside the main 'Calendar' (e.g. a family calendar) are refused unless
@@ -6219,7 +6564,10 @@ def updateAppointment(account: str,
         timezone: IANA time zone. Default "Asia/Taipei".
         allow_other_calendar: Allow changing an appointment in a calendar other than 'Calendar'.
         dry_run: Show the change without writing.
+        description: Alias of notes (used when notes is not given).
     """
+    if notes is None and description is not None:
+        notes = description
     try:
         appt, inv, comp = _get_appt(account, appt_id)
         cal = _appt_folder_guard(account, appt, allow_other_calendar)
@@ -6491,34 +6839,106 @@ def searchTasks(account: str,
         return tool_response({"status": "error", "message": f"Failed to search tasks: {str(e)}"})
 
 
+_HTML_QUOTE_STYLE = "border-left:2px solid #1010FF;margin-left:5px;padding-left:5px;color:#000;"
+
+
+def _html_fragment(src: str) -> str:
+    """Inner part of <body> when given a whole HTML document; scripts removed."""
+    if not src:
+        return ''
+    m = re.search(r'(?is)<body[^>]*>(.*)</body>', src)
+    frag = m.group(1) if m else src
+    frag = re.sub(r'(?is)<(script|head|title)[^>]*>.*?</\1>', '', frag)
+    frag = re.sub(r'(?is)</?(html|body|meta)[^>]*>', '', frag)
+    return frag.strip()
+
+
+def _text_to_html(text: str) -> str:
+    return _html.escape(text or '').replace('\r\n', '\n').replace('\n', '<br>')
+
+
+def _get_default_signature(account: str, for_reply: bool) -> Optional[Dict[str, str]]:
+    """The account's default signature: {"name", "html", "text"}, or None when none is set.
+
+    Replies/forwards use zimbraPrefForwardReplySignatureId when set, else the default one.
+    """
+    ns_acc = 'urn:zimbraAccount'
+    root = query_zimbra_mail_api(
+        '<GetPrefsRequest xmlns="urn:zimbraAccount"><pref name="zimbraPrefDefaultSignatureId"/>'
+        '<pref name="zimbraPrefForwardReplySignatureId"/></GetPrefsRequest>', account)
+    parse_zimbra_response(root, namespace=ns_acc)
+    prefs = {e.get('name'): (e.text or '').strip() for e in root.iter(f'{{{ns_acc}}}pref')}
+    sig_id = (prefs.get('zimbraPrefForwardReplySignatureId') if for_reply else '') or \
+        prefs.get('zimbraPrefDefaultSignatureId', '')
+    if not sig_id:
+        return None
+    root = query_zimbra_mail_api('<GetSignaturesRequest xmlns="urn:zimbraAccount"/>', account)
+    parse_zimbra_response(root, namespace=ns_acc)
+    for sig in root.iter(f'{{{ns_acc}}}signature'):
+        if sig.get('id') != sig_id:
+            continue
+        out = {"name": sig.get('name', ''), "html": '', "text": ''}
+        for c in sig.findall(f'{{{ns_acc}}}content'):
+            if c.get('type') == 'text/html':
+                out["html"] = c.text or ''
+            elif c.get('type') == 'text/plain':
+                out["text"] = c.text or ''
+        if not out["html"] and not out["text"]:
+            return None
+        if not out["text"]:
+            out["text"] = _html_to_text(out["html"])
+        if not out["html"]:
+            out["html"] = _text_to_html(out["text"])
+        return out
+    return None
+
+
 @_tool()
 def saveDraft(account: str,
               to: Any,
               subject: str,
-              body: str,
+              body: Optional[str] = None,
               cc: Optional[Any] = None,
               bcc: Optional[Any] = None,
               reply_to_msg_id: Optional[str] = None,
               is_forward: bool = False,
-              attachments: Optional[List[Dict[str, str]]] = None) -> str:
+              attachments: Optional[List[Dict[str, str]]] = None,
+              body_html: Optional[str] = None,
+              include_signature: bool = False) -> str:
     """Save a new email or a reply/forward as draft. When replying, original message is auto-quoted.
+
+    Without body_html the draft is plain text (HTML tags in `body` show up literally).
+    With body_html the draft is HTML (multipart/alternative: text/html from body_html,
+    text/plain from `body` or converted from body_html); a reply/forward then quotes the
+    original as HTML in a blockquote under a From/Date/Subject header, like Zimbra web.
 
     Args:
         account: Sender account email. Example: "user@example.com".
         to: Recipient email(s), comma-separated. Example: "a@example.com" or "a@example.com,b@example.com".
         subject: Email subject. For replies, add "Re: " prefix. Example: "Re: Meeting Tomorrow".
-        body: Your reply/new message text only. Do NOT include quoted original — it is auto-appended for replies.
+        body: Your reply/new message text only. Do NOT include quoted original — it is auto-appended for replies. Optional when body_html is given.
         cc: CC recipient(s), comma-separated. Example: "manager@example.com". Default: none.
         bcc: BCC recipient(s), comma-separated. Example: "archive@example.com". Default: none.
         reply_to_msg_id: Original message ID to reply to (from searchMail "id" field). Original message auto-quoted. Example: "894727". Default: none (new email).
         is_forward: Set true if forwarding instead of replying. Only used with reply_to_msg_id. Default: false.
         attachments: Files to attach. Each item is either {"filename": "x.pdf", "content_base64": "..."}
             or {"msg_id": "...", "part_id": "2"} to attach a file from another message. Default: none.
+        body_html: Your new message as HTML (a fragment such as "<p>Hi</p><ul><li>..</li></ul>").
+            Do NOT include the quoted original or the signature. Default: none (plain-text draft).
+        include_signature: Insert the account's default Zimbra signature (for replies/forwards the
+            "reply/forward" signature when one is set) between your text and the quoted original.
+            Default: false (no signature). If the account has no signature, the draft is saved
+            without one and the result says signature=null.
 
     Nothing is sent: the draft appears in Drafts for a person to check and send. `to`, `cc`
     and `bcc` accept a comma-separated string or a list.
     """
-    logger.info(f"Saving draft: account={account}, to={to}, subject={subject}, reply_to={reply_to_msg_id}")
+    logger.info(f"Saving draft: account={account}, to={to}, subject={subject}, reply_to={reply_to_msg_id}, "
+                f"html={bool(body_html)}, signature={include_signature}")
+
+    if not (body and body.strip()) and not (body_html and body_html.strip()):
+        return tool_response({"status": "error", "message": "Give body (plain text) or body_html (HTML)."})
+    is_html = bool(body_html and body_html.strip())
 
     def _addr_list(v):
         if not v:
@@ -6530,54 +6950,62 @@ def saveDraft(account: str,
     try:
         # Build recipient elements
         recipients = ""
-        for addr in to.split(','):
-            addr = addr.strip()
-            if addr:
-                recipients += f'<e t="t" a="{addr}"/>\n'
-
-        if cc:
-            for addr in cc.split(','):
+        for t, addrs in (("t", to), ("c", cc), ("b", bcc)):
+            for addr in addrs.split(','):
                 addr = addr.strip()
                 if addr:
-                    recipients += f'<e t="c" a="{addr}"/>\n'
+                    recipients += f'<e t="{t}" a="{_xml_text(addr)}"/>\n'
+        recipients += f'<e t="f" a="{_xml_text(account)}"/>'
 
-        if bcc:
-            for addr in bcc.split(','):
-                addr = addr.strip()
-                if addr:
-                    recipients += f'<e t="b" a="{addr}"/>\n'
+        text_part = body if (body and body.strip()) else ''
+        html_part = _html_fragment(body_html) if is_html else ''
+        if is_html and not text_part:
+            text_part = _html_to_text(html_part)
 
-        # From address
-        recipients += f'<e t="f" a="{account}"/>'
+        # Signature goes between the new text and the quoted original
+        signature = None
+        if include_signature:
+            try:
+                signature = _get_default_signature(account, bool(reply_to_msg_id))
+            except Exception as sig_err:
+                logger.warning(f"Failed to read signature: {sig_err}")
+                signature = None
+            if signature:
+                text_part = text_part.rstrip('\n') + "\n\n" + signature["text"].strip('\n')
+                html_part = html_part + '<br><div class="jt-signature">' + _html_fragment(signature["html"]) + '</div>'
 
         # Build message attributes for reply/forward
         msg_attrs = ""
+        quoted = False
         if reply_to_msg_id:
             reply_type = "w" if is_forward else "r"
-            msg_attrs = f'origid="{reply_to_msg_id}" rt="{reply_type}"'
+            msg_attrs = f'origid="{_xml_text(reply_to_msg_id)}" rt="{reply_type}"'
 
             # Auto-quote original message for reply/forward
             try:
-                orig_detail = json.loads(getMailDetail(account, reply_to_msg_id))
+                orig_detail = json.loads(getMailDetail(account, reply_to_msg_id, include_html=is_html))
                 if orig_detail.get("status") == "success":
                     orig_msg = orig_detail.get("message", {})
-                    orig_from = ""
-                    from_list = orig_msg.get("from", [])
-                    if from_list:
-                        f = from_list[0]
-                        orig_from = f.get("display", f.get("address", ""))
-                        if f.get("address"):
-                            orig_from = f"{f.get('display', '')} <{f['address']}>".strip()
+
+                    def _fmt_addrs(lst):
+                        out = []
+                        for a in lst or []:
+                            if isinstance(a, dict):
+                                disp, addr = a.get('display', ''), a.get('address', '')
+                                out.append(f"{disp} <{addr}>".strip() if addr else disp)
+                            else:
+                                out.append(str(a))
+                        return ', '.join(x for x in out if x)
+                    orig_from = _fmt_addrs(orig_msg.get("from", []))
+                    orig_to = _fmt_addrs(orig_msg.get("to", []))
+                    orig_cc = _fmt_addrs(orig_msg.get("cc", []))
                     orig_date = orig_msg.get("date", "")
                     orig_subject = orig_msg.get("subject", "")
                     orig_body = orig_msg.get("body_text", "")
 
-                    # Build quoted text
-                    quoted_lines = orig_body.split('\n')
-                    quoted_text = '\n'.join(f'> {line}' for line in quoted_lines)
-
+                    quoted_text = '\n'.join(f'> {line}' for line in orig_body.split('\n'))
                     if is_forward:
-                        separator = (
+                        text_part += (
                             f"\n\n---------- Forwarded message ----------\n"
                             f"From: {orig_from}\n"
                             f"Date: {orig_date}\n"
@@ -6585,21 +7013,42 @@ def saveDraft(account: str,
                             f"{orig_body}"
                         )
                     else:
-                        separator = (
-                            f"\n\nOn {orig_date}, {orig_from} wrote:\n"
-                            f"{quoted_text}"
-                        )
+                        text_part += f"\n\nOn {orig_date}, {orig_from} wrote:\n{quoted_text}"
 
-                    body = body + separator
+                    if is_html:
+                        orig_html = _html_fragment(orig_msg.get("body_html") or '') or _text_to_html(orig_body)
+                        e = _html.escape
+                        hdr = [f"<b>From: </b>{e(orig_from)}"]
+                        if orig_to:
+                            hdr.append(f"<b>To: </b>{e(orig_to)}")
+                        if orig_cc:
+                            hdr.append(f"<b>Cc: </b>{e(orig_cc)}")
+                        hdr += [f"<b>Sent: </b>{e(str(orig_date))}", f"<b>Subject: </b>{e(orig_subject)}"]
+                        header_html = ('<div style="color:#000;font-weight:normal;font-style:normal;'
+                                       'text-decoration:none;font-family:Helvetica,Arial,sans-serif;font-size:12pt;">'
+                                       + '<br>'.join(hdr) + '</div><br>')
+                        if is_forward:
+                            html_part += ('<br><div>---------- Forwarded message ----------</div>'
+                                          + header_html + f'<div data-marker="__QUOTED_TEXT__">{orig_html}</div>')
+                        else:
+                            html_part += ('<br><hr id="zwchr">' + header_html
+                                          + f'<blockquote style="{_HTML_QUOTE_STYLE}" data-marker="__QUOTED_TEXT__">'
+                                          + orig_html + '</blockquote>')
+                    quoted = True
             except Exception as quote_err:
                 logger.warning(f"Failed to auto-quote original message: {quote_err}")
                 # Continue without quote — still save the draft
 
-        # Escape XML special characters in body and subject
-        body_escaped = (body.replace('&', '&amp;').replace('<', '&lt;')
-                           .replace('>', '&gt;'))
-        subject_escaped = (subject.replace('&', '&amp;').replace('<', '&lt;')
-                                  .replace('>', '&gt;'))
+        subject_escaped = _xml_text(subject)
+        if is_html:
+            html_doc = ('<html><body><div style="font-family: arial, helvetica, sans-serif; font-size: 12pt; '
+                        f'color: #000000">{html_part}</div></body></html>')
+            mime_xml = (f'<mp ct="multipart/alternative">'
+                        f'<mp ct="text/plain"><content>{_xml_text(text_part)}</content></mp>'
+                        f'<mp ct="text/html"><content>{_xml_text(html_doc)}</content></mp>'
+                        f'</mp>')
+        else:
+            mime_xml = f'<mp ct="text/plain"><content>{_xml_text(text_part)}</content></mp>'
 
         attach_xml = ''
         attached = []
@@ -6612,21 +7061,21 @@ def saveDraft(account: str,
                     aids.append(_upload_attachment(account, data, fname, att.get('content_type', '')))
                     attached.append(fname)
                 elif att.get('msg_id') and att.get('part_id'):
-                    mps.append(f'<mp mid="{att["msg_id"]}" part="{att["part_id"]}"/>')
+                    mps.append(f'<mp mid="{_xml_text(att["msg_id"])}" part="{_xml_text(att["part_id"])}"/>')
                     attached.append(f'{att["msg_id"]}#{att["part_id"]}')
                 else:
                     return tool_response({"status": "error", "message":
                                           "Each attachment needs filename+content_base64, or msg_id+part_id."})
             attach_xml = f'<attach{" aid=" + chr(34) + ",".join(aids) + chr(34) if aids else ""}>{"".join(mps)}</attach>'
 
+        # With <attach>, Zimbra wraps the body (text, or the multipart/alternative) and the
+        # files in multipart/mixed itself.
         soap_body = f"""
         <SaveDraftRequest xmlns="urn:zimbraMail">
             <m {msg_attrs}>
                 {recipients}
                 <su>{subject_escaped}</su>
-                <mp ct="text/plain">
-                    <content>{body_escaped}</content>
-                </mp>
+                {mime_xml}
                 {attach_xml}
             </m>
         </SaveDraftRequest>
@@ -6640,7 +7089,9 @@ def saveDraft(account: str,
 
         draft_id = msg_elem.get('id', '') if msg_elem is not None else ''
         _audit_write("saveDraft", account, {"draft_id": draft_id, "to": to, "cc": cc or None, "subject": subject,
-                                            "reply_to_msg_id": reply_to_msg_id, "attachments": attached or None})
+                                            "reply_to_msg_id": reply_to_msg_id, "attachments": attached or None,
+                                            "format": "html" if is_html else "text",
+                                            "signature": signature["name"] if signature else None})
 
         draft_type = "reply draft" if reply_to_msg_id and not is_forward else \
                      "forward draft" if reply_to_msg_id and is_forward else \
@@ -6650,6 +7101,8 @@ def saveDraft(account: str,
             "status": "success",
             "account": account,
             "draft_id": draft_id,
+            "format": "html" if is_html else "text",
+            "signature": signature["name"] if signature else None,
             "attachments": attached or None,
             "draft_type": draft_type,
             "to": to,
@@ -6657,10 +7110,13 @@ def saveDraft(account: str,
             "bcc": bcc,
             "subject": subject,
             "reply_to_msg_id": reply_to_msg_id,
-            "display_message": f"Saved {draft_type} in {account}'s Drafts folder (ID: {draft_id})"
+            "display_message": f"Saved {draft_type} ({'HTML' if is_html else 'plain text'}) in {account}'s Drafts folder (ID: {draft_id})"
         }
+        if include_signature and not signature:
+            result["signature_note"] = "No default signature is set for this account (or it could not be read); saved without one."
         if reply_to_msg_id:
-            result["note"] = "Original message was auto-quoted in the draft body. No need to include it separately."
+            result["note"] = ("Original message was auto-quoted in the draft body. No need to include it separately."
+                              if quoted else "Could not read the original message; the draft has no quote.")
 
         return tool_response(result)
 

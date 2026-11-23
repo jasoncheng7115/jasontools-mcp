@@ -1,9 +1,9 @@
 # Zimbra MCP Server
 
-**Version:** 1.12.0
+**Version:** 1.14.0
 **Author:** Jason Cheng (co-created with Claude Code)
 **License:** MIT
-**Last Updated:** 2026-10-09
+**Last Updated:** 2026-11-23
 **Repository:** [github.com/jasoncheng7115/jasontools-mcp](https://github.com/jasoncheng7115/jasontools-mcp)
 **Language:** [English](README.md) · [繁體中文](README_zh-TW.md)
 
@@ -54,7 +54,7 @@ FastMCP-based integration for Zimbra Collaboration Suite, providing comprehensiv
 
 mcp_zimbra supports two authentication modes:
 
-### Admin Mode (44 base + 8 mail_read)
+### Admin Mode (44 base + 16 mail_read)
 
 Full access to all Zimbra administration tools. Mail read tools require `ZIMBRA_ENABLE_MAIL_READ=true`.
 
@@ -65,7 +65,7 @@ export ZIMBRA_ADMIN_PASS="admin_password"
 export ZIMBRA_ENABLE_MAIL_READ="true"   # Optional: enable mail read tools
 ```
 
-### User Mode (13 base + 8 mail_read)
+### User Mode (13 base + 16 mail_read)
 
 Personal mailbox access only. Authenticates as a regular user via the web client API.
 
@@ -85,7 +85,7 @@ export ZIMBRA_ENABLE_MAIL_READ="true"   # Optional: enable mail read tools
 | `searchMail` | Search mailbox by subject/sender/recipient/date/content |
 | `getMailDetail` | Get full message content, headers, attachment list |
 | `getConversation` | Get all messages in a conversation thread |
-| `listFolders` | List mailbox folders |
+| `listFolders` | List mailbox folders, each with its direct `subfolder_count` |
 | `getMailAttachment` | Attachment as a one-time download link (HTTP), base64, or saved file; pick by part ID or file-name pattern |
 
 **User Mode Tools (always available):**
@@ -394,9 +394,39 @@ Endpoint: `http://<host>:<port>/mcp` (stateless — no session is kept between r
 | `getMailAttachment` | **⚡ UPDATED** - Attachment as a one-time download link (HTTP transports, 10 min, fetch with curl), base64 (≤10 MB) or saved file; `filename_pattern` (e.g. `*-A4.pdf`) instead of a part ID; `filename` to rename |
 | `getAttachmentText` | **⚡ NEW** - Text of a PDF (text layer, or OCR `chi_tra+eng` for scans), image (OCR) or text attachment |
 | `waitForMail` | **⚡ NEW** - Wait until a mail from a sender / with a subject arrives (polls, up to 10 min) |
-| `listFolders` | List mailbox folders with optional keyword filter |
-| `saveDraft` | Save new email or reply/forward as draft for review (nothing is sent); attachments as base64 or taken from another message |
+| `listFolders` | List mailbox folders with optional keyword filter; each folder has `subfolder_count` |
+| `saveDraft` | **⚡ UPDATED** - Save new email or reply/forward as draft for review (nothing is sent); plain text or HTML (`body_html`); optional default signature (`include_signature`); attachments as base64 or taken from another message |
 | `searchContacts` | Search user's personal address book / contacts |
+
+`saveDraft` writes a plain-text draft unless `body_html` is given; HTML tags put in `body`
+show up literally. With `body_html` the draft is `multipart/alternative`: the HTML part is
+`body_html`, the text part is `body` when given, otherwise text converted from the HTML. A
+reply or forward then quotes the original as HTML: a From / To / Sent / Subject header and
+the original body in a blockquote (replies) or below a "Forwarded message" line (forwards),
+close to what Zimbra web produces. Plain-text drafts keep the `> ` quoting.
+`include_signature=true` (default `false`) inserts the account's default signature between
+the new text and the quote; replies and forwards use the reply/forward signature when the
+account has one set. If the account has no signature the draft is saved without one and the
+result has `signature: null`. Attachments can be combined with HTML; Zimbra nests the
+`multipart/alternative` body and the files in `multipart/mixed`.
+
+Every tool refuses arguments it does not declare and lists the valid ones (since v1.14.0).
+Before that, an unknown argument was dropped silently: `createAppointment(description=...)`
+created an appointment with no text. `description` is now accepted as an alias of `notes`.
+
+### Mail Organize (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `createFolder` | **⚡ NEW** - Create a mail folder under a parent given by exact path or id; returns the existing folder (`created=false`) if the name is already there; `dry_run` |
+| `moveMail` | **⚡ NEW** - Move one or more messages to a folder (exact path or id), optionally creating the last level (`create_if_missing`); `dry_run`; result read back from Zimbra |
+
+Folder references are exact: a full path such as `/Inbox/Projects 2` or a folder id, never a
+fuzzy match, so mail cannot land in a similarly named folder. Trash and Junk are refused as
+targets, and there are no delete tools. When the parent folder has
+`ZIMBRA_FOLDER_DISPLAY_LIMIT` subfolders or more (default 100: Zimbra webmail shows that many
+and hides the rest behind "Show remaining folders"), the result carries a `warning`
+suggesting a new parent; nothing is blocked. Both tools are recorded in `ZIMBRA_AUDIT_LOG`.
 
 ### Calendar & Tasks (6 tools)
 
@@ -405,8 +435,8 @@ Endpoint: `http://<host>:<port>/mcp` (stateless — no session is kept between r
 | `searchCalendar` | **⚡ NEW** - Appointments in a date range, all calendars or one folder; expands recurring events |
 | `getAppointment` | **⚡ NEW** - One appointment in full: description, attendees with reply status, recurrence, attachments |
 | `searchTasks` | **⚡ NEW** - Zimbra Tasks filtered by folder, status and due date |
-| `createAppointment` | **⚡ NEW** - Create a personal appointment: subject, start/end, location, notes, calendar, all-day, reminder |
-| `updateAppointment` | **⚡ NEW** - Change subject, time, location, notes or reminder of a personal appointment; `dry_run` |
+| `createAppointment` | **⚡ NEW** - Create a personal appointment: subject, start/end, location, notes (or `description`), calendar, all-day, reminder |
+| `updateAppointment` | **⚡ NEW** - Change subject, time, location, notes (or `description`) or reminder of a personal appointment; `dry_run` |
 | `deleteAppointment` | **⚡ NEW** - Delete a personal appointment (`confirm=true`; otherwise a preview) |
 
 Calendar writes default to the main `Calendar`. Changing or deleting an appointment in any
@@ -468,8 +498,8 @@ separate jt_zmmsgtrace service rather than Zimbra's SOAP API.
 | `clear_cache` | Clear all cached API responses |
 | `cache_stats` | Get cache usage statistics |
 
-**Total: 52 tools in admin mode** (44 base + 8 mail_read) — 6 Account + 3 Distribution Lists + 3 Mail Queue + 2 Statistics + 9 System + 3 Rights + 5 Bulk Audit + 5 Mail Read† + 3 Calendar & Tasks† + 2 Mail Write + 1 Directory + 1 Advanced DL + 3 Utilities + 6 jt_zmmsgtrace
-**Total: 21 tools in user mode** (13 base + 8 mail_read) — 5 Mail Read† + 3 Calendar & Tasks† + 2 Mail Write + 1 Directory + 3 Utilities + 1 Version + 6 jt_zmmsgtrace
+**Total: 60 tools in admin mode** (44 base + 16 mail_read) — 6 Account + 3 Distribution Lists + 3 Mail Queue + 2 Statistics + 9 System + 3 Rights + 5 Bulk Audit + 10 Mail Search (8† + saveDraft, searchContacts) + 2 Mail Organize† + 6 Calendar & Tasks† + 1 Directory + 1 Advanced DL + 3 Utilities + 6 jt_zmmsgtrace
+**Total: 29 tools in user mode** (13 base + 16 mail_read) — 10 Mail Search + 2 Mail Organize† + 6 Calendar & Tasks† + 1 Directory + 3 Utilities + 1 Version + 6 jt_zmmsgtrace
 
 †Mail Read tools require `ZIMBRA_ENABLE_MAIL_READ=true`
 
@@ -593,7 +623,47 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 
 ## 📜 Version History
 
-### v1.12.0 (2026-10-09) - Current
+### v1.14.0 (2026-11-23) - Current
+
+**FEATURE — HTML drafts and signatures; FIX — unknown arguments were ignored**
+
+- `saveDraft`: new `body_html` builds an HTML draft (`multipart/alternative`; the text part is
+  `body` or converted from the HTML). `body` is optional when `body_html` is given. Without
+  `body_html` the draft is plain text as before.
+- `saveDraft`: replies and forwards in HTML mode quote the original as HTML under a
+  From / To / Sent / Subject header, in a blockquote for replies.
+- `saveDraft`: new `include_signature` (default `false`) inserts the account's default
+  signature, or the reply/forward signature for replies when one is set, between the new
+  text and the quote. The result reports `format` (`text` / `html`) and `signature`.
+- All tools: arguments a tool does not declare are refused with the list of valid ones.
+  `createAppointment` used to drop `description=` silently and create an empty appointment.
+- `createAppointment` / `updateAppointment`: `description` is accepted as an alias of `notes`.
+
+### v1.13.0 (2026-11-11)
+
+**FEATURE — createFolder, moveMail**
+
+- `createFolder`: create a mail folder under a parent given by exact path or folder id (no
+  fuzzy match). Names with Chinese, spaces and brackets work. If the folder already exists it
+  is returned with `created=false`. Returns `id`, `path`, `created`, `parent_subfolder_count`.
+- `moveMail`: move one or more messages (ids as `searchMail` returns them) to a folder by exact
+  path or id; `create_if_missing` creates the last level; `dry_run`; every message is read back
+  and reported with its old and new folder. Trash and Junk are refused.
+- Both warn when the parent folder has `ZIMBRA_FOLDER_DISPLAY_LIMIT` (default 100) subfolders
+  or more, the point where Zimbra webmail hides the rest behind "Show remaining folders".
+- `listFolders`: each folder now has `subfolder_count` (direct children).
+- No delete tools were added.
+
+### v1.12.1 (2026-10-17)
+
+**FIX — searchMail results, attachment picking**
+
+- `searchMail`: `to` / `cc` were always empty; results now include recipients.
+- `searchMail`: `total` used to echo the page size. Zimbra does not report a match count, so `total` is `null` while `has_more` is true and exact on the last page.
+- `searchMail`: `sender` / `recipient` / `cc` given as a domain (`example.com`) also find subdomain addresses such as `user@mail.example.com`. Each result carries `is_single_message` (Zimbra gives a lone message a negative conversation id).
+- `getAttachmentText` / `getMailAttachment`: a `filename_pattern` without wildcards matches as plain text (`.pdf`, `S01055`). `getAttachmentText` without `part_id` uses the only attachment, or lists the part IDs when there are several.
+
+### v1.12.0 (2026-10-09)
 
 **FEATURE — attachments, text extraction, search, reading, calendar edits**
 
