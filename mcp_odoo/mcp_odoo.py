@@ -4865,7 +4865,7 @@ def search_invoices(partner_name: Optional[str] = None,
 
     Args:
         partner_name: Customer/vendor name, partial match.
-        invoice_number: Invoice number, partial match (e.g. 'INV/2026/0009').
+        invoice_number: Invoice number, partial match (e.g. 'INV/2026/00123').
         invoice_type: "customer" (default), "vendor", "customer_credit", "vendor_credit", or "all".
         state: draft / posted / cancel. Default: all states.
         payment_state: not_paid / in_payment / partial / paid / reversed.
@@ -4961,7 +4961,7 @@ def get_invoice_details(invoice_id: Optional[int] = None,
 
     Args:
         invoice_id: Odoo record id, as returned by search_invoices.
-        invoice_number: Invoice number, e.g. 'INV/2026/0009'.
+        invoice_number: Invoice number, e.g. 'INV/2026/00123'.
         include_lines: Include line items (default True).
     """
     try:
@@ -7235,7 +7235,7 @@ def duplicate_invoice(invoice_id: Optional[int] = None, invoice_number: Optional
 
     Args:
         invoice_id: Source invoice ID; or give invoice_number
-        invoice_number: Source invoice number, e.g. "INV/2026/0010"
+        invoice_number: Source invoice number, e.g. "INV/2026/00123"
         invoice_date: Date of the new invoice, YYYY-MM-DD (default: today)
         due_date: Due date. Default: with a payment term Odoo computes it from the term;
                   without one it keeps the source's gap between invoice date and due date
@@ -7418,7 +7418,7 @@ def draft_invoice(invoice_id: Optional[int] = None, invoice_number: Optional[str
 
     Args:
         invoice_id: Invoice ID; or invoice_number
-        invoice_number: Invoice number, e.g. "INV/2026/0011"
+        invoice_number: Invoice number, e.g. "INV/2026/00123"
         confirm: Must be True to reset
     """
     try:

@@ -661,7 +661,7 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 - `searchMail`: `to` / `cc` were always empty; results now include recipients.
 - `searchMail`: `total` used to echo the page size. Zimbra does not report a match count, so `total` is `null` while `has_more` is true and exact on the last page.
 - `searchMail`: `sender` / `recipient` / `cc` given as a domain (`example.com`) also find subdomain addresses such as `user@mail.example.com`. Each result carries `is_single_message` (Zimbra gives a lone message a negative conversation id).
-- `getAttachmentText` / `getMailAttachment`: a `filename_pattern` without wildcards matches as plain text (`.pdf`, `S01055`). `getAttachmentText` without `part_id` uses the only attachment, or lists the part IDs when there are several.
+- `getAttachmentText` / `getMailAttachment`: a `filename_pattern` without wildcards matches as plain text (`.pdf`, `S00123`). `getAttachmentText` without `part_id` uses the only attachment, or lists the part IDs when there are several.
 
 ### v1.12.0 (2026-10-09)
 
@@ -672,7 +672,7 @@ export ZIMBRA_LOG_LEVEL=DEBUG
   pick by file-name pattern. `getAttachmentText` reads PDF text or OCRs scans.
 - `searchMail`: `include_subfolders`, `attachment_name`, `since`, `include_attachment_names`,
   `folder_path` and `snippet` per result; one-word subjects match inside longer tokens
-  (`DC2026167` did not find `採購單-DC2026167-02`).
+  (`AB12345` did not find `採購單-AB12345-02`).
 - `getMailDetail` reads the HTML body: HTML-only mail used to come back with an empty body.
   New `body_text`, `body_latest` (quoted history removed), `include_html`; `message_id` is
   accepted for `msg_id`. New `getMailDetails` (batch) and `waitForMail`.

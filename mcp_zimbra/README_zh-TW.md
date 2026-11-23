@@ -652,7 +652,7 @@ export ZIMBRA_LOG_LEVEL=DEBUG
 - `searchMail`：`sender`／`recipient`／`cc` 給網域 (`example.com`) 時，也會找到子網域的位址，
   例如 `user@mail.example.com`。每筆結果帶 `is_single_message` (Zimbra 對單封郵件給負數的對話 id)。
 - `getAttachmentText`／`getMailAttachment`：沒有萬用字元的 `filename_pattern` 當成一般字串比對
-  (`.pdf`、`S01055`)。`getAttachmentText` 沒給 `part_id` 時，只有一個附件就用那一個，有多個就列出 part ID。
+  (`.pdf`、`S00123`)。`getAttachmentText` 沒給 `part_id` 時，只有一個附件就用那一個，有多個就列出 part ID。
 
 ### v1.12.0 (2026-10-09)
 
@@ -662,7 +662,7 @@ export ZIMBRA_LOG_LEVEL=DEBUG
   用戶端拿不到)，另支援 base64、重新命名，以及依檔名樣式挑選。`getAttachmentText` 可讀取 PDF 文字，或對掃描檔進行 OCR。
 - `searchMail`：新增 `include_subfolders`、`attachment_name`、`since`、`include_attachment_names`，
   每筆結果附 `folder_path` 與 `snippet`；單一字詞的主旨可比對到較長字串的中間
-  (之前 `DC2026167` 找不到 `採購單-DC2026167-02`)。
+  (之前 `AB12345` 找不到 `採購單-AB12345-02`)。
 - `getMailDetail` 會讀取 HTML 內文：之前只有 HTML 的郵件會回傳空白內文。
   新增 `body_text`、`body_latest` (去除引用歷史)、`include_html`；`msg_id` 也接受
   `message_id`。新增 `getMailDetails` (批次) 與 `waitForMail`。

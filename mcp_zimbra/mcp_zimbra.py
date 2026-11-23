@@ -4669,7 +4669,7 @@ def searchMail(account: str,
     Args:
         account: Target account email. Example: "user@example.com".
         query: Raw Zimbra search query (advanced). Example: "subject:meeting from:boss". Combined (AND) with any other filters given.
-        subject: Search in subject line; a single word also matches inside longer tokens (e.g. "DC2026167" finds "採購單-DC2026167-02"). Example: "meeting invitation".
+        subject: Search in subject line; a single word also matches inside longer tokens (e.g. "AB12345" finds "採購單-AB12345-02"). Example: "meeting invitation".
         sender: Search by sender email or domain (From). Example: "boss@example.com", "example.com"
             (a domain also finds subdomain senders such as user@mail.example.com).
         recipient: Search by recipient email (To). Example: "team@example.com".
@@ -4682,7 +4682,7 @@ def searchMail(account: str,
         limit: Max results. Default: 50. Range: 1-500.
         offset: Starting position for pagination. Default: 0.
         include_subfolders: With folder, also search all its subfolders (e.g. folder="inbox" + include_subfolders covers "Inbox/Proxmox 交易/<customer>"). Default: false.
-        attachment_name: Attachment file name text. Example: "S01439" or "報價單".
+        attachment_name: Attachment file name text. Example: "S00123" or "報價單".
         since: Only mail received at or after this time, "YYYY-MM-DDTHH:MM:SS" (local). Finer than date_from.
         include_attachment_names: Also list attachment file names per message (one extra request per message with attachments, max 30). Default: false.
 
@@ -4696,7 +4696,7 @@ def searchMail(account: str,
         if subject:
             subj = subject.strip()
             if re.fullmatch(r'[^\s"()]+', subj):
-                # Zimbra matches whole tokens: "DC2026167" misses "採購單-DC2026167-02".
+                # Zimbra matches whole tokens: "AB12345" misses "採購單-AB12345-02".
                 parts.append(f'(subject:"{subj}" OR subject:*{subj}*)')
             else:
                 parts.append(f'subject:("{subj}")')
@@ -6064,7 +6064,7 @@ _HTTP_MODE = False          # set in main: attachments are served as one-time li
 
 
 def _name_matches(filename: str, pattern: str) -> bool:
-    """Shell pattern when it has wildcards ("*.pdf"); otherwise a plain substring (".pdf", "S01055")."""
+    """Shell pattern when it has wildcards ("*.pdf"); otherwise a plain substring (".pdf", "S00123")."""
     name, pat = (filename or "").lower(), pattern.lower().strip()
     if any(ch in pat for ch in "*?["):
         return _fnmatch.fnmatch(name, pat)
@@ -6265,7 +6265,7 @@ def getMailAttachment(account: str,
         msg_id: Message ID from searchMail "id". ("message_id" is accepted too.)
         part_id: Attachment part ID, e.g. "2". Optional when filename_pattern is given.
         filename_pattern: Pattern on the attachment name, case-insensitive: "*-A4.pdf" style, or plain
-            text matched anywhere in the name (".pdf", "S01055").
+            text matched anywhere in the name (".pdf", "S00123").
         filename: Name to give the file (single attachment only). Example: "FS36743277-A4-Company.pdf".
         return_mode: "url" (one-time link, 10 min, default on HTTP servers; fetch with curl),
                      "base64" (content in the response, up to 10 MB), or "file" (save on the server, default for stdio).
@@ -6347,7 +6347,7 @@ def getAttachmentText(account: str,
         part_id: Attachment part ID. Optional: with neither part_id nor filename_pattern, a
             message with one attachment uses it; with several, the error lists their part_ids.
         filename_pattern: "*.pdf" style pattern, or plain text matched anywhere in the name
-            (".pdf", "S01055"). First match is used.
+            (".pdf", "S00123"). First match is used.
         ocr: "auto" (only when a PDF has no text layer), "always", or "never". OCR language: Traditional Chinese + English.
         max_chars: Truncate the text to this many characters. Default 30000.
     """
